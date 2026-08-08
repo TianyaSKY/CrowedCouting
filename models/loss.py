@@ -68,10 +68,10 @@ class CrowdPointLoss(nn.Module):
         # 定义各类真值的掩码矩阵 (维度为 BS, N_anchors)
         n_anchors = anchor_points.shape[0]
         target_cls = torch.zeros((bs, n_anchors, self.nc), device=self.device)
-        target_off = torch.zeros((bs, n_anchors, 2), device=self.device)
         fg_mask = torch.zeros((bs, n_anchors), dtype=torch.bool, device=self.device)
-        # 用于记录每个锚点被匹配到的 GT 偏移量的累加（处理多 GT 竞争同一锚点的情况）
-        anchor_match_count = torch.zeros((bs, n_anchors), device=self.device)
+        # 保留每个有效 GT-anchor 配对的偏移目标。相同 anchor 的多个配对
+        # 分别参与偏移损失，避免将它们的 offset 平均成一个不存在的目标点。
+        offset_matches = []
         
         for i in range(bs):
             idx = targets[:, 0] == i
@@ -122,20 +122,7 @@ class CrowdPointLoss(nn.Module):
             gt_feat_pts = valid_gt_pts_matched / valid_strides
             offsets = gt_feat_pts - valid_anchors
             
-            # 处理多个 GT 匹配到同一锚点的情况：
-            # 使用 scatter 取平均偏移（而非简单覆盖）
-            target_off_accum = torch.zeros((n_anchors, 2), device=self.device)
-            match_count = torch.zeros(n_anchors, device=self.device)
-            
-            target_off_accum.scatter_add_(0, valid_anchor_idx.unsqueeze(1).expand(-1, 2), offsets)
-            match_count.scatter_add_(0, valid_anchor_idx, torch.ones_like(valid_anchor_idx, dtype=torch.float32))
-            
-            # 对匹配到多个 GT 的锚点取平均偏移
-            matched_mask = match_count > 0
-            target_off_accum[matched_mask] /= match_count[matched_mask].unsqueeze(1)
-            
-            target_off[i] = target_off_accum
-            anchor_match_count[i] = match_count
+            offset_matches.append((i, valid_anchor_idx, offsets))
         
         # 1. 分类损失计算 (BCE + Focal Loss)
         pred_cls_trans = pred_cls.transpose(1, 2)
@@ -153,8 +140,15 @@ class CrowdPointLoss(nn.Module):
         cls_loss = (cls_loss / num_pos) * 20.0
         
         # 2. 偏移量损失计算 (L1)
-        if fg_mask.sum() > 0:
-            off_loss = self.l1(pred_off.transpose(1, 2)[fg_mask], target_off[fg_mask]).mean()
+        if offset_matches:
+            pred_off_trans = pred_off.transpose(1, 2)
+            matched_pred_offsets = torch.cat(
+                [pred_off_trans[batch_idx, anchor_idx] for batch_idx, anchor_idx, _ in offset_matches]
+            )
+            matched_target_offsets = torch.cat(
+                [offsets for _, _, offsets in offset_matches]
+            )
+            off_loss = self.l1(matched_pred_offsets, matched_target_offsets).mean()
         else:
             off_loss = torch.tensor(0.0, device=self.device)
             

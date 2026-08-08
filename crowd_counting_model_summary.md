@@ -60,7 +60,7 @@ $$
 3. 通过阈值的锚点为正样本，分类目标为 1；其余为背景；
 4. 偏移目标为 `GT / stride - anchor`。
 
-若多个 GT 匹配同一锚点，当前代码将其偏移目标取平均，而非覆盖最后一个 GT。这避免了标签顺序影响，但一个锚点仍只能输出一个点，因此这类碰撞仍是高密度场景的结构性限制。
+若多个 GT 匹配同一锚点，它们的偏移目标会分别参与偏移损失，不再取平均或相互覆盖。一个锚点仍只能输出一个点，因此这类碰撞仍是高密度场景的结构性限制。
 
 ### 3.2 子损失
 
@@ -79,7 +79,7 @@ $$
 
 ## 5. 评估说明与已知限制
 
-应以点级指标为准：人数 MAE/RMSE，以及给定像素容忍距离下的一对一匹配 Precision、Recall 和 F1；相关脚本包括 `evaluate.py`、`evaluate_detailed.py` 与 `evaluate_localization_comparison.py`。
+应以点级指标为准：人数 MAE/RMSE，以及给定像素容忍距离下的一对一匹配 Precision、Recall 和 F1；相关脚本包括 `scripts/evaluation/count.py`、`scripts/evaluation/detailed.py` 与 `scripts/evaluation/compare_localization.py`。
 
 不要用训练日志里的标准 YOLO `Box(P/R/mAP)` 作为此模型的有效结论。标签虚拟框约为图像宽高的 1%，而自定义头推理输出固定 1×1 px 框；即便中心点重合，二者 IoU 通常也远低于标准 mAP 阈值，因此这些框指标可能始终为 0。
 

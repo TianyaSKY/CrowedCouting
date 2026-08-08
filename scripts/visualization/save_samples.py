@@ -1,9 +1,7 @@
 import os
-import sys
 import cv2
 import torch
 import numpy as np
-sys.path.append("/home/tianya/PythonProjects/CrowedCouting")
 from models.crowd_model import CrowdCountingModel
 from ultralytics import YOLO
 
