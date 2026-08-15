@@ -43,6 +43,8 @@ class PointMoELoss(nn.Module):
 
     匹配流程（对 Router 处理后的最终候选点）：
         网络输出所有最终候选点
+            -> 按置信度取 top-K 作为匹配候选（K = max(match_top_k, n_gt)，
+               避免 n_gt x Q(25600) 的匈牙利指派在密集裁剪上卡死）
             -> 计算候选点与真实点之间的代价
             -> 匈牙利一对一匹配
             -> 匹配候选点为正样本，未匹配候选点为负样本
@@ -65,6 +67,7 @@ class PointMoELoss(nn.Module):
             40.0,
         ),
         scale_sigma_octaves: float = 0.6,
+        match_top_k: int = 2000,
     ) -> None:
         super().__init__()
 
@@ -74,6 +77,7 @@ class PointMoELoss(nn.Module):
         self.knn_k = knn_k
         self.scale_centers = scale_centers
         self.scale_sigma_octaves = scale_sigma_octaves
+        self.match_top_k = match_top_k
 
     @staticmethod
     def scale_targets(
@@ -161,13 +165,35 @@ class PointMoELoss(nn.Module):
             targets = torch.zeros_like(pred_logits)
 
             if number_of_gt > 0:
-                if pred_points.shape[0] < number_of_gt:
+                # 匹配候选：只对置信度最高的 top-K 做匈牙利匹配，
+                # 否则 n_gt x Q(25600) 的线性指派在密集裁剪上会卡死
+                # （实测单张 1407 个 GT 的裁剪可挂住数分钟）。
+                # K = max(match_top_k, n_gt) 保证每个 GT 仍能匹配到一个候选。
+                match_logits = pred_logits
+                match_points = pred_points
+                match_indices = None
+
+                top_k = max(self.match_top_k, number_of_gt)
+
+                if pred_logits.shape[0] > top_k:
+                    match_indices = pred_logits.topk(
+                        top_k
+                    ).indices
+
+                    match_logits = pred_logits[
+                        match_indices
+                    ]
+                    match_points = pred_points[
+                        match_indices
+                    ]
+
+                if match_points.shape[0] < number_of_gt:
                     raise RuntimeError(
                         "候选点数量小于真实点数量"
                     )
 
                 normalized_gt = gt / scale
-                normalized_pred = pred_points / scale
+                normalized_pred = match_points / scale
 
                 coordinate_cost = torch.cdist(
                     normalized_gt,
@@ -176,7 +202,7 @@ class PointMoELoss(nn.Module):
                 )
 
                 confidence_cost = (
-                    -pred_logits.sigmoid().unsqueeze(0)
+                    -match_logits.sigmoid().unsqueeze(0)
                 )
 
                 total_cost = (
@@ -205,7 +231,14 @@ class PointMoELoss(nn.Module):
                     device=points.device,
                 )
 
-                targets[pred_indices] = 1.0
+                if match_indices is not None:
+                    matched_full_indices = match_indices[
+                        pred_indices
+                    ]
+                else:
+                    matched_full_indices = pred_indices
+
+                targets[matched_full_indices] = 1.0
 
                 point_loss = point_loss + (
                     F.smooth_l1_loss(
@@ -234,7 +267,7 @@ class PointMoELoss(nn.Module):
 
                     matched_route = route_logits_flat[
                         batch_index
-                    ][pred_indices]
+                    ][matched_full_indices]
 
                     route_loss = route_loss + (
                         F.cross_entropy(

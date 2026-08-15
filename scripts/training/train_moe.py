@@ -116,6 +116,7 @@ def train_moe(args):
     # 2. 损失
     criterion = PointMoELoss(
         route_weight=args.route_weight,
+        match_top_k=args.match_top_k,
     )
 
     # 3. 数据
@@ -390,6 +391,10 @@ def parse_args():
     parser.add_argument(
         "--route-weight", type=float, default=0.05,
         help="尺度路由监督(CE)损失权重"
+    )
+    parser.add_argument(
+        "--match-top-k", type=int, default=2000,
+        help="匈牙利匹配的候选点 top-K（K=max(K, n_gt)）"
     )
     parser.add_argument(
         "--freeze-epochs", type=int, default=3,
