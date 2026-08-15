@@ -100,6 +100,26 @@ python -m scripts.data.prepare_ucf_cc50
 
 每个数据集目录都含 `images/ + labels/ + points/ + dataset.yaml`，images 与 points 一一对应。
 
+**一键流程**（转换全部 + 联合训练 + 跨数据集评估）：
+
+```bash
+# 一个命令转换全部数据集（已存在则跳过，--force 强制重转）
+python -m scripts.data.prepare_all
+
+# 在所有数据集上联合训练（batch 混合 + 逐数据集验证，超参数同 train_moe）
+python -m scripts.training.train_all \
+    --weights yolo11n.pt \
+    --save-dir runs/moe_point_all
+
+# 跨数据集分组评估（对训练出的 best.pt）
+python -m scripts.evaluation.evaluate_datasets \
+    --checkpoint runs/moe_point_all/best.pt \
+    --dataset shanghaitech=datasets/shanghaitech_AB:val \
+    --dataset jhu=datasets/jhu_crowd:val \
+    --dataset qnrf=datasets/ucf_qnrf:test \
+    --dataset cc50=datasets/ucf_cc50:fold0_test
+```
+
 ### 2. 训练
 
 ```bash

@@ -67,7 +67,20 @@ python -m scripts.data.prepare_ucf_cc50
 
 ## 3. 训练接入
 
-`train_moe.py` 通过 `--data-root` 切换数据集（`PointDataset` 按 split 读取）：
+**一键转换 + 联合训练**（推荐）：
+
+```bash
+python -m scripts.data.prepare_all        # 一个命令转换全部数据集（--force 重转）
+python -m scripts.training.train_all      # 在所有数据集上联合训练
+```
+
+`prepare_all` 幂等（已存在跳过）；`train_all` 把各数据集 train split 拼成
+ConcatDataset（batch 内随机混合），逐数据集验证并输出各数据集 MAE，best 按
+各数据集 MAE 的算术平均选取。默认覆盖 4 个数据集；`--dataset NAME=ROOT:TRAIN[:TRAIN2...]:EVAL`
+可自定义（如 UCF-CC-50 逐折：`--dataset cc50=datasets/ucf_cc50:fold0_train:fold0_test`）。
+超参数与 `train_moe` 共享 argparse，checkpoint 兼容 `evaluate_datasets` / `test_each_dataset`。
+
+单数据集训练：
 
 ```bash
 python -m scripts.training.train_moe \
