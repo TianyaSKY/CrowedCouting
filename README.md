@@ -113,8 +113,8 @@ python -m scripts.visualization.predict_moe_batch \
 中可调）。
 
 验证使用 letterbox（保持纵横比 + 居中填充）而非直接压成正方形，避免
-人为改变人的尺度；日志同时输出 `soft_MAE` 与 `hard_MAE`，硬路由生效后
-`best.pt` 按 hard MAE 选取（最终推理即硬路由）。
+人为改变人的尺度；日志同时输出 `soft_MAE` 与 `hard_MAE`，`best.pt`
+在软路由阶段按 soft MAE、硬路由生效后按 hard MAE 选取（最终推理即硬路由）。
 
 ## v4 PointDetect 分支（旧）
 

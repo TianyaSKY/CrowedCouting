@@ -202,6 +202,12 @@ def train_moe(args):
         start_epoch = checkpoint.get("epoch", 0) + 1
         best_mae = checkpoint.get("best_mae", float("inf"))
 
+        # 恢复到硬路由阶段时，checkpoint 的 best_mae 可能是 soft 口径，
+        # 重置基准避免两种口径混用
+        if start_epoch >= args.hard_route_epoch:
+            best_mae = float("inf")
+            print("已进入硬路由阶段，best 基准重置为 hard MAE")
+
         # 恢复后若已超过冻结期，解冻 YOLO（不重建优化器，保留状态）
         if start_epoch >= args.freeze_epochs:
             for param in model.yolo.parameters():
@@ -259,7 +265,7 @@ def train_moe(args):
 
             optimizer.step()
 
-            total_loss += float(loss)
+            total_loss += loss.item()
             num_batches += 1
 
         avg_loss = total_loss / max(num_batches, 1)
@@ -294,10 +300,21 @@ def train_moe(args):
             last_path,
         )
 
-        # 硬路由阶段才更新 best（最终推理使用硬路由）；
-        # 软路由阶段只记录，避免 soft 模型占据 best 位置
-        if hard_route and hard_mae < best_mae:
-            best_mae = hard_mae
+        # best 选择：软路由阶段按 soft MAE、硬路由阶段按 hard MAE
+        # （最终推理使用硬路由）。切换硬路由时重置基准，
+        # 避免 soft 阶段的 best 继续占位。
+        if hard_route:
+            if epoch == args.hard_route_epoch:
+                best_mae = float("inf")
+                print("切换硬路由，best 基准重置为 hard MAE")
+            val_mae_for_best = hard_mae
+            metric_name = "hard MAE"
+        else:
+            val_mae_for_best = soft_mae
+            metric_name = "soft MAE"
+
+        if val_mae_for_best < best_mae:
+            best_mae = val_mae_for_best
             best_path = os.path.join(args.save_dir, "best.pt")
             torch.save(
                 {
@@ -309,7 +326,10 @@ def train_moe(args):
                 },
                 best_path,
             )
-            print(f"  -> 新的最佳 hard MAE: {best_mae:.3f}，已保存 {best_path}")
+            print(
+                f"  -> 新的最佳 {metric_name}: {best_mae:.3f}，"
+                f"已保存 {best_path}"
+            )
 
     print("训练结束。")
 
