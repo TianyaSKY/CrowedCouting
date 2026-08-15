@@ -17,4 +17,7 @@ scipy>=1.13.0             # scipy.io 解析 .mat 真值; scipy.optimize.linear_s
 h5py>=3.10.0              # 解析 v7.3 格式 .mat 文件
 PyYAML>=6.0               # 数据集 yaml 配置
 
-# 注: matplotlib/tqdm/pandas 等由 ultralytics 自动安装, 项目代码未直接使用, 无需显式声明
+# 进度显示
+tqdm>=4.66.0              # 训练/验证循环进度条
+
+# 注: matplotlib/pandas 等由 ultralytics 自动安装, 项目代码未直接使用, 无需显式声明
