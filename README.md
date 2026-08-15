@@ -87,11 +87,22 @@ python -m scripts.training.train_moe \
 
 ```bash
 python -m scripts.visualization.predict_moe \
-    --image path/to/image.jpg \
+    --image path \
     --checkpoint runs/moe_point/best.pt
 ```
 
 三个专家用不同颜色绘制：红色=P3 局部细节、绿色=P4 中层上下文、蓝色=P5 大范围上下文。
+
+批量验证集推理（letterbox 预处理与训练验证一致，结果输出到独立目录）：
+
+```bash
+python -m scripts.visualization.predict_moe_batch \
+    --data-root datasets/shanghaitech_AB \
+    --checkpoint runs/moe_point/best.pt \
+    --out-dir runs/moe_point/val_pred
+```
+
+输出 `images/*_pred.jpg`（黄=GT、红/绿/蓝=三专家预测）、`predictions.csv`（逐图计数）与 `summary.json`（MAE/RMSE、专家使用）。
 
 ### 判断专家坍缩
 
