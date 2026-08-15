@@ -1,0 +1,20 @@
+# CrowdCounting 运行依赖
+# 实测环境: Python 3.13.9 / torch 2.12.1+cu130 / ultralytics 8.4.71 (见 train_v4.log)
+# GPU 机器安装 CUDA 版 torch 请使用:
+#   pip install torch torchvision --index-url https://download.pytorch.org/whl/cu130
+
+# 核心框架
+ultralytics>=8.4.0        # YOLO11/YOLO26 支持 (yolo26n.pt 需要 8.4+)
+torch>=2.5.0              # Python 3.13 支持; 实测 2.12.1+cu130
+torchvision>=0.20.0
+
+# 数值与图像
+numpy>=1.26.0
+opencv-python>=4.8.0      # cv2: 数据增强、可视化绘图
+
+# 数据处理
+scipy>=1.13.0             # scipy.io 解析 .mat 真值; scipy.optimize.linear_sum_assignment (MoE 匈牙利匹配)
+h5py>=3.10.0              # 解析 v7.3 格式 .mat 文件
+PyYAML>=6.0               # 数据集 yaml 配置
+
+# 注: matplotlib/tqdm/pandas 等由 ultralytics 自动安装, 项目代码未直接使用, 无需显式声明
