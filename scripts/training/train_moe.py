@@ -795,7 +795,7 @@ def train_moe(args):
     logging.info("训练结束。")
 
 
-def parse_args():
+def build_parser():
     parser = argparse.ArgumentParser(
         description="训练 YOLO11 + 点级 Scale-MoE Head 人群计数模型"
     )
@@ -909,7 +909,11 @@ def parse_args():
         "--resume", type=str, default=None,
         help="从指定 checkpoint 恢复训练"
     )
-    return parser.parse_args()
+    return parser
+
+
+def parse_args():
+    return build_parser().parse_args()
 
 
 if __name__ == "__main__":
