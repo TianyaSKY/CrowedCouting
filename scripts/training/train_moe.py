@@ -53,6 +53,7 @@ def evaluate_count_mae(model, val_loader, device):
 
     total_abs_error = {"soft": 0.0, "hard": 0.0}
     total_images = 0
+    hard_usage = torch.zeros(3, dtype=torch.int64, device=device)
 
     with torch.no_grad():
         for batch in tqdm(
@@ -84,6 +85,15 @@ def evaluate_count_mae(model, val_loader, device):
                         float(pred_counts[i]) - gt_count
                     )
 
+                if hard_route:
+                    # 硬路由使用率：所有候选点 argmax 到的专家分布
+                    hard_usage += (
+                        predictions["gates"]
+                        .argmax(dim=-1)
+                        .flatten()
+                        .bincount(minlength=3)
+                    )
+
             total_images += len(gt_counts)
 
     model.train()
@@ -95,7 +105,7 @@ def evaluate_count_mae(model, val_loader, device):
         total_images, 1
     )
 
-    return soft_mae, hard_mae
+    return soft_mae, hard_mae, hard_usage
 
 
 def train_moe(args):
@@ -233,6 +243,8 @@ def train_moe(args):
         model.train()
         total_loss = 0.0
         num_batches = 0
+        gate_mean = torch.zeros(3, device=device)
+        target_mean = torch.zeros(3, device=device)
 
         for batch in tqdm(
             train_loader,
@@ -256,6 +268,15 @@ def train_moe(args):
                 image_size=images.shape[-2:],
             )
 
+            # 诊断：本 batch 候选点的平均 gate 分布（软阶段=soft 门，
+            # 硬阶段=one-hot 使用率），与 GT 目标分布对比
+            gate_mean += predictions["gates"].reshape(
+                -1, 3
+            ).mean(dim=0)
+            target_mean += loss_items["gate_target"].to(
+                device
+            )
+
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
 
@@ -272,8 +293,16 @@ def train_moe(args):
         avg_loss = total_loss / max(num_batches, 1)
 
         # 6. 验证与保存
-        soft_mae, hard_mae = evaluate_count_mae(
+        soft_mae, hard_mae, hard_usage = evaluate_count_mae(
             model, val_loader, device
+        )
+
+        gate_pct = gate_mean / max(num_batches, 1) * 100
+        target_pct = target_mean / max(num_batches, 1) * 100
+        usage_pct = (
+            hard_usage.float()
+            / max(int(hard_usage.sum()), 1)
+            * 100
         )
 
         print(
@@ -287,6 +316,14 @@ def train_moe(args):
             f"hard_route={hard_route} "
             f"soft_MAE={soft_mae:.3f} "
             f"hard_MAE={hard_mae:.3f}"
+        )
+        print(
+            f"  gate  =E0:{gate_pct[0]:.1f}% E1:{gate_pct[1]:.1f}% "
+            f"E2:{gate_pct[2]:.1f}%"
+            f" | target=E0:{target_pct[0]:.1f}% "
+            f"E1:{target_pct[1]:.1f}% E2:{target_pct[2]:.1f}%"
+            f" | 硬路由使用=E0:{usage_pct[0]:.1f}% "
+            f"E1:{usage_pct[1]:.1f}% E2:{usage_pct[2]:.1f}%"
         )
 
         last_path = os.path.join(args.save_dir, "last.pt")

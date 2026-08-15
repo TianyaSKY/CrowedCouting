@@ -152,6 +152,10 @@ class PointMoELoss(nn.Module):
         count_loss = logits.new_zeros(())
         route_loss = logits.new_zeros(())
 
+        # 诊断：GT 尺度目标的 argmax 分布，与预测 gate 分布对比
+        target_gate_hist = logits.new_zeros(num_experts)
+        target_gate_points = 0
+
         for batch_index in range(batch_size):
             gt = ground_truth_points[batch_index].to(
                 points.device
@@ -265,6 +269,11 @@ class PointMoELoss(nn.Module):
                         self.scale_sigma_octaves,
                     )
 
+                    target_gate_hist += target_gate.argmax(
+                        dim=1
+                    ).bincount(minlength=num_experts).float()
+                    target_gate_points += number_of_gt
+
                     matched_route = route_logits_flat[
                         batch_index
                     ][matched_full_indices]
@@ -312,4 +321,7 @@ class PointMoELoss(nn.Module):
             "point": point_loss.detach(),
             "count": count_loss.detach(),
             "route": route_loss.detach(),
+            "gate_target": (
+                target_gate_hist / max(target_gate_points, 1)
+            ).detach(),
         }
