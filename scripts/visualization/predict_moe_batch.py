@@ -205,7 +205,15 @@ def predict_batch(args):
             crop_points = predictions["points"][0]
             routes = predictions["gates"].argmax(dim=-1)[0]
 
-            keep = scores > args.conf
+            # soft 口径与训练验证一致：全部候选 sigmoid 求和；
+            # 可视化仍用阈值点，否则密集图会画满整幅图
+            if args.count_mode == "soft":
+                pred_count = float(scores.sum().item())
+                keep = scores > args.conf
+            else:
+                keep = scores > args.conf
+                pred_count = int(keep.sum().item())
+
             crop_points = crop_points[keep].cpu().numpy()
             routes = routes[keep].cpu().numpy()
 
@@ -264,6 +272,7 @@ def predict_batch(args):
         "mae": float(mae),
         "rmse": float(rmse),
         "conf": args.conf,
+        "count_mode": args.count_mode,
         "imgsz": args.imgsz,
         "checkpoint": args.checkpoint,
         "expert_usage": {
@@ -316,7 +325,13 @@ def parse_args():
     )
     parser.add_argument(
         "--conf", type=float, default=0.5,
-        help="置信度阈值"
+        help="置信度阈值（thresh 计数与可视化点筛选）"
+    )
+    parser.add_argument(
+        "--count-mode", type=str,
+        choices=["soft", "thresh"], default="thresh",
+        help="计数口径: soft=所有候选 sigmoid 之和(与训练验证一致), "
+        "thresh=置信度大于 conf 的点数"
     )
     parser.add_argument(
         "--out-dir", type=str,
