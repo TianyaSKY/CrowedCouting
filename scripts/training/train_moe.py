@@ -1,6 +1,7 @@
 import argparse
 import logging
 import os
+import shutil
 
 import numpy as np
 import torch
@@ -104,11 +105,13 @@ def evaluate_count_mae(model, val_loader, device):
                     )
 
                 if hard_route:
-                    # 硬路由使用率：所有候选点 argmax 到的专家分布
+                    # 硬路由使用率：仅统计前景候选（置信度>0.5）的 argmax
+                    # 分布。全部候选统计会被背景点污染（背景 gate 不受
+                    # route 监督，实测漂移到 E2 74% 而真实前景 E2=0%）。
+                    fg_mask = scores > 0.5
                     hard_usage += (
-                        predictions["gates"]
+                        predictions["gates"][fg_mask]
                         .argmax(dim=-1)
-                        .flatten()
                         .bincount(minlength=3)
                     )
 
@@ -134,6 +137,18 @@ def train_moe(args):
         "cuda" if torch.cuda.is_available() else "cpu"
     )
     logging.info(f"使用设备: {device}")
+
+    # 覆盖保护：从头训练进入已有 save-dir 时，备份现有 best.pt，
+    # 防止新 run 第一个 epoch 就把历史最佳覆盖掉
+    if not args.resume:
+        old_best = os.path.join(args.save_dir, "best.pt")
+        if os.path.exists(old_best):
+            backup = os.path.join(
+                args.save_dir, "best_prev.pt"
+            )
+            if not os.path.exists(backup):
+                shutil.copy2(old_best, backup)
+                logging.info(f"旧 best 已备份到 {backup}")
 
     # 1. 模型
     model = YOLO11MoEPoint(
@@ -240,8 +255,6 @@ def train_moe(args):
                 args.save_dir, "best_pre_resume.pt"
             )
             if not os.path.exists(backup):
-                import shutil
-
                 shutil.copy2(old_best, backup)
                 logging.info(f"旧 best 已备份到 {backup}")
 
