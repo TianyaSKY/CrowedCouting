@@ -1,101 +1,69 @@
+"""下载 ShanghaiTech (Zhang et al. 2016) 人群计数数据集 A/B 两部分。
+
+官方仓库 desenzhou/ShanghaiTechDataset 提供的下载源（2024 更新版，Dropbox 镜像，
+约 166 MB）: 见 DEFAULT_URL。
+
+数量情况:
+  - Part A: 300 train / 182 test（本项目另从 train 随机抽 30 张作 val）
+  - Part B: 400 train / 316 test（本项目另从 train 随机抽 40 张作 val）
+
+备用源（需手动获取）:
+  - 百度网盘: https://pan.baidu.com/s/1xJnhmJbwPdnNKBM1K6F1Cg?pwd=iga3
+  - Kaggle:   https://www.kaggle.com/datasets/xyyu18/shanghaitech-crowd-counting-dataset
+
+解压后结构（data/）:
+  part_A_final/{train,test}_data/images/*.jpg, ground_truth/*.mat
+  part_B_final/{train,test}_data/images/*.jpg, ground_truth/*.mat
+"""
+
 import argparse
 import os
-import shutil
-import urllib.request
-import zipfile
 
-# 官方仓库 desenzhou/ShanghaiTechDataset 提供的下载源（2024 更新版）
+from ._download_common import DownloadError, download_file, extract_zip
+
 DEFAULT_URL = (
     "https://www.dropbox.com/scl/fi/dkj5kulc9zj0rzesslck8/"
     "ShanghaiTech_Crowd_Counting_Dataset.zip"
     "?rlkey=ymbcj50ac04uvqn8p49j9af5f&dl=1"
 )
-
-# 备用源（需手动获取）：
-# - 百度网盘: https://pan.baidu.com/s/1xJnhmJbwPdnNKBM1K6F1Cg?pwd=iga3
-# - Kaggle:   https://www.kaggle.com/datasets/xyyu18/shanghaitech-crowd-counting-dataset
-
-
-def download_file(url, dest_path):
-    """带进度输出的单文件下载（仅用标准库）。"""
-    print(f"开始下载: {url}")
-    print(f"保存到: {dest_path}")
-
-    tmp_path = dest_path + ".part"
-
-    def report(block_count, block_size, total_size):
-        downloaded = block_count * block_size
-        if total_size > 0:
-            percent = min(100.0, downloaded * 100.0 / total_size)
-            print(f"\r下载进度: {percent:5.1f}% ({downloaded / 1e6:.1f} MB)", end="")
-
-    try:
-        urllib.request.urlretrieve(
-            url, tmp_path, reporthook=report
-        )
-    except Exception as e:
-        if os.path.exists(tmp_path):
-            os.remove(tmp_path)
-        raise RuntimeError(
-            f"下载失败: {e}\n"
-            "请检查网络，或改用 --url 指定其他镜像源。"
-        )
-
-    print()
-    os.replace(tmp_path, dest_path)
-    print(f"下载完成: {dest_path}")
-
-
-def extract_zip(zip_path, dest_dir):
-    """解压 zip，期望顶层包含 part_A_final/ 与 part_B_final/。"""
-    print(f"解压 {zip_path} -> {dest_dir}")
-
-    with zipfile.ZipFile(zip_path) as zf:
-        members = zf.namelist()
-        top_levels = {
-            m.split("/", 1)[0] for m in members if "/" in m
-        }
-        print(f"zip 顶层目录: {sorted(top_levels)}")
-
-        if not any(
-            t in {"part_A_final", "part_B_final"}
-            for t in top_levels
-        ):
-            raise RuntimeError(
-                "zip 中未找到 part_A_final/part_B_final，请检查镜像源内容"
-            )
-
-        zf.extractall(dest_dir)
-
-    # 清理 zip 临时文件
-    os.remove(zip_path)
+ZIP_NAME = "ShanghaiTech_Crowd_Counting_Dataset.zip"
+EXPECT_DIRS = ("part_A_final", "part_B_final")
 
 
 def download_shanghaitech(url=None, data_dir="data", keep_zip=False):
     """下载并解压 ShanghaiTech 数据集到 data/part_A_final 与 data/part_B_final。"""
+    print(
+        "ShanghaiTech: Part A 300 train / 182 test，Part B 400 train / 316 test；"
+        "压缩包约 166 MB"
+    )
     url = url or DEFAULT_URL
     os.makedirs(data_dir, exist_ok=True)
 
     # 已存在则跳过
     if all(
         os.path.isdir(os.path.join(data_dir, name))
-        for name in ("part_A_final", "part_B_final")
+        for name in EXPECT_DIRS
     ):
         print("data/part_A_final 与 data/part_B_final 已存在，跳过下载。")
         return
 
-    zip_path = os.path.join(data_dir, "ShanghaiTech_Crowd_Counting_Dataset.zip")
+    zip_path = os.path.join(data_dir, ZIP_NAME)
 
     if not os.path.exists(zip_path):
-        download_file(url, zip_path)
+        download_file(url, zip_path, note="约 166 MB")
     else:
         print(f"已存在 {zip_path}，跳过下载。")
 
-    extract_zip(zip_path, data_dir)
+    extract_zip(zip_path, data_dir, expect_tops=set(EXPECT_DIRS))
 
     if not keep_zip and os.path.exists(zip_path):
         os.remove(zip_path)
 
+    if not all(
+        os.path.isdir(os.path.join(data_dir, name))
+        for name in EXPECT_DIRS
+    ):
+        raise DownloadError("解压后未找到 part_A_final/part_B_final，请检查镜像源内容")
     print("ShanghaiTech 数据集准备完成。")
     print("下一步: python -m scripts.data.prepare_combined")
 
