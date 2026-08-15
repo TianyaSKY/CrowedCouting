@@ -278,14 +278,34 @@ class PointMoELoss(nn.Module):
                         batch_index
                     ][matched_full_indices]
 
-                    route_loss = route_loss + (
-                        F.cross_entropy(
-                            matched_route,
-                            target_gate[gt_indices],
-                            reduction="sum",
+                    # macro 类别平衡：GT 目标 E0~60%/E1~27%/E2~13%，
+                    # 逐点 CE 会让 E0 天然主导 route 梯度，E2 永远学不动。
+                    # 改为：按 hard 目标类别分组，组内 soft-target CE 取
+                    # 均值，再对三个类别取均值——各类别对 Router 训练
+                    # 同等重要，但不强制最终路由比例 33/33/33。
+                    per_point_route = -(
+                        target_gate[gt_indices]
+                        * F.log_softmax(
+                            matched_route, dim=-1
                         )
-                        / number_of_gt
-                    )
+                    ).sum(dim=-1)
+
+                    hard_target = target_gate[
+                        gt_indices
+                    ].argmax(dim=-1)
+
+                    class_route_losses = []
+                    for expert_id in range(num_experts):
+                        mask = hard_target == expert_id
+                        if mask.any():
+                            class_route_losses.append(
+                                per_point_route[mask].mean()
+                            )
+
+                    if class_route_losses:
+                        route_loss = route_loss + torch.stack(
+                            class_route_losses
+                        ).mean()
 
             cls_loss = cls_loss + (
                 sigmoid_focal_loss(

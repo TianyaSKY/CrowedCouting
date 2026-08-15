@@ -225,6 +225,7 @@ class MoEPointHead(nn.Module):
         features: list[torch.Tensor],
         temperature: float = 1.0,
         hard_route: bool = False,
+        router_grad: bool = True,
     ) -> dict[str, torch.Tensor]:
         p3, p4, p5 = features
 
@@ -303,19 +304,29 @@ class MoEPointHead(nn.Module):
             dim=2,
         )
 
+        # 梯度隔离：router_grad=False 时，混合用的 gate 不携带梯度，
+        # cls/point/count 不会通过 gate 反向传播到 Router（避免
+        # winner-take-all 正反馈：质量好的专家被选中更多 -> 更多任务梯度
+        # -> 更强，少数专家饿死）。Router 此时只由 L_route 训练。
+        # predictions 仍返回未 detach 的 gate / route_logits 供诊断。
+        if router_grad:
+            mix_gate = gate
+        else:
+            mix_gate = gate.detach()
+
         # soft 阶段在概率空间混合: p = sum(g * sigmoid(z))，再转回 logit，
         # 避免 logits 线性混合时专家置信度相互抵消；硬路由 one-hot 时
         # logit(sigmoid(z_j)) = z_j，退化为原来的单专家 logit
         expert_probabilities = expert_scores.sigmoid()
         mixed_probability = (
-            gate * expert_probabilities
+            mix_gate * expert_probabilities
         ).sum(dim=2).clamp(1e-7, 1.0 - 1e-7)
         final_logits = torch.log(
             mixed_probability
         ) - torch.log1p(-mixed_probability)
 
         final_offsets = (
-            gate.unsqueeze(3) * expert_offsets
+            mix_gate.unsqueeze(3) * expert_offsets
         ).sum(dim=2)
 
         # 展平顺序：H、W、K

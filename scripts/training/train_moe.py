@@ -280,6 +280,80 @@ def evaluate_count_mae(
     )
 
 
+def temperature_for_epoch(
+    epoch: int,
+    hard_route: bool,
+    first_hard_epoch: int | None,
+    args,
+) -> float:
+    """阶段化温度调度。
+
+    T 不改变 argmax（argmax(z/T) == argmax(z)），降低 T 只会让
+    soft gate 更尖锐，不会把错误的 E0 argmax 修成 E1，所以：
+    - 软阶段：init-temperature -> phase1-temp（router-grad-epoch
+      到达）-> soft-temp-floor（temp-floor-epoch 到达），下限 1.0；
+    - hard 阶段：soft-temp-floor -> min-temperature，
+      历时 hard-temp-epochs。
+    """
+    if hard_route:
+        if first_hard_epoch is None:
+            return args.soft_temp_floor
+        progress = min(
+            epoch - first_hard_epoch,
+            args.hard_temp_epochs,
+        )
+        return max(
+            args.min_temperature,
+            args.soft_temp_floor
+            - (
+                args.soft_temp_floor
+                - args.min_temperature
+            )
+            * progress
+            / max(args.hard_temp_epochs, 1),
+        )
+
+    if epoch <= args.router_grad_epoch:
+        progress = epoch / max(args.router_grad_epoch, 1)
+        temperature = (
+            args.init_temperature
+            - (args.init_temperature - args.phase1_temp)
+            * progress
+        )
+    else:
+        span = max(
+            args.temp_floor_epoch
+            - args.router_grad_epoch,
+            1,
+        )
+        progress = min(
+            epoch - args.router_grad_epoch, span
+        )
+        temperature = (
+            args.phase1_temp
+            - (args.phase1_temp - args.soft_temp_floor)
+            * progress
+            / span
+        )
+
+    return max(temperature, args.soft_temp_floor)
+
+
+def router_recalls(
+    route_confusion: torch.Tensor,
+) -> tuple[list[float], float]:
+    """混淆矩阵的行 recall（对角元/行和）与 macro recall。
+
+    recall[i] = 匹配到的 GT E_i 点中，路由到 E_i 的比例。
+    """
+    row_sums = route_confusion.sum(dim=1)
+    recalls = (
+        route_confusion.diagonal().float()
+        / row_sums.clamp_min(1).float()
+    )
+    return recalls.tolist(), float(recalls.mean())
+
+
 def train_moe(args):
     os.makedirs(args.save_dir, exist_ok=True)
     setup_logging(os.path.join(args.save_dir, "train.log"))
@@ -288,6 +362,15 @@ def train_moe(args):
         "cuda" if torch.cuda.is_available() else "cpu"
     )
     logging.info(f"使用设备: {device}")
+
+    graduate_recalls = tuple(
+        float(value)
+        for value in args.graduate_recalls.split(",")
+    )
+    if len(graduate_recalls) != 3:
+        raise ValueError(
+            "--graduate-recalls 需要 3 个值，如 0.60,0.40,0.30"
+        )
 
     # 覆盖保护：从头训练进入已有 save-dir 时，备份现有 best.pt，
     # 防止新 run 第一个 epoch 就把历史最佳覆盖掉
@@ -369,6 +452,9 @@ def train_moe(args):
 
     start_epoch = 0
     best_mae = float("inf")
+    hard_started = False
+    grad_streak = 0
+    first_hard_epoch = None
 
     if args.resume and os.path.exists(args.resume):
         logging.info(f"从 {args.resume} 恢复训练")
@@ -397,6 +483,17 @@ def train_moe(args):
             optimizer = build_optimizer(model, args)
         start_epoch = checkpoint.get("epoch", 0) + 1
         best_mae = checkpoint.get("best_mae", float("inf"))
+        hard_started = checkpoint.get(
+            "hard_started",
+            # 旧版 checkpoint 无该字段：旧默认 hard_route_epoch=20，
+            # 用 checkpoint epoch 是否已过切换点做迁移推断
+            checkpoint.get("epoch", 0) >= 20,
+        )
+        grad_streak = checkpoint.get("grad_streak", 0)
+        first_hard_epoch = checkpoint.get(
+            "first_hard_epoch",
+            checkpoint.get("epoch") if hard_started else None,
+        )
 
         # 覆盖保护：resume 前把当前 best.pt 备份，防止新 run 覆盖掉
         # 历史最佳（曾发生 epoch 47 的 45.68 覆盖 epoch 40 的 43.96 事故）
@@ -409,32 +506,48 @@ def train_moe(args):
                 shutil.copy2(old_best, backup)
                 logging.info(f"旧 best 已备份到 {backup}")
 
-        # 只有 checkpoint 的 best 记录于软路由阶段（epoch < 切换点）时，
-        # 才需要重置基准为 hard 口径；硬阶段记录的直接沿用，
-        # 避免从 last.pt 恢复时把已有的历史 best 清掉
-        if (
-            checkpoint.get("epoch", 0) < args.hard_route_epoch
-            and start_epoch >= args.hard_route_epoch
-        ):
-            best_mae = float("inf")
-            logging.info(
-                "checkpoint best 为软路由口径，"
-                "基准重置为 hard MAE"
-            )
-
         # 恢复后若已超过冻结期，解冻 YOLO（不重建优化器，保留状态）
         if start_epoch >= args.freeze_epochs:
             for param in model.yolo.parameters():
                 param.requires_grad = True
 
     # 5. 训练循环
+    # hard 路由由 Router 毕业条件决定（混淆矩阵 recall 连续达标），
+    # 不由 epoch 决定；未达标就继续 soft——提前切 hard 等于
+    # 正式宣布少数专家死刑。可选 --force-hard-epoch 强制覆盖。
+    was_hard_route = hard_started
+
     for epoch in range(start_epoch, args.epochs):
-        temperature = max(
-            args.min_temperature,
-            args.init_temperature
-            - args.temperature_decay * epoch / 30.0,
+        hard_route = hard_started
+        router_grad = epoch >= args.router_grad_epoch
+
+        if (
+            not hard_route
+            and args.force_hard_epoch is not None
+            and epoch >= args.force_hard_epoch
+        ):
+            hard_started = True
+            hard_route = True
+            logging.info(
+                f"强制启用硬路由（force-hard-epoch="
+                f"{args.force_hard_epoch}）"
+            )
+
+        # 软->硬切换：best 基准重置为 hard 口径
+        if hard_route and not was_hard_route:
+            was_hard_route = True
+            first_hard_epoch = epoch
+            best_mae = float("inf")
+            logging.info(
+                "切换硬路由，best 基准重置为 hard MAE"
+            )
+
+        temperature = temperature_for_epoch(
+            epoch,
+            hard_route,
+            first_hard_epoch,
+            args,
         )
-        hard_route = epoch >= args.hard_route_epoch
 
         # 到达解冻点：解冻 YOLO，不重建优化器——
         # 冻结参数在优化器中自动跳过，解冻后自然开始积累 Adam 状态
@@ -471,6 +584,7 @@ def train_moe(args):
                 images,
                 temperature=temperature,
                 hard_route=hard_route,
+                router_grad=router_grad,
             )
 
             loss, loss_items = criterion(
@@ -541,6 +655,7 @@ def train_moe(args):
             f"route={avg_loss_items['route']:.4f} "
             f"T={temperature:.2f} "
             f"hard_route={hard_route} "
+            f"router_grad={router_grad} "
             f"soft_MAE={soft_mae:.3f} "
             f"hard_MAE={hard_mae:.3f}"
         )
@@ -557,8 +672,10 @@ def train_moe(args):
         # 列=预测专家。主对角线占优说明 Router 学到尺度分工；
         # 某行集中到 E0 说明该尺度的专家在 hard 阶段拿不到样本。
         if matched_points > 0:
+            # 0~1 比例乘 100 再拼 %（此前漏乘 100，1.0 显示成 "1.0%"）
             confusion_pct = (
-                route_confusion.float()
+                100.0
+                * route_confusion.float()
                 / route_confusion.sum(
                     dim=1, keepdim=True
                 ).clamp_min(1)
@@ -576,19 +693,63 @@ def train_moe(args):
                     f"  (n={int(row_counts[expert_index])})"
                 )
 
-        # best 选择：软路由阶段按 soft MAE、硬路由阶段按 hard MAE
-        # （最终推理使用硬路由）。切换硬路由时重置基准，
-        # 避免 soft 阶段的 best 继续占位。
-        # 必须先于 last.pt 保存执行：否则 last.pt 记录的还是旧的
-        # （软路由口径）best_mae，从该 last.pt resume 时
-        # "checkpoint epoch < hard_route_epoch" 判断不成立，
-        # 旧基准会继续作为 hard 阶段门槛。
-        if hard_route:
-            if epoch == args.hard_route_epoch:
-                best_mae = float("inf")
-                logging.info(
-                    "切换硬路由，best 基准重置为 hard MAE"
+        # Router 毕业检查：E0/E1/E2 recall 均达标且 macro recall 达标，
+        # 连续 graduate-stable-epochs 轮后才切 hard（下一 epoch 生效）。
+        # 未达标就继续 soft，不因 epoch 到了就强制切换。
+        if not hard_started:
+            if matched_points > 0:
+                recalls, macro_recall = router_recalls(
+                    route_confusion
                 )
+                if (
+                    recalls[0] >= graduate_recalls[0]
+                    and recalls[1] >= graduate_recalls[1]
+                    and recalls[2] >= graduate_recalls[2]
+                    and macro_recall >= args.graduate_macro_recall
+                ):
+                    grad_streak += 1
+                    if (
+                        grad_streak
+                        >= args.graduate_stable_epochs
+                    ):
+                        hard_started = True
+                        # 立即记录首个 hard epoch（epoch+1）：若在此
+                        # checkpoint 处 resume，hard 温度调度才能续上
+                        first_hard_epoch = epoch + 1
+                        logging.info(
+                            f"Router 毕业（连续 {grad_streak} 轮达标，"
+                            f"recall=E0:{recalls[0]:.2f} "
+                            f"E1:{recalls[1]:.2f} "
+                            f"E2:{recalls[2]:.2f} "
+                            f"macro={macro_recall:.2f}），"
+                            "下一 epoch 进入 hard 路由"
+                        )
+                    else:
+                        logging.info(
+                            f"Router 达标 streak="
+                            f"{grad_streak}/"
+                            f"{args.graduate_stable_epochs} "
+                            f"(recall=E0:{recalls[0]:.2f} "
+                            f"E1:{recalls[1]:.2f} "
+                            f"E2:{recalls[2]:.2f} "
+                            f"macro={macro_recall:.2f})"
+                        )
+                else:
+                    grad_streak = 0
+                    logging.info(
+                        f"Router 未达标，继续 soft "
+                        f"(recall=E0:{recalls[0]:.2f} "
+                        f"E1:{recalls[1]:.2f} "
+                        f"E2:{recalls[2]:.2f} "
+                        f"macro={macro_recall:.2f})"
+                    )
+
+        # best 选择：软路由阶段按 soft MAE、硬路由阶段按 hard MAE
+        # （最终推理使用硬路由）。软->硬切换时的基准重置已由循环开头
+        # 的切换检测完成。必须先于 last.pt 保存执行：否则 last.pt
+        # 记录的还是旧的（软路由口径）best_mae，从该 last.pt resume
+        # 时会把旧基准继续作为 hard 阶段门槛。
+        if hard_route:
             val_mae_for_best = hard_mae
             metric_name = "hard MAE"
         else:
@@ -604,6 +765,9 @@ def train_moe(args):
                     "optimizer": optimizer.state_dict(),
                     "epoch": epoch,
                     "best_mae": best_mae,
+                    "hard_started": hard_started,
+                    "grad_streak": grad_streak,
+                    "first_hard_epoch": first_hard_epoch,
                     "args": vars(args),
                 },
                 best_path,
@@ -620,6 +784,9 @@ def train_moe(args):
                 "optimizer": optimizer.state_dict(),
                 "epoch": epoch,
                 "best_mae": best_mae,
+                "hard_started": hard_started,
+                "grad_streak": grad_streak,
+                "first_hard_epoch": first_hard_epoch,
                 "args": vars(args),
             },
             last_path,
@@ -668,24 +835,56 @@ def parse_args():
         "--weight-decay", type=float, default=1e-4
     )
     parser.add_argument(
-        "--init-temperature", type=float, default=2.0
+        "--init-temperature", type=float, default=2.0,
+        help="软阶段起始温度"
     )
     parser.add_argument(
-        "--min-temperature", type=float, default=0.5
+        "--min-temperature", type=float, default=0.5,
+        help="hard 阶段温度下限"
     )
     parser.add_argument(
-        "--temperature-decay", type=float, default=1.5,
-        help="温度随 epoch 衰减量（30 epoch 内衰减完）"
+        "--phase1-temp", type=float, default=1.3,
+        help="router-grad-epoch 时的温度（epoch 0 到该点线性插值）"
     )
     parser.add_argument(
-        "--hard-route-epoch", type=int, default=35,
-        help="启用 Top-1 硬路由的起始 epoch（建议 30+，"
-        "给 Router 更长的软路由学习期，避免 winner-take-all 过早）"
+        "--soft-temp-floor", type=float, default=1.0,
+        help="hard 切换前的温度下限。T 不改变 argmax，"
+        "降到 0.5 只会让 soft gate 更尖锐，无助于 Router 学尺度"
+    )
+    parser.add_argument(
+        "--temp-floor-epoch", type=int, default=30,
+        help="软阶段温度降到 soft-temp-floor 的 epoch"
+    )
+    parser.add_argument(
+        "--hard-temp-epochs", type=int, default=20,
+        help="hard 阶段温度从 soft-temp-floor 衰减到 "
+        "min-temperature 的 epoch 数"
+    )
+    parser.add_argument(
+        "--router-grad-epoch", type=int, default=15,
+        help="从该 epoch 起允许 cls/point/count 梯度流入 Router；"
+        "之前 Router 只接受 balanced L_route（梯度隔离）"
+    )
+    parser.add_argument(
+        "--force-hard-epoch", type=int, default=None,
+        help="可选：强制在该 epoch 启用硬路由，绕过毕业条件"
+    )
+    parser.add_argument(
+        "--graduate-recalls", type=str,
+        default="0.60,0.40,0.30",
+        help="Router 毕业条件：混淆矩阵上 E0/E1/E2 的最小 recall"
+    )
+    parser.add_argument(
+        "--graduate-macro-recall", type=float, default=0.50,
+        help="Router 毕业条件：macro recall 下限"
+    )
+    parser.add_argument(
+        "--graduate-stable-epochs", type=int, default=3,
+        help="连续满足毕业条件的 epoch 数后才切 hard"
     )
     parser.add_argument(
         "--route-weight", type=float, default=0.15,
-        help="尺度路由监督(CE)损失权重（0.05 太弱，Router 会被"
-        "分类/计数梯度带偏，建议 0.15~0.25）"
+        help="尺度路由监督(macro CE)损失权重"
     )
     parser.add_argument(
         "--match-top-k", type=int, default=2000,
