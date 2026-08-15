@@ -155,7 +155,8 @@ python -m scripts.training.train_moe \
 - **日志**：每 epoch 输出 `route`（路由 CE）、`T`、`hard_route`、`router_grad`、
   `soft_MAE`/`hard_MAE`、GT 尺度目标分布 `target` vs 预测 `gate`、硬路由使用率与混淆矩阵。
 - **best.pt 选取**：软路由阶段按 soft MAE、硬路由生效后按 hard MAE 选 best（最终推理即硬路由）。
-  输出到 `runs/moe_point/{best,last}.pt` + `train.log`。
+  未传 `--save-dir` 时输出到 `runs/moe_point_<时间戳>/{best,last}.pt` + `train.log`
+  （每次启动自动带时间戳，互不覆盖；`--resume` 时沿用原 run 目录）。
 
 ### 3. 评估与推理
 

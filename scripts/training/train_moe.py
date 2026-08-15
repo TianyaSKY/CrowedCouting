@@ -2,6 +2,7 @@ import argparse
 import logging
 import os
 import shutil
+import time
 
 # 解冻 YOLO 时 backward 图骤增，缓存分配器在 Blackwell(RTX50) 等新卡上
 # 容易碎片化，导致 cublasCreate 分配失败崩溃；启用可扩展段规避。
@@ -354,9 +355,27 @@ def router_recalls(
     return recalls.tolist(), float(recalls.mean())
 
 
+def timestamped_save_dir(base: str) -> str:
+    """为输出目录附加启动时间戳，避免不同 run 互相覆盖。"""
+    return f"{base}_{time.strftime('%Y%m%d_%H%M%S')}"
+
+
 def train_moe(args):
+    # 未显式指定输出目录时自动加时间戳；--resume 则沿用原 run 目录，
+    # 保证恢复训练仍写回同一目录（best/last 覆盖逻辑不变）。
+    if args.save_dir is None:
+        if args.resume:
+            args.save_dir = os.path.dirname(
+                os.path.abspath(args.resume)
+            )
+        else:
+            args.save_dir = timestamped_save_dir(
+                "runs/moe_point"
+            )
+
     os.makedirs(args.save_dir, exist_ok=True)
     setup_logging(os.path.join(args.save_dir, "train.log"))
+    logging.info("输出目录: %s", args.save_dir)
 
     device = (
         "cuda" if torch.cuda.is_available() else "cpu"
@@ -901,9 +920,9 @@ def build_parser():
         "--workers", type=int, default=4
     )
     parser.add_argument(
-        "--save-dir", type=str,
-        default="runs/moe_point",
-        help="权重保存目录"
+        "--save-dir", type=str, default=None,
+        help="权重保存目录（默认 runs/moe_point_<时间戳>；"
+        "--resume 时沿用原 run 目录）"
     )
     parser.add_argument(
         "--resume", type=str, default=None,

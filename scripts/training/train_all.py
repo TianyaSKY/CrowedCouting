@@ -71,8 +71,20 @@ def parse_dataset_spec(spec: str) -> tuple[str, str, list[str], str]:
 
 
 def train_all(args: argparse.Namespace) -> None:
+    # 未显式指定输出目录时自动加时间戳；--resume 沿用原 run 目录
+    if args.save_dir is None:
+        if args.resume:
+            args.save_dir = os.path.dirname(
+                os.path.abspath(args.resume)
+            )
+        else:
+            args.save_dir = tm.timestamped_save_dir(
+                "runs/moe_point_all"
+            )
+
     os.makedirs(args.save_dir, exist_ok=True)
     tm.setup_logging(os.path.join(args.save_dir, "train.log"))
+    logging.info("输出目录: %s", args.save_dir)
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     logging.info("使用设备: %s", device)
