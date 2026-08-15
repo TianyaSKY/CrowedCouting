@@ -1,4 +1,5 @@
 import argparse
+import logging
 import os
 
 import numpy as np
@@ -13,6 +14,23 @@ from scripts.data.point_dataset import (
     PointDataset,
     point_collate_fn,
 )
+
+
+def setup_logging(log_path: str) -> None:
+    """INFO 及以上同时写入控制台与日志文件。
+
+    tqdm 进度条走 stderr，不会混入日志文件。
+    """
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+        handlers=[
+            logging.StreamHandler(),
+            logging.FileHandler(log_path, encoding="utf-8"),
+        ],
+        force=True,
+    )
 
 
 def build_optimizer(model, args):
@@ -109,12 +127,13 @@ def evaluate_count_mae(model, val_loader, device):
 
 
 def train_moe(args):
+    os.makedirs(args.save_dir, exist_ok=True)
+    setup_logging(os.path.join(args.save_dir, "train.log"))
+
     device = (
         "cuda" if torch.cuda.is_available() else "cpu"
     )
-    print(f"使用设备: {device}")
-
-    os.makedirs(args.save_dir, exist_ok=True)
+    logging.info(f"使用设备: {device}")
 
     # 1. 模型
     model = YOLO11MoEPoint(
@@ -148,7 +167,7 @@ def train_moe(args):
         num_samples=100
     )
     if gt_counts.size > 0:
-        print(
+        logging.info(
             f"训练裁剪 GT 统计(采样 {gt_counts.size} 张): "
             f"mean={float(gt_counts.mean()):.1f} "
             f"median={float(np.median(gt_counts)):.0f} "
@@ -174,7 +193,7 @@ def train_moe(args):
 
     # 4. 前几个 epoch 冻结 YOLO 部分，只训练 Point Head
     if args.freeze_epochs > 0:
-        print(
+        logging.info(
             f"前 {args.freeze_epochs} 个 epoch 冻结 YOLO Backbone+Neck"
         )
         for param in model.yolo.parameters():
@@ -186,15 +205,15 @@ def train_moe(args):
     best_mae = float("inf")
 
     if args.resume and os.path.exists(args.resume):
-        print(f"从 {args.resume} 恢复训练")
+        logging.info(f"从 {args.resume} 恢复训练")
         checkpoint = torch.load(
             args.resume, map_location="cpu", weights_only=False
         )
         try:
             model.load_state_dict(checkpoint["model"])
         except RuntimeError as error:
-            print(
-                f"警告: 旧版 checkpoint 缺少新参数({error})，"
+            logging.warning(
+                f"旧版 checkpoint 缺少新参数({error})，"
                 "缺失部分使用初始化值"
             )
             model.load_state_dict(
@@ -205,8 +224,8 @@ def train_moe(args):
                 checkpoint["optimizer"]
             )
         except (ValueError, RuntimeError) as error:
-            print(
-                f"警告: 优化器状态不兼容({error})，"
+            logging.warning(
+                f"优化器状态不兼容({error})，"
                 "使用全新优化器重新开始优化"
             )
             optimizer = build_optimizer(model, args)
@@ -224,7 +243,7 @@ def train_moe(args):
                 import shutil
 
                 shutil.copy2(old_best, backup)
-                print(f"旧 best 已备份到 {backup}")
+                logging.info(f"旧 best 已备份到 {backup}")
 
         # 只有 checkpoint 的 best 记录于软路由阶段（epoch < 切换点）时，
         # 才需要重置基准为 hard 口径；硬阶段记录的直接沿用，
@@ -234,7 +253,7 @@ def train_moe(args):
             and start_epoch >= args.hard_route_epoch
         ):
             best_mae = float("inf")
-            print(
+            logging.info(
                 "checkpoint best 为软路由口径，"
                 "基准重置为 hard MAE"
             )
@@ -258,7 +277,9 @@ def train_moe(args):
         if args.freeze_epochs > 0 and epoch == args.freeze_epochs:
             for param in model.yolo.parameters():
                 param.requires_grad = True
-            print("解冻 YOLO Backbone+Neck（保留优化器状态，不重建）")
+            logging.info(
+                "解冻 YOLO Backbone+Neck（保留优化器状态，不重建）"
+            )
 
         model.train()
         total_loss = 0.0
@@ -325,7 +346,7 @@ def train_moe(args):
             * 100
         )
 
-        print(
+        logging.info(
             f"[Epoch {epoch + 1}/{args.epochs}] "
             f"loss={avg_loss:.4f} "
             f"cls={float(loss_items['cls']):.4f} "
@@ -337,7 +358,7 @@ def train_moe(args):
             f"soft_MAE={soft_mae:.3f} "
             f"hard_MAE={hard_mae:.3f}"
         )
-        print(
+        logging.info(
             f"  gate  =E0:{gate_pct[0]:.1f}% E1:{gate_pct[1]:.1f}% "
             f"E2:{gate_pct[2]:.1f}%"
             f" | target=E0:{target_pct[0]:.1f}% "
@@ -364,7 +385,9 @@ def train_moe(args):
         if hard_route:
             if epoch == args.hard_route_epoch:
                 best_mae = float("inf")
-                print("切换硬路由，best 基准重置为 hard MAE")
+                logging.info(
+                    "切换硬路由，best 基准重置为 hard MAE"
+                )
             val_mae_for_best = hard_mae
             metric_name = "hard MAE"
         else:
@@ -384,12 +407,12 @@ def train_moe(args):
                 },
                 best_path,
             )
-            print(
+            logging.info(
                 f"  -> 新的最佳 {metric_name}: {best_mae:.3f}，"
                 f"已保存 {best_path}"
             )
 
-    print("训练结束。")
+    logging.info("训练结束。")
 
 
 def parse_args():

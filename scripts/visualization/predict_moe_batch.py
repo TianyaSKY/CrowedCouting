@@ -20,6 +20,7 @@ import argparse
 import csv
 import glob
 import json
+import logging
 import os
 
 import cv2
@@ -32,6 +33,23 @@ from scripts.visualization.predict_moe import (
     EXPERT_COLORS,
     load_model,
 )
+
+
+def setup_logging(log_path: str) -> None:
+    """INFO 及以上同时写入控制台与日志文件。
+
+    tqdm 进度条走 stderr，不会混入日志文件。
+    """
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+        handlers=[
+            logging.StreamHandler(),
+            logging.FileHandler(log_path, encoding="utf-8"),
+        ],
+        force=True,
+    )
 
 # GT 点: 黄色空心圆
 GT_COLOR = (0, 255, 255)
@@ -133,8 +151,11 @@ def draw_result(
 
 
 def predict_batch(args):
+    os.makedirs(args.out_dir, exist_ok=True)
+    setup_logging(os.path.join(args.out_dir, "predict.log"))
+
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    print(f"使用设备: {device}")
+    logging.info(f"使用设备: {device}")
 
     model = load_model(args.weights, args.checkpoint, device)
 
@@ -149,7 +170,6 @@ def predict_batch(args):
             f"未在 {image_dir} 中找到任何 jpg 图片"
         )
 
-    os.makedirs(args.out_dir, exist_ok=True)
     image_out_dir = os.path.join(args.out_dir, "images")
     os.makedirs(image_out_dir, exist_ok=True)
 
@@ -175,7 +195,9 @@ def predict_batch(args):
 
             image_bgr = cv2.imread(image_path)
             if image_bgr is None:
-                print(f"警告: 无法读取 {image_path}，跳过")
+                logging.warning(
+                    f"无法读取 {image_path}，跳过"
+                )
                 continue
 
             height, width = image_bgr.shape[:2]
@@ -329,17 +351,17 @@ def predict_batch(args):
     with open(summary_path, "w") as f:
         json.dump(summary, f, indent=2, ensure_ascii=False)
 
-    print(f"共处理 {num_images} 张验证图像")
-    print(f"MAE={mae:.3f}  RMSE={rmse:.3f}")
-    print(
+    logging.info(f"共处理 {num_images} 张验证图像")
+    logging.info(f"MAE={mae:.3f}  RMSE={rmse:.3f}")
+    logging.info(
         "专家使用: "
         + ", ".join(
             f"E{i}={int(expert_counts[i])}" for i in range(3)
         )
     )
-    print(f"可视化结果: {image_out_dir}")
-    print(f"逐图计数: {csv_path}")
-    print(f"汇总: {summary_path}")
+    logging.info(f"可视化结果: {image_out_dir}")
+    logging.info(f"逐图计数: {csv_path}")
+    logging.info(f"汇总: {summary_path}")
 
 
 def parse_args():

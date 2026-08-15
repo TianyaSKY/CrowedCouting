@@ -1,4 +1,5 @@
 import argparse
+import logging
 import os
 
 import cv2
@@ -20,7 +21,7 @@ def load_model(weights_path, checkpoint_path, device):
     model = YOLO11MoEPoint(weights=weights_path).to(device)
 
     if checkpoint_path and os.path.exists(checkpoint_path):
-        print(f"从 {checkpoint_path} 加载权重")
+        logging.info(f"从 {checkpoint_path} 加载权重")
         ckpt = torch.load(
             checkpoint_path,
             map_location="cpu",
@@ -29,22 +30,24 @@ def load_model(weights_path, checkpoint_path, device):
         state_dict = (
             ckpt["model"] if "model" in ckpt else ckpt
         )
-        print(
+        logging.info(
             f"checkpoint: epoch={ckpt.get('epoch')} "
             f"best_mae={ckpt.get('best_mae')}"
         )
         try:
             model.load_state_dict(state_dict)
         except RuntimeError as error:
-            print(
-                f"警告: 旧版 checkpoint 缺少新参数({error})，"
+            logging.warning(
+                f"旧版 checkpoint 缺少新参数({error})，"
                 "缺失部分使用初始化值"
             )
             model.load_state_dict(
                 state_dict, strict=False
             )
     else:
-        print("警告: 未提供权重文件，模型使用随机初始化参数进行推理。")
+        logging.warning(
+            "未提供权重文件，模型使用随机初始化参数进行推理。"
+        )
 
     model.eval()
     return model
@@ -131,8 +134,16 @@ def draw_predictions(
 
 
 def predict_main(args):
+    # 单图脚本独立运行：默认控制台输出（batch 脚本会以 force 覆盖为文件）
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+        force=True,
+    )
+
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    print(f"使用设备: {device}")
+    logging.info(f"使用设备: {device}")
 
     model = load_model(args.weights, args.checkpoint, device)
 
@@ -148,9 +159,9 @@ def predict_main(args):
         conf_threshold=args.conf,
     )
 
-    print(f"检测到 {len(points)} 个人。")
+    logging.info(f"检测到 {len(points)} 个人。")
     for route in range(3):
-        print(
+        logging.info(
             f"  专家 {route}: {int((routes == route).sum())} 个点"
         )
 
@@ -159,7 +170,7 @@ def predict_main(args):
         ".jpg", "_moe_pred.jpg"
     )
     cv2.imwrite(out_path, result)
-    print(f"已将预测结果保存至 {out_path}")
+    logging.info(f"已将预测结果保存至 {out_path}")
 
 
 def parse_args():
