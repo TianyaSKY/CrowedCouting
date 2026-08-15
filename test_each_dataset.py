@@ -6,7 +6,7 @@ all candidates for each image. Results are reported for Part A, Part B, and the
 whole requested split.
 
 Example:
-    python -m scripts.evaluation.moe \
+    python test_each_dataset.py \
         --data-root datasets/shanghaitech_AB \
         --checkpoint runs/moe_point/best.pt \
         --split val \

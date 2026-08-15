@@ -1,131 +1,217 @@
 # CrowdCounting
 
-基于 YOLO11 的人群计数项目，包含两个分支：
+基于 YOLO11 的人群计数项目。模型不回归边界框，只预测人头中心点，支持多数据集。
 
-1. **v4 PointDetect 分支**（早期实现）：在 YOLO11 各尺度上添加逐尺度点检测头。
-2. **点级 Scale-MoE Head 分支**（当前推荐）：保留 YOLO11 Backbone+Neck、删除原始
-   Detect Head，替换为统一候选点网格上的三专家 MoE 点检测头。
+两个分支：
+
+1. **点级 Scale-MoE Head 分支（当前推荐）**：保留 YOLO11 Backbone+Neck、删除原始
+   Detect Head，替换为统一候选点网格（P3 网格 × K 参考点）上的三专家 MoE 点检测头。
+   由 `scripts/training/train_moe.py` 训练，支持 JHU-Crowd++ 等多数据集。
+2. **v4 PointDetect 分支（旧实现）**：在 YOLO11 各尺度（P2–P5）上添加逐尺度点检测头，
+   走 ultralytics 训练管线。保留用于对照实验，不再推荐新训练。
+
+## 环境
+
+```bash
+pip install -r requirements.txt
+# GPU 机器装 CUDA 版 torch（实测环境 Python 3.13 / torch 2.12.1+cu130 / ultralytics 8.4.71）:
+#   pip install torch torchvision --index-url https://download.pytorch.org/whl/cu130
+```
+
+运行约定：**始终从项目根目录以模块方式执行**（`python -m scripts.xxx`），避免相对导入
+与工作目录问题。除标注 argparse 的脚本外，其余脚本的路径/参数写在 `__main__` 硬编码配置里，
+切换数据集或权重时直接改对应脚本底部即可。
 
 ## 目录
 
 - `models/`：模型结构、锚点生成和损失函数。
-  - `yolo11_pyramid.py`：`YOLO11Pyramid`，保留 Backbone+Neck、移除 Detect Head，输出 P3/P4/P5。
+  - `yolo11_pyramid.py`：`YOLO11Pyramid`，保留 Backbone+Neck、移除 Detect Head，
+    输出 P3/P4/P5（层索引与步长从 Detect Head 动态读取，不硬编码）。
   - `moe_point_head.py`：`MoEPointHead`，三个专家（局部/中层/大范围感受野）+ 点级 Router。
-  - `yolo11_moe_point.py`：`YOLO11MoEPoint`，Backbone+Neck + MoE Point Head 的组合网络。
-  - `point_moe_loss.py`：`PointMoELoss`，匈牙利匹配 + Focal 分类 + Smooth L1 + 计数 + 尺度路由监督。
-- `scripts/data/`：ShanghaiTech 数据集转换、离线增强与点标注转换。
-- `scripts/training/`：训练与恢复训练。
-- `scripts/evaluation/`：人数、定位和模型对比评估。
-- `scripts/visualization/`：单图预测、结果绘制与可视化对比。
+  - `yolo11_moe_point.py`：`YOLO11MoEPoint`，Backbone+Neck + MoE Point Head 组合网络。
+  - `point_moe_loss.py`：`PointMoELoss`，匈牙利匹配 + Focal 分类 + Smooth L1 定位 + 计数 + 尺度路由监督。
+  - `crowd_model.py` / `modules.py` / `loss.py` / `yolo11-crowd.yaml`：v4 分支（`CrowdCountingModel`
+    + `PointDetect` + `CrowdPointLoss`）。
+- `scripts/data/`：数据集下载（6 个公开数据集）、ShanghaiTech 转换、离线增强与点标注转换。
+- `scripts/training/`：`train_moe.py`（Scale-MoE，argparse）与 v4/标准模型训练脚本。
+- `scripts/evaluation/`：人数（MAE/RMSE）、点定位（P/R/F1）与模型对比评估。
+- `scripts/visualization/`：单图/批量预测、GT-Pred 对比与样本绘制。
 - `scripts/diagnostics/`：不修改数据的匹配逻辑检查工具。
+- `test_each_dataset.py`（根目录）：Scale-MoE 模型按 Part A/B 分组的评估脚本。
 - `runs/`：训练、评估与可视化输出（运行生成）。
 
-## 点级 Scale-MoE Head 分支
+## 数据集下载
 
-结构：
+`scripts/data/` 下提供各公开人群计数数据集的下载脚本（仅用标准库，带进度条，
+从项目根目录以模块方式执行）。原始数据统一落在 `data/`。
 
-```text
-输入图像
-   ↓
-YOLO11 Backbone
-   ↓
-YOLO11 PAN-FPN Neck
-   ↓
-P3(8)  P4(16)  P5(32)   ← 三个尺度只产生同一组 P3 候选点
-   ↓       ↓       ↓
-Point Router (g3, g4, g5)
-   ↓
-Expert3(F3) / Expert4(Up(F4)+α4·F3) / Expert5(Up(F5)+α5·F3)
-   ↓   α4/α5 可学习横向融合，初始为 0（纯尺度输入）
-每个候选点输出 (x, y, confidence)，候选点 = P3 网格 × K 个参考点
-```
+| 数据集 | 脚本 | 图像数量 | 标注/说明 |
+| --- | --- | --- | --- |
+| JHU-Crowd++ (Sindagi 2019) | `python -m scripts.data.download_jhu_crowd` | 4,372（train 2,272 / val 500 / test 1,600） | 约 151 万点标注；单图最多 25,791 人；含恶劣天气与无人图像 |
+| ShanghaiTech A (Zhang 2016) | `python -m scripts.data.download_shanghaitech`（A+B 一并下载） | 482（train 300 / test 182） | 本项目另从 train 随机抽 30 张作 val |
+| ShanghaiTech B (Zhang 2016) | 同上 | 716（train 400 / test 316） | 本项目另从 train 随机抽 40 张作 val |
+| UCF-CC-50 (Idrees 2013) | `python -m scripts.data.download_ucf_cc50` | 50 | 极端密集人群；按标准协议 5 折交叉验证（每折 40 train / 10 test） |
+| UCF-QNRF (Idrees 2018) | `python -m scripts.data.download_ucf_qnrf` | 1,535（train 1,201 / test 334） | 约 125 万点标注；压缩包约 4.5 GB |
 
-- 训练早期使用软路由（概率空间加权混合：$p=\sum_i g_i\sigma(z_i)$，再转回 logit），约第 20 epoch 后切换 Top-1 硬路由（Straight-Through）。
-- Router 温度从 2.0 线性衰减到 0.5。
-- 匹配：候选点与真实点做匈牙利一对一匹配，正候选点学习选择最合适的专家。
-- 路由监督：不再强制三专家 1/3 均匀使用，而是用 GT 点最近邻间距估计局部尺度，
-  映射为专家软目标（小间距→E3 精细、大间距→E5 大范围），与 Router logits 做交叉熵（`L_route`，权重 0.05）。
-  这让 Router 学到数据驱动的尺度语义。
+各脚本均支持 `--data-dir`（默认 `data/`）与 `--keep-zip`/`--keep-rar`；已存在目标目录时
+自动跳过；解压后打印实际顶层结构。大文件支持**断点续传**：下载中断会保留 `.part` 文件，
+重跑脚本自动从断点继续（并按 Content-Length 校验完整性）。来源说明（脚本内亦有注释）：
 
-### 准备数据
+- JHU-Crowd++：官方需在 crowd-counting.com 填表，脚本直接走社区公开 Google Drive
+  镜像（jhu_crowd_v2.0.zip，约 2.87 GB），自动处理 Drive 大文件确认页。
+- ShanghaiTech：官方 Dropbox 镜像（约 166 MB），可 `--url` 换源。
+- UCF-CC-50 / UCF-QNRF：官方 CRCV 直链（rar / zip）。
+
+## 快速开始（Scale-MoE 分支）
+
+### 1. 准备数据
+
+以 ShanghaiTech 为例（其余数据集需自行把原始数据放到 `data/` 下并准备点标注）：
 
 ```bash
-# 0. 下载官方数据集（约 166 MB，官方 Dropbox 镜像；也可用 --url 换源）
+# 0. 下载官方数据集（约 166 MB）
 python -m scripts.data.download_shanghaitech
 
-# 1. 生成合并数据集（现有 prepare_combined 生成 YOLO 虚拟框标签）
+# 1. 合并 A/B 生成 datasets/shanghaitech_AB：
+#    images/{train,val}/*.jpg + labels/{train,val}/*.txt（YOLO 虚拟框 0 nx ny 0.010000 0.010000）
+#    验证集 = 原始 test_data 映射（part_A_/part_B_ 前缀区分）
 python -m scripts.data.prepare_combined
 
-# 2. 将 YOLO 虚拟框标签（cls nx ny w h）转换为纯点标签（nx ny）
+# 2. 虚拟框标签转纯点标签（labels/ 每行第 2、3 列 -> points/ 每行 "nx ny"）
 python -m scripts.data.prepare_point_labels
 ```
 
-点标注格式（`datasets/shanghaitech_AB/points/{train,val}/*.txt`，每行）：
+`PointDataset`（`scripts/data/point_dataset.py`）读取 `images/ + points/`：训练走 5 步在线增强
+（随机缩放 0.8–1.2、随机裁剪 `crop_size=384`、翻转 p=0.5、亮度 α∈[0.8,1.2]、β∈[−20,20]）；
+验证走 letterbox（保持纵横比 + 居中填充 114，不改变人的尺度）。
 
-```text
-0.3125 0.4172
-0.4251 0.3928
-0.7312 0.6215
+其余数据集同样转换为标准布局（纯标准库，无需 scipy/h5py/cv2，`_matlab_utils.py`
+内置 Matlab v5 .mat 解析与 JPEG/PNG 尺寸读取）：
+
+```bash
+# JHU-Crowd++（gt 为逐图 txt，取 x y 两列）: datasets/jhu_crowd/{train,val,test}
+python -m scripts.data.prepare_jhu
+# UCF-QNRF（2024 版扁平布局 Train/Test，annPoints 点标注）: datasets/ucf_qnrf/{train,test}
+python -m scripts.data.prepare_qnrf
+# UCF-CC-50（5 折交叉验证，seed=0 打乱，每折 40 train / 10 test）:
+#   datasets/ucf_cc50/{fold0_train,fold0_test,...,fold4_train,fold4_test}
+python -m scripts.data.prepare_ucf_cc50
 ```
 
-### 训练
+每个数据集目录都含 `images/ + labels/ + points/ + dataset.yaml`，images 与 points 一一对应。
+
+### 2. 训练
 
 ```bash
 python -m scripts.training.train_moe \
     --weights yolo11n.pt \
     --data-root datasets/shanghaitech_AB \
-    --crop-size 640 \
-    --batch-size 96 \
-    --epochs 100 \
     --save-dir runs/moe_point
 ```
 
-推荐超参数（可覆盖）：YOLO 主干学习率 `1e-4`、Head 学习率 `1e-3`、每网格参考点 K=4、
-`--hard-route-epoch 20`、`--freeze-epochs 3`、`--route-weight 0.05`。
+常用参数（默认值见 `python -m scripts.training.train_moe --help`）：
 
-### 推理
+| 参数 | 默认 | 说明 |
+| --- | --- | --- |
+| `--crop-size` | 384 | 训练/验证裁剪尺寸 |
+| `--batch-size` | 8 | |
+| `--epochs` | 100 | |
+| `--backbone-lr` / `--head-lr` | 1e-4 / 1e-3 | YOLO 主干 / MoE Head 两组 AdamW 学习率 |
+| `--num-references` | 4 | 每网格参考点数 K（1/4/9） |
+| `--freeze-epochs` | 3 | 前 N 个 epoch 冻结 YOLO 主干 |
+| `--route-weight` | 0.15 | 尺度路由监督 macro CE 权重 |
+| `--match-top-k` | 2000 | 匈牙利匹配候选点上限（K=max(K, n_gt)） |
+| `--force-hard-epoch` | None | 强制切换硬路由的 epoch；默认由 Router 毕业条件决定 |
+| `--resume` | None | 从 checkpoint 恢复（模型/优化器/epoch/best_mae/路由状态） |
+
+训练要点：
+
+- **软/硬路由两阶段**：默认不按 epoch 强制切硬路由，而是看 Router 毕业条件——验证集
+  路由混淆矩阵 E0/E1/E2 行 recall 连续 3 轮 ≥ 0.60/0.40/0.30 且 macro recall ≥ 0.50，
+  下一轮起切 Top-1 硬路由（Straight-Through）。可用 `--force-hard-epoch` 覆盖。
+- **温度调度**：软阶段 2.0 →（epoch 15 处 1.3）→ 1.0；硬阶段 1.0 → 0.5（20 个 epoch）。
+- **Router 梯度隔离**：epoch < `--router-grad-epoch`(15) 时，cls/point/count 不经过 gate
+  向 Router 回传，Router 只由 `L_route` 训练，避免 winner-take-all 饿死少数专家。
+- **日志**：每 epoch 输出 `route`（路由 CE）、`T`、`hard_route`、`router_grad`、
+  `soft_MAE`/`hard_MAE`、GT 尺度目标分布 `target` vs 预测 `gate`、硬路由使用率与混淆矩阵。
+- **best.pt 选取**：软路由阶段按 soft MAE、硬路由生效后按 hard MAE 选 best（最终推理即硬路由）。
+  输出到 `runs/moe_point/{best,last}.pt` + `train.log`。
+
+### 3. 评估与推理
 
 ```bash
+# 单图推理（红/绿/蓝 = E3 精细 / E4 中层 / E5 大范围）
 python -m scripts.visualization.predict_moe \
-    --image path \
+    --image path/to/img.jpg \
     --checkpoint runs/moe_point/best.pt
-```
 
-三个专家用不同颜色绘制：红色=P3 局部细节、绿色=P4 中层上下文、蓝色=P5 大范围上下文。
-
-批量验证集推理（letterbox 预处理与训练验证一致，结果输出到独立目录）：
-
-```bash
+# 验证集批量推理：images/*_pred.jpg + predictions.csv（逐图计数）+ summary.json（MAE/RMSE）
 python -m scripts.visualization.predict_moe_batch \
     --data-root datasets/shanghaitech_AB \
     --checkpoint runs/moe_point/best.pt \
     --out-dir runs/moe_point/val_pred
+
+# 分 Part 评估（Part A/B/overall 的 MAE/RMSE；hard 路由 + Σsigmoid 计数口径）
+python test_each_dataset.py \
+    --data-root datasets/shanghaitech_AB \
+    --checkpoint runs/moe_point/best.pt
 ```
 
-输出 `images/*_pred.jpg`（黄=GT、红/绿/蓝=三专家预测）、`predictions.csv`（逐图计数）与 `summary.json`（MAE/RMSE、专家使用）。
+MoE 计数口径：全部候选点 `logits.sigmoid()` 求和（无需置信度阈值/去重，与评估一致）；
+验证固定 `temperature=0.5`。定位类指标（P/R/F1）见下文 v4 评估脚本，MoE 分支以 MAE/RMSE 为准。
 
-### 判断专家坍缩
+### 3.5 跨数据集分组评估
 
-训练日志输出 `route` 项（尺度路由 CE）。路由目标来自 GT 实际尺度分布：
-密集场景大量使用 E3 是**正确的尺度专家化**，不是坍缩。若某个专家几乎
-从不被使用（其对应尺度区间内几乎没有 GT 样本），应检查 `scale_centers`
-阈值是否与数据尺度匹配（默认 10/20/40 px，`models/point_moe_loss.py`
-中可调）。
+```bash
+python -m scripts.evaluation.evaluate_datasets \
+    --checkpoint runs/moe_point/best.pt \
+    --dataset shanghaitech=datasets/shanghaitech_AB:val \
+    --dataset jhu=datasets/jhu_crowd:val \
+    --dataset qnrf=datasets/ucf_qnrf:test \
+    --dataset cc50_fold0=datasets/ucf_cc50:fold0_test \
+    --out-dir runs/eval_datasets
+```
 
-验证使用 letterbox（保持纵横比 + 居中填充）而非直接压成正方形，避免
-人为改变人的尺度；日志同时输出 `soft_MAE` 与 `hard_MAE`，`best.pt`
-在软路由阶段按 soft MAE、硬路由生效后按 hard MAE 选取（最终推理即硬路由）。
+对每个 `NAME=ROOT:SPLIT` 分别评估并输出该数据集的 MAE/RMSE/GT/Pred：
+`<out-dir>/<name>/predictions.csv` + `summary.json`，另生成合并的
+`<out-dir>/summary.json` 与控制台汇总表。UCF-CC-50 5 折需逐折指定
+（fold0_test..fold4_test），汇总均值自行取。
+
+### 4. 判断专家坍缩
+
+日志 `target` 是 GT 尺度目标的 argmax 分布（来自真实最近邻间距），`gate` 是预测路由分布，
+`hard_route` 统计硬路由下置信度 >0.5 候选的专家使用率。密集场景大量使用 E3 是**正确的尺度
+专家化**，不是坍缩。若某专家几乎从不被选中（其尺度区间内几乎没有 GT 样本），应检查
+`scale_centers`（默认 10/20/40 px，`models/point_moe_loss.py` 中可调）是否与数据尺度匹配，
+以及 Router 是否一直未毕业（见日志 `route` 与混淆矩阵）。
 
 ## v4 PointDetect 分支（旧）
 
+ultralytics 管线，硬编码配置，运行后修改脚本底部即可：
+
 ```bash
-python -m scripts.training.train_custom_v4
-python -m scripts.evaluation.count
-python -m scripts.evaluation.localization
-python -m scripts.visualization.predict
+# 训练（imgsz=1024、epochs=200、加载本地 yolo26n.pt 的 Backbone 0–10 层）
+python scripts/training/train_custom_v4.py
+# 对照：标准 YOLO11n 微调 baseline（imgsz=640）
+python scripts/training/train_standard.py
+
+# 评估：人数（MAE/RMSE，扫置信度阈值）/ 点定位（P/R/F1，容忍距离 15px）/ 逐图明细
+python scripts/evaluation/count.py
+python scripts/evaluation/localization.py
+python scripts/evaluation/detailed.py
+python scripts/evaluation/compare_localization.py
+
+# 可视化
+python scripts/visualization/predict.py
+python scripts/visualization/compare_custom.py
 ```
 
-## 运行方式
+注意：v4 用检测框数做计数、用框中心做点匹配，训练日志里的标准 YOLO `Box(P/R/mAP)` 因
+虚拟框（1×1 px）与标签框（宽高 1%）IoU 近乎恒为 0，**不能**用于评价该模型；请使用点级
+MAE/RMSE 与 P/R/F1，并固定置信度阈值、匹配容忍距离和 `max_det` 后再比较。
 
-始终从项目根目录以模块方式执行，避免相对导入和工作目录问题。每个脚本底部保留了
-原有的默认路径和参数；需要切换数据集、权重或阈值时，修改对应脚本的 `__main__` 配置即可。
+模型与损失的设计细节见：
+
+- [`crowd_counting_model_summary.md`](./crowd_counting_model_summary.md)（当前 Scale-MoE + v4 附录）
+- [`loss_design_explanation.md`](./loss_design_explanation.md)（`PointMoELoss` 详解 + v4 附录）
+- [`docs/datasets.md`](./docs/datasets.md)（数据集下载/转换/训练接入/跨数据集评估指南）
