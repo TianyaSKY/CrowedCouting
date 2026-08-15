@@ -12,7 +12,7 @@
   - `yolo11_pyramid.py`：`YOLO11Pyramid`，保留 Backbone+Neck、移除 Detect Head，输出 P3/P4/P5。
   - `moe_point_head.py`：`MoEPointHead`，三个专家（局部/中层/大范围感受野）+ 点级 Router。
   - `yolo11_moe_point.py`：`YOLO11MoEPoint`，Backbone+Neck + MoE Point Head 的组合网络。
-  - `point_moe_loss.py`：`PointMoELoss`，匈牙利匹配 + Focal 分类 + Smooth L1 + 计数 + 路由均衡。
+  - `point_moe_loss.py`：`PointMoELoss`，匈牙利匹配 + Focal 分类 + Smooth L1 + 计数 + 尺度路由监督。
 - `scripts/data/`：ShanghaiTech 数据集转换、离线增强与点标注转换。
 - `scripts/training/`：训练与恢复训练。
 - `scripts/evaluation/`：人数、定位和模型对比评估。
@@ -35,14 +35,17 @@ P3(8)  P4(16)  P5(32)   ← 三个尺度只产生同一组 P3 候选点
    ↓       ↓       ↓
 Point Router (g3, g4, g5)
    ↓
-Expert3(F3) / Expert4(F3+Up(F4)) / Expert5(F3+Up(F5))
-   ↓
+Expert3(F3) / Expert4(Up(F4)+α4·F3) / Expert5(Up(F5)+α5·F3)
+   ↓   α4/α5 可学习横向融合，初始为 0（纯尺度输入）
 每个候选点输出 (x, y, confidence)，候选点 = P3 网格 × K 个参考点
 ```
 
-- 训练早期使用软路由（加权融合），约第 20 epoch 后切换 Top-1 硬路由（Straight-Through）。
+- 训练早期使用软路由（概率空间加权混合：$p=\sum_i g_i\sigma(z_i)$，再转回 logit），约第 20 epoch 后切换 Top-1 硬路由（Straight-Through）。
 - Router 温度从 2.0 线性衰减到 0.5。
 - 匹配：候选点与真实点做匈牙利一对一匹配，正候选点学习选择最合适的专家。
+- 路由监督：不再强制三专家 1/3 均匀使用，而是用 GT 点最近邻间距估计局部尺度，
+  映射为专家软目标（小间距→E3 精细、大间距→E5 大范围），与 Router logits 做交叉熵（`L_route`，权重 0.05）。
+  这让 Router 学到数据驱动的尺度语义。
 
 ### 准备数据
 
@@ -72,13 +75,13 @@ python -m scripts.training.train_moe \
     --weights yolo11n.pt \
     --data-root datasets/shanghaitech_AB \
     --crop-size 384 \
-    --batch-size 32 \
+    --batch-size 128 \
     --epochs 100 \
     --save-dir runs/moe_point
 ```
 
 推荐超参数（可覆盖）：YOLO 主干学习率 `1e-4`、Head 学习率 `1e-3`、每网格参考点 K=4、
-`--hard-route-epoch 20`、`--freeze-epochs 3`。
+`--hard-route-epoch 20`、`--freeze-epochs 3`、`--route-weight 0.05`。
 
 ### 推理
 
@@ -92,8 +95,15 @@ python -m scripts.visualization.predict_moe \
 
 ### 判断专家坍缩
 
-训练时统计匹配正样本的专家使用比例（见 `L_balance` 与日志中的 balance 项）。
-若出现 P3≈92%、P4≈6%、P5≈2% 的极端失衡即为坍缩；正常应观察到不同场景有不同选择。
+训练日志输出 `route` 项（尺度路由 CE）。路由目标来自 GT 实际尺度分布：
+密集场景大量使用 E3 是**正确的尺度专家化**，不是坍缩。若某个专家几乎
+从不被使用（其对应尺度区间内几乎没有 GT 样本），应检查 `scale_centers`
+阈值是否与数据尺度匹配（默认 10/20/40 px，`models/point_moe_loss.py`
+中可调）。
+
+验证使用 letterbox（保持纵横比 + 居中填充）而非直接压成正方形，避免
+人为改变人的尺度；日志同时输出 `soft_MAE` 与 `hard_MAE`，硬路由生效后
+`best.pt` 按 hard MAE 选取（最终推理即硬路由）。
 
 ## v4 PointDetect 分支（旧）
 

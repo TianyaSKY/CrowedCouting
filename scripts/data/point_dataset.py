@@ -70,6 +70,23 @@ class PointDataset(Dataset):
     def __len__(self) -> int:
         return len(self.image_paths)
 
+    def sample_gt_counts(
+        self,
+        num_samples: int = 100,
+    ) -> np.ndarray:
+        """随机采样若干样本，统计裁剪/增强后的每图 GT 点数分布。
+
+        用于诊断随机 crop 产生过多空样本（GT=0）的问题。
+        """
+        sample_size = min(num_samples, len(self))
+        indices = random.sample(range(len(self)), sample_size)
+
+        counts = np.empty(sample_size, dtype=np.int64)
+        for i, index in enumerate(indices):
+            counts[i] = self[index]["points"].shape[0]
+
+        return counts
+
     def __getitem__(self, index: int) -> dict[str, torch.Tensor]:
         image_path = self.image_paths[index]
         base_name = os.path.splitext(os.path.basename(image_path))[0]
@@ -90,7 +107,8 @@ class PointDataset(Dataset):
                 image, points, height, width
             )
         else:
-            image, points = self._resize(
+            # 验证/测试：letterbox 保持纵横比，避免压扁改变人的尺度
+            image, points = self._letterbox(
                 image, points, height, width
             )
 
@@ -180,29 +198,55 @@ class PointDataset(Dataset):
 
         return image, points
 
-    def _resize(
+    def _letterbox(
         self,
         image: np.ndarray,
         points: np.ndarray,
         height: int,
         width: int,
     ) -> tuple[np.ndarray, np.ndarray]:
+        """等比例缩放后居中填充到 crop_size x crop_size，同步变换点坐标。
+
+        对尺度敏感的人群计数任务，直接压成正方形会改变人的纵横比与
+        尺度分布，这里保持原始宽高比。
+        """
         crop_size = self.crop_size
+
+        scale = min(crop_size / max(width, 1),
+                    crop_size / max(height, 1))
+        new_width = max(1, int(round(width * scale)))
+        new_height = max(1, int(round(height * scale)))
 
         image = cv2.resize(
             image,
-            (crop_size, crop_size),
+            (new_width, new_height),
             interpolation=cv2.INTER_LINEAR,
         )
 
+        pad_x = (crop_size - new_width) // 2
+        pad_y = (crop_size - new_height) // 2
+
+        image = cv2.copyMakeBorder(
+            image,
+            pad_y,
+            crop_size - new_height - pad_y,
+            pad_x,
+            crop_size - new_width - pad_x,
+            cv2.BORDER_CONSTANT,
+            value=(114, 114, 114),
+        )
+
         if points.shape[0] > 0:
-            fx = crop_size / max(width, 1)
-            fy = crop_size / max(height, 1)
-            points = points * np.array(
-                [fx, fy], dtype=np.float32
+            points = points * scale
+            points = points + np.array(
+                [pad_x, pad_y], dtype=np.float32
             )
-            points[:, 0] = np.clip(points[:, 0], 0, crop_size - 1)
-            points[:, 1] = np.clip(points[:, 1], 0, crop_size - 1)
+            points[:, 0] = np.clip(
+                points[:, 0], 0, crop_size - 1
+            )
+            points[:, 1] = np.clip(
+                points[:, 1], 0, crop_size - 1
+            )
 
         return image, points
 

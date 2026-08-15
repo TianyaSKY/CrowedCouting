@@ -29,7 +29,16 @@ def load_model(weights_path, checkpoint_path, device):
         state_dict = (
             ckpt["model"] if "model" in ckpt else ckpt
         )
-        model.load_state_dict(state_dict)
+        try:
+            model.load_state_dict(state_dict)
+        except RuntimeError as error:
+            print(
+                f"警告: 旧版 checkpoint 缺少新参数({error})，"
+                "缺失部分使用初始化值"
+            )
+            model.load_state_dict(
+                state_dict, strict=False
+            )
     else:
         print("警告: 未提供权重文件，模型使用随机初始化参数进行推理。")
 

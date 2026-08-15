@@ -1,10 +1,11 @@
 import argparse
-import math
 import os
 
+import numpy as np
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
+from tqdm import tqdm
 
 from models.yolo11_moe_point import YOLO11MoEPoint
 from models.point_moe_loss import PointMoELoss
@@ -15,29 +16,25 @@ from scripts.data.point_dataset import (
 
 
 def build_optimizer(model, args):
-    """两个学习率组：YOLO 主干 1e-4，MoE Point Head 1e-3。"""
-    head_params = [
-        p for p in model.point_head.parameters()
-        if p.requires_grad
-    ]
-    yolo_params = [
-        p for p in model.yolo.parameters()
-        if p.requires_grad
-    ]
+    """两个学习率组：YOLO 主干 1e-4，MoE Point Head 1e-3。
+
+    始终包含全部参数（不再按 requires_grad 过滤）：冻结期的参数由优化器
+    自动跳过（grad 为 None），解冻后自然开始积累 Adam 状态。整个训练过程
+    只创建一次优化器，避免解冻/恢复时重建导致 Head 已积累的动量丢失。
+    """
+    head_params = list(model.point_head.parameters())
+    yolo_params = list(model.yolo.parameters())
 
     groups = [
         {
             "params": head_params,
             "lr": args.head_lr,
         },
+        {
+            "params": yolo_params,
+            "lr": args.backbone_lr,
+        },
     ]
-    if yolo_params:
-        groups.append(
-            {
-                "params": yolo_params,
-                "lr": args.backbone_lr,
-            }
-        )
 
     return torch.optim.AdamW(
         groups,
@@ -46,37 +43,59 @@ def build_optimizer(model, args):
 
 
 def evaluate_count_mae(model, val_loader, device):
-    """验证集人数 MAE（以所有候选点置信度和作为预测人数）。"""
+    """验证集人数 MAE（以所有候选点置信度和作为预测人数）。
+
+    同时评估软路由与硬路由两种模式：
+    - 训练早期为软路由，soft_MAE 与训练一致；
+    - hard routing 生效后以 hard_MAE 作为 best 模型选择依据。
+    """
     model.eval()
 
-    total_abs_error = 0.0
+    total_abs_error = {"soft": 0.0, "hard": 0.0}
     total_images = 0
 
     with torch.no_grad():
-        for batch in val_loader:
+        for batch in tqdm(
+            val_loader, desc="验证中", leave=False
+        ):
             images = batch["img"].to(device)
             gt_points = [
                 p.to(device) for p in batch["points"]
             ]
+            gt_counts = [
+                p.shape[0] for p in gt_points
+            ]
 
-            predictions = model(
-                images,
-                temperature=0.5,
-                hard_route=True,
-            )
-
-            scores = predictions["logits"].sigmoid()
-            pred_counts = scores.sum(dim=1)
-
-            for i in range(images.shape[0]):
-                gt_count = gt_points[i].shape[0]
-                total_abs_error += abs(
-                    float(pred_counts[i]) - gt_count
+            for mode, hard_route in (
+                ("soft", False),
+                ("hard", True),
+            ):
+                predictions = model(
+                    images,
+                    temperature=0.5,
+                    hard_route=hard_route,
                 )
-                total_images += 1
+
+                scores = predictions["logits"].sigmoid()
+                pred_counts = scores.sum(dim=1)
+
+                for i, gt_count in enumerate(gt_counts):
+                    total_abs_error[mode] += abs(
+                        float(pred_counts[i]) - gt_count
+                    )
+
+            total_images += len(gt_counts)
 
     model.train()
-    return total_abs_error / max(total_images, 1)
+
+    soft_mae = total_abs_error["soft"] / max(
+        total_images, 1
+    )
+    hard_mae = total_abs_error["hard"] / max(
+        total_images, 1
+    )
+
+    return soft_mae, hard_mae
 
 
 def train_moe(args):
@@ -95,7 +114,9 @@ def train_moe(args):
     ).to(device)
 
     # 2. 损失
-    criterion = PointMoELoss()
+    criterion = PointMoELoss(
+        route_weight=args.route_weight,
+    )
 
     # 3. 数据
     train_dataset = PointDataset(
@@ -110,6 +131,19 @@ def train_moe(args):
         crop_size=args.crop_size,
         augment=False,
     )
+
+    # 随机裁剪的 GT 分布统计：空 crop 比例过高时分类梯度会压制正样本
+    gt_counts = train_dataset.sample_gt_counts(
+        num_samples=100
+    )
+    if gt_counts.size > 0:
+        print(
+            f"训练裁剪 GT 统计(采样 {gt_counts.size} 张): "
+            f"mean={float(gt_counts.mean()):.1f} "
+            f"median={float(np.median(gt_counts)):.0f} "
+            f"max={int(gt_counts.max())} "
+            f"zero_ratio={float((gt_counts == 0).mean()):.1%}"
+        )
 
     train_loader = DataLoader(
         train_dataset,
@@ -145,16 +179,33 @@ def train_moe(args):
         checkpoint = torch.load(
             args.resume, map_location="cpu", weights_only=False
         )
-        model.load_state_dict(checkpoint["model"])
-        optimizer.load_state_dict(checkpoint["optimizer"])
+        try:
+            model.load_state_dict(checkpoint["model"])
+        except RuntimeError as error:
+            print(
+                f"警告: 旧版 checkpoint 缺少新参数({error})，"
+                "缺失部分使用初始化值"
+            )
+            model.load_state_dict(
+                checkpoint["model"], strict=False
+            )
+        try:
+            optimizer.load_state_dict(
+                checkpoint["optimizer"]
+            )
+        except (ValueError, RuntimeError) as error:
+            print(
+                f"警告: 优化器状态不兼容({error})，"
+                "使用全新优化器重新开始优化"
+            )
+            optimizer = build_optimizer(model, args)
         start_epoch = checkpoint.get("epoch", 0) + 1
         best_mae = checkpoint.get("best_mae", float("inf"))
 
-        # 恢复后若已超过冻结期，解冻 YOLO
+        # 恢复后若已超过冻结期，解冻 YOLO（不重建优化器，保留状态）
         if start_epoch >= args.freeze_epochs:
             for param in model.yolo.parameters():
                 param.requires_grad = True
-            optimizer = build_optimizer(model, args)
 
     # 5. 训练循环
     for epoch in range(start_epoch, args.epochs):
@@ -165,18 +216,22 @@ def train_moe(args):
         )
         hard_route = epoch >= args.hard_route_epoch
 
-        # 到达解冻点：解冻 YOLO 并重建优化器（加入新参数组）
+        # 到达解冻点：解冻 YOLO，不重建优化器——
+        # 冻结参数在优化器中自动跳过，解冻后自然开始积累 Adam 状态
         if args.freeze_epochs > 0 and epoch == args.freeze_epochs:
             for param in model.yolo.parameters():
                 param.requires_grad = True
-            optimizer = build_optimizer(model, args)
-            print("解冻 YOLO Backbone+Neck，重建优化器")
+            print("解冻 YOLO Backbone+Neck（保留优化器状态，不重建）")
 
         model.train()
         total_loss = 0.0
         num_batches = 0
 
-        for batch in train_loader:
+        for batch in tqdm(
+            train_loader,
+            desc=f"Epoch {epoch + 1}/{args.epochs}",
+            leave=False,
+        ):
             images = batch["img"].to(device)
             gt_points = [
                 p.to(device) for p in batch["points"]
@@ -210,7 +265,7 @@ def train_moe(args):
         avg_loss = total_loss / max(num_batches, 1)
 
         # 6. 验证与保存
-        val_mae = evaluate_count_mae(
+        soft_mae, hard_mae = evaluate_count_mae(
             model, val_loader, device
         )
 
@@ -220,10 +275,11 @@ def train_moe(args):
             f"cls={float(loss_items['cls']):.4f} "
             f"point={float(loss_items['point']):.4f} "
             f"count={float(loss_items['count']):.4f} "
-            f"balance={float(loss_items['balance']):.4f} "
+            f"route={float(loss_items['route']):.4f} "
             f"T={temperature:.2f} "
             f"hard_route={hard_route} "
-            f"val_MAE={val_mae:.3f}"
+            f"soft_MAE={soft_mae:.3f} "
+            f"hard_MAE={hard_mae:.3f}"
         )
 
         last_path = os.path.join(args.save_dir, "last.pt")
@@ -238,8 +294,10 @@ def train_moe(args):
             last_path,
         )
 
-        if val_mae < best_mae:
-            best_mae = val_mae
+        # 硬路由阶段才更新 best（最终推理使用硬路由）；
+        # 软路由阶段只记录，避免 soft 模型占据 best 位置
+        if hard_route and hard_mae < best_mae:
+            best_mae = hard_mae
             best_path = os.path.join(args.save_dir, "best.pt")
             torch.save(
                 {
@@ -251,7 +309,7 @@ def train_moe(args):
                 },
                 best_path,
             )
-            print(f"  -> 新的最佳 MAE: {best_mae:.3f}，已保存 {best_path}")
+            print(f"  -> 新的最佳 hard MAE: {best_mae:.3f}，已保存 {best_path}")
 
     print("训练结束。")
 
@@ -308,6 +366,10 @@ def parse_args():
     parser.add_argument(
         "--hard-route-epoch", type=int, default=20,
         help="启用 Top-1 硬路由的起始 epoch"
+    )
+    parser.add_argument(
+        "--route-weight", type=float, default=0.05,
+        help="尺度路由监督(CE)损失权重"
     )
     parser.add_argument(
         "--freeze-epochs", type=int, default=3,

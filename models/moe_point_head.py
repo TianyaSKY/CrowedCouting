@@ -106,10 +106,14 @@ class MoEPointHead(nn.Module):
     """
     输入 P3、P4、P5，输出统一的候选点集合。
 
-    三个专家共享 P3 的定位细节、感受野不同：
+    三个专家对应不同尺度（多感受野），全部在 P3 网格上预测：
         Expert3 = E3(F3)
-        Expert4 = E4(F3 + Up(F4))
-        Expert5 = E5(F3 + Up(F5))
+        Expert4 = E4(Up(F4) + alpha4 * F3)
+        Expert5 = E5(Up(F5) + alpha5 * F3)
+
+    alpha4/alpha5 为可学习横向融合系数，初始为 0：专家先只吃自身尺度特征
+    （E3 精细 / E4 中层 / E5 大范围），需要时再学习引入 P3 细节，
+    避免三个专家共享完整 P3 而退化成近似副本。
 
     Router 以 Concat(P3, Up(P4), Up(P5)) 为输入，
     为每个候选点（P3 网格 x K 个参考点）输出 [g3, g4, g5]。
@@ -141,6 +145,10 @@ class MoEPointHead(nn.Module):
         self.num_experts = 3
         self.output_stride = output_stride
         self.offset_range = offset_range
+
+        # 可学习横向融合系数：初始 0（纯尺度输入），需要时可学习引入 P3 细节
+        self.alpha4 = nn.Parameter(torch.zeros(1))
+        self.alpha5 = nn.Parameter(torch.zeros(1))
 
         c3, c4, c5 = feature_channels
 
@@ -236,10 +244,11 @@ class MoEPointHead(nn.Module):
             align_corners=False,
         )
 
-        # 每个专家都保留 P3 精细定位特征
+        # 每个专家只接收自身尺度的特征（E3 精细 / E4 中层 / E5 大范围），
+        # 横向融合 alpha*F3 初始为 0，防止专家输入同质化
         score3, offset3 = self.expert3(f3)
-        score4, offset4 = self.expert4(f3 + f4)
-        score5, offset5 = self.expert5(f3 + f5)
+        score4, offset4 = self.expert4(f4 + self.alpha4 * f3)
+        score5, offset5 = self.expert5(f5 + self.alpha5 * f3)
 
         batch_size, _, height, width = score3.shape
 
@@ -294,9 +303,16 @@ class MoEPointHead(nn.Module):
             dim=2,
         )
 
-        final_logits = (
-            gate * expert_scores
-        ).sum(dim=2)
+        # soft 阶段在概率空间混合: p = sum(g * sigmoid(z))，再转回 logit，
+        # 避免 logits 线性混合时专家置信度相互抵消；硬路由 one-hot 时
+        # logit(sigmoid(z_j)) = z_j，退化为原来的单专家 logit
+        expert_probabilities = expert_scores.sigmoid()
+        mixed_probability = (
+            gate * expert_probabilities
+        ).sum(dim=2).clamp(1e-7, 1.0 - 1e-7)
+        final_logits = torch.log(
+            mixed_probability
+        ) - torch.log1p(-mixed_probability)
 
         final_offsets = (
             gate.unsqueeze(3) * expert_offsets
