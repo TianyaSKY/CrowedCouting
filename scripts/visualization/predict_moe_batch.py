@@ -237,7 +237,6 @@ def predict_batch(args):
             )
 
             gt_count = gt_points.shape[0]
-            pred_count = len(pred_points)
             abs_err = abs(pred_count - gt_count)
 
             total_abs_error += abs_err
