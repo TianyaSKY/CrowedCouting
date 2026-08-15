@@ -213,11 +213,31 @@ def train_moe(args):
         start_epoch = checkpoint.get("epoch", 0) + 1
         best_mae = checkpoint.get("best_mae", float("inf"))
 
-        # 恢复到硬路由阶段时，checkpoint 的 best_mae 可能是 soft 口径，
-        # 重置基准避免两种口径混用
-        if start_epoch >= args.hard_route_epoch:
+        # 覆盖保护：resume 前把当前 best.pt 备份，防止新 run 覆盖掉
+        # 历史最佳（曾发生 epoch 47 的 45.68 覆盖 epoch 40 的 43.96 事故）
+        old_best = os.path.join(args.save_dir, "best.pt")
+        if os.path.exists(old_best):
+            backup = os.path.join(
+                args.save_dir, "best_pre_resume.pt"
+            )
+            if not os.path.exists(backup):
+                import shutil
+
+                shutil.copy2(old_best, backup)
+                print(f"旧 best 已备份到 {backup}")
+
+        # 只有 checkpoint 的 best 记录于软路由阶段（epoch < 切换点）时，
+        # 才需要重置基准为 hard 口径；硬阶段记录的直接沿用，
+        # 避免从 last.pt 恢复时把已有的历史 best 清掉
+        if (
+            checkpoint.get("epoch", 0) < args.hard_route_epoch
+            and start_epoch >= args.hard_route_epoch
+        ):
             best_mae = float("inf")
-            print("已进入硬路由阶段，best 基准重置为 hard MAE")
+            print(
+                "checkpoint best 为软路由口径，"
+                "基准重置为 hard MAE"
+            )
 
         # 恢复后若已超过冻结期，解冻 YOLO（不重建优化器，保留状态）
         if start_epoch >= args.freeze_epochs:
