@@ -3,6 +3,13 @@ import logging
 import os
 import shutil
 
+# 解冻 YOLO 时 backward 图骤增，缓存分配器在 Blackwell(RTX50) 等新卡上
+# 容易碎片化，导致 cublasCreate 分配失败崩溃；启用可扩展段规避。
+# 必须在首次 CUDA 调用前设置。
+os.environ.setdefault(
+    "PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True"
+)
+
 import numpy as np
 import torch
 import torch.nn as nn

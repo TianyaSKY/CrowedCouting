@@ -23,6 +23,11 @@ import json
 import logging
 import os
 
+# 与训练一致：避免 Blackwell(RTX50) 上缓存分配器碎片化
+os.environ.setdefault(
+    "PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True"
+)
+
 import cv2
 import numpy as np
 import torch
