@@ -29,6 +29,10 @@ def load_model(weights_path, checkpoint_path, device):
         state_dict = (
             ckpt["model"] if "model" in ckpt else ckpt
         )
+        print(
+            f"checkpoint: epoch={ckpt.get('epoch')} "
+            f"best_mae={ckpt.get('best_mae')}"
+        )
         try:
             model.load_state_dict(state_dict)
         except RuntimeError as error:
