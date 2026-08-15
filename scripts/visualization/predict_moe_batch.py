@@ -214,6 +214,51 @@ def predict_batch(args):
                 keep = scores > args.conf
                 pred_count = int(keep.sum().item())
 
+            if args.heatmap:
+                # 概率场 -> 密度热力图：每网格单元取 K 个参考点的最大置信度
+                side = args.imgsz // model.point_head.output_stride
+                num_refs = model.point_head.num_references
+                cell_conf = (
+                    scores.view(side, side, num_refs)
+                    .max(dim=-1)
+                    .values.cpu()
+                    .numpy()
+                    .astype(np.float32)
+                )
+                heat = cv2.resize(
+                    cell_conf,
+                    (args.imgsz, args.imgsz),
+                    interpolation=cv2.INTER_LINEAR,
+                )
+                # 去掉 letterbox padding，映射回原图分辨率
+                new_w = max(1, int(round(width * scale)))
+                new_h = max(1, int(round(height * scale)))
+                heat = heat[pad_y:pad_y + new_h, pad_x:pad_x + new_w]
+                heat = cv2.resize(
+                    heat,
+                    (width, height),
+                    interpolation=cv2.INTER_LINEAR,
+                )
+                heat_vis = cv2.applyColorMap(
+                    (np.clip(heat, 0, 1) * 255).astype(np.uint8),
+                    cv2.COLORMAP_JET,
+                )
+                overlay = cv2.addWeighted(
+                    image_bgr,
+                    1.0 - args.heat_alpha,
+                    heat_vis,
+                    args.heat_alpha,
+                    0,
+                )
+                heat_dir = os.path.join(args.out_dir, "heatmaps")
+                os.makedirs(heat_dir, exist_ok=True)
+                cv2.imwrite(
+                    os.path.join(
+                        heat_dir, base_name + "_heat.jpg"
+                    ),
+                    overlay,
+                )
+
             crop_points = crop_points[keep].cpu().numpy()
             routes = routes[keep].cpu().numpy()
 
@@ -272,6 +317,7 @@ def predict_batch(args):
         "rmse": float(rmse),
         "conf": args.conf,
         "count_mode": args.count_mode,
+        "heatmap": args.heatmap,
         "imgsz": args.imgsz,
         "checkpoint": args.checkpoint,
         "expert_usage": {
@@ -331,6 +377,14 @@ def parse_args():
         choices=["soft", "thresh"], default="thresh",
         help="计数口径: soft=所有候选 sigmoid 之和(与训练验证一致), "
         "thresh=置信度大于 conf 的点数"
+    )
+    parser.add_argument(
+        "--heatmap", action="store_true",
+        help="额外输出概率场热力图叠加到原图 (out_dir/heatmaps/)"
+    )
+    parser.add_argument(
+        "--heat-alpha", type=float, default=0.45,
+        help="热力图叠加透明度 (0-1)"
     )
     parser.add_argument(
         "--out-dir", type=str,
