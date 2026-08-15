@@ -75,7 +75,7 @@ python -m scripts.training.train_moe \
     --weights yolo11n.pt \
     --data-root datasets/shanghaitech_AB \
     --crop-size 640 \
-    --batch-size 128 \
+    --batch-size 96 \
     --epochs 100 \
     --save-dir runs/moe_point
 ```

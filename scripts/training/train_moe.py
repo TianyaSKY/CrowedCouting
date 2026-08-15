@@ -13,6 +13,7 @@ os.environ.setdefault(
 import numpy as np
 import torch
 import torch.nn as nn
+from scipy.optimize import linear_sum_assignment
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
@@ -68,18 +69,142 @@ def build_optimizer(model, args):
     )
 
 
-def evaluate_count_mae(model, val_loader, device):
+def _routing_confusion(
+    predictions: dict[str, torch.Tensor],
+    gt_points: list[torch.Tensor],
+    image_size: tuple[int, int],
+    device: torch.device,
+    match_top_k: int = 2000,
+) -> tuple[torch.Tensor, int]:
+    """单个 batch 的路由混淆矩阵：GT 尺度目标类(行) x 预测专家(列)。
+
+    匹配口径与 PointMoELoss 完全一致：置信度 top-K(K=max(match_top_k,
+    n_gt)) 候选上做匈牙利指派，代价 = 5*归一化L1坐标距离 - 置信度。
+    行 = GT 最近邻间距映射的尺度目标类(E0/E1/E2)，
+    列 = 匹配候选在硬路由 gate 上的 argmax 专家。
+
+    这是"Router 是否学到尺度分工"的直接证据：若某行集中到对角元，
+    说明该尺度的 GT 点确实路由到了对应专家；若某行集中到 E0，
+    说明对应尺度的专家在 hard 阶段根本没有拿到正样本。
+    """
+    from models.point_moe_loss import PointMoELoss
+
+    logits = predictions["logits"]
+    points = predictions["points"]
+    gates = predictions["gates"]
+
+    batch_size = logits.shape[0]
+    image_height, image_width = image_size
+
+    scale = points.new_tensor(
+        [float(image_width), float(image_height)]
+    )
+
+    confusion = torch.zeros(
+        3, 3, dtype=torch.int64, device=device
+    )
+    matched_points = 0
+
+    for batch_index in range(batch_size):
+        gt = gt_points[batch_index].to(device)
+        number_of_gt = gt.shape[0]
+
+        # 至少 2 个点才能计算最近邻间距尺度目标（与损失一致）
+        if number_of_gt < 2:
+            continue
+
+        pred_logits = logits[batch_index]
+        pred_points = points[batch_index]
+        pred_gates = gates[batch_index]
+
+        top_k = max(match_top_k, number_of_gt)
+
+        if pred_logits.shape[0] > top_k:
+            match_indices = pred_logits.topk(top_k).indices
+            match_logits = pred_logits[match_indices]
+            match_points = pred_points[match_indices]
+            match_gates = pred_gates[match_indices]
+        else:
+            match_logits = pred_logits
+            match_points = pred_points
+            match_gates = pred_gates
+            match_indices = None
+
+        normalized_gt = gt / scale
+        normalized_pred = match_points / scale
+
+        total_cost = (
+            5.0
+            * torch.cdist(
+                normalized_gt, normalized_pred, p=1
+            )
+            - match_logits.sigmoid().unsqueeze(0)
+        )
+
+        gt_indices, pred_indices = linear_sum_assignment(
+            total_cost.detach().float().cpu().numpy()
+        )
+
+        gt_indices = torch.as_tensor(
+            gt_indices, dtype=torch.long, device=device
+        )
+        pred_indices = torch.as_tensor(
+            pred_indices, dtype=torch.long, device=device
+        )
+
+        if match_indices is not None:
+            matched_full_indices = match_indices[pred_indices]
+        else:
+            matched_full_indices = pred_indices
+
+        # 尺度目标与 PointMoELoss 默认参数一致
+        target_gate = PointMoELoss.scale_targets(
+            gt,
+            knn_k=1,
+            scale_centers=(10.0, 20.0, 40.0),
+            scale_sigma_octaves=0.6,
+        )
+        target_class = target_gate.argmax(dim=1)
+
+        pred_class = pred_gates[
+            matched_full_indices
+        ].argmax(dim=1)
+
+        confusion.index_add_(
+            0,
+            target_class,
+            torch.nn.functional.one_hot(
+                pred_class, num_classes=3
+            ).to(device),
+        )
+        matched_points += number_of_gt
+
+    return confusion, matched_points
+
+
+def evaluate_count_mae(
+    model,
+    val_loader,
+    device,
+    match_top_k: int = 2000,
+):
     """验证集人数 MAE（以所有候选点置信度和作为预测人数）。
 
     同时评估软路由与硬路由两种模式：
     - 训练早期为软路由，soft_MAE 与训练一致；
     - hard routing 生效后以 hard_MAE 作为 best 模型选择依据。
+    另外复用 hard 前向的预测做 GT 匹配，统计路由混淆矩阵
+    （见 _routing_confusion），回答"Router 是否学到尺度分工"。
     """
     model.eval()
 
     total_abs_error = {"soft": 0.0, "hard": 0.0}
     total_images = 0
     hard_usage = torch.zeros(3, dtype=torch.int64, device=device)
+    route_confusion = torch.zeros(
+        3, 3, dtype=torch.int64, device=device
+    )
+    matched_points = 0
 
     with torch.no_grad():
         for batch in tqdm(
@@ -122,6 +247,19 @@ def evaluate_count_mae(model, val_loader, device):
                         .bincount(minlength=3)
                     )
 
+                    # 路由混淆矩阵：复用本次 hard 前向，无额外推理开销
+                    batch_confusion, batch_matched = (
+                        _routing_confusion(
+                            predictions,
+                            gt_points,
+                            images.shape[-2:],
+                            device,
+                            match_top_k,
+                        )
+                    )
+                    route_confusion += batch_confusion
+                    matched_points += batch_matched
+
             total_images += len(gt_counts)
 
     model.train()
@@ -133,7 +271,13 @@ def evaluate_count_mae(model, val_loader, device):
         total_images, 1
     )
 
-    return soft_mae, hard_mae, hard_usage
+    return (
+        soft_mae,
+        hard_mae,
+        hard_usage,
+        route_confusion,
+        matched_points,
+    )
 
 
 def train_moe(args):
@@ -306,6 +450,12 @@ def train_moe(args):
         num_batches = 0
         gate_mean = torch.zeros(3, device=device)
         target_mean = torch.zeros(3, device=device)
+        # 各损失分量的 epoch 均值：只记最后一个 batch 的 loss_items
+        # 会误导调参（如 Epoch 38 后 cls/count 骤增是否真实）。
+        loss_sums = {
+            name: torch.zeros((), device=device)
+            for name in ("cls", "point", "count", "route")
+        }
 
         for batch in tqdm(
             train_loader,
@@ -349,13 +499,29 @@ def train_moe(args):
             optimizer.step()
 
             total_loss += loss.item()
+            for loss_name in loss_sums:
+                loss_sums[loss_name] += loss_items[
+                    loss_name
+                ].detach()
             num_batches += 1
 
         avg_loss = total_loss / max(num_batches, 1)
+        avg_loss_items = {
+            loss_name: (
+                loss_sums[loss_name] / max(num_batches, 1)
+            ).item()
+            for loss_name in loss_sums
+        }
 
         # 6. 验证与保存
-        soft_mae, hard_mae, hard_usage = evaluate_count_mae(
-            model, val_loader, device
+        (
+            soft_mae,
+            hard_mae,
+            hard_usage,
+            route_confusion,
+            matched_points,
+        ) = evaluate_count_mae(
+            model, val_loader, device, args.match_top_k
         )
 
         gate_pct = gate_mean / max(num_batches, 1) * 100
@@ -369,10 +535,10 @@ def train_moe(args):
         logging.info(
             f"[Epoch {epoch + 1}/{args.epochs}] "
             f"loss={avg_loss:.4f} "
-            f"cls={float(loss_items['cls']):.4f} "
-            f"point={float(loss_items['point']):.4f} "
-            f"count={float(loss_items['count']):.4f} "
-            f"route={float(loss_items['route']):.4f} "
+            f"cls={avg_loss_items['cls']:.4f} "
+            f"point={avg_loss_items['point']:.4f} "
+            f"count={avg_loss_items['count']:.4f} "
+            f"route={avg_loss_items['route']:.4f} "
             f"T={temperature:.2f} "
             f"hard_route={hard_route} "
             f"soft_MAE={soft_mae:.3f} "
@@ -387,21 +553,36 @@ def train_moe(args):
             f"E1:{usage_pct[1]:.1f}% E2:{usage_pct[2]:.1f}%"
         )
 
-        last_path = os.path.join(args.save_dir, "last.pt")
-        torch.save(
-            {
-                "model": model.state_dict(),
-                "optimizer": optimizer.state_dict(),
-                "epoch": epoch,
-                "best_mae": best_mae,
-                "args": vars(args),
-            },
-            last_path,
-        )
+        # 路由混淆矩阵（匹配正样本口径）：行=GT 尺度目标类，
+        # 列=预测专家。主对角线占优说明 Router 学到尺度分工；
+        # 某行集中到 E0 说明该尺度的专家在 hard 阶段拿不到样本。
+        if matched_points > 0:
+            confusion_pct = (
+                route_confusion.float()
+                / route_confusion.sum(
+                    dim=1, keepdim=True
+                ).clamp_min(1)
+            )
+            row_counts = route_confusion.sum(dim=1)
+            logging.info(
+                "  路由混淆 (行=GT尺度目标类, 列=预测专家):"
+            )
+            for expert_index in range(3):
+                logging.info(
+                    f"    GT E{expert_index} -> "
+                    f"E0:{confusion_pct[expert_index, 0]:5.1f}% "
+                    f"E1:{confusion_pct[expert_index, 1]:5.1f}% "
+                    f"E2:{confusion_pct[expert_index, 2]:5.1f}%"
+                    f"  (n={int(row_counts[expert_index])})"
+                )
 
         # best 选择：软路由阶段按 soft MAE、硬路由阶段按 hard MAE
         # （最终推理使用硬路由）。切换硬路由时重置基准，
         # 避免 soft 阶段的 best 继续占位。
+        # 必须先于 last.pt 保存执行：否则 last.pt 记录的还是旧的
+        # （软路由口径）best_mae，从该 last.pt resume 时
+        # "checkpoint epoch < hard_route_epoch" 判断不成立，
+        # 旧基准会继续作为 hard 阶段门槛。
         if hard_route:
             if epoch == args.hard_route_epoch:
                 best_mae = float("inf")
@@ -431,6 +612,18 @@ def train_moe(args):
                 f"  -> 新的最佳 {metric_name}: {best_mae:.3f}，"
                 f"已保存 {best_path}"
             )
+
+        last_path = os.path.join(args.save_dir, "last.pt")
+        torch.save(
+            {
+                "model": model.state_dict(),
+                "optimizer": optimizer.state_dict(),
+                "epoch": epoch,
+                "best_mae": best_mae,
+                "args": vars(args),
+            },
+            last_path,
+        )
 
     logging.info("训练结束。")
 
@@ -485,12 +678,14 @@ def parse_args():
         help="温度随 epoch 衰减量（30 epoch 内衰减完）"
     )
     parser.add_argument(
-        "--hard-route-epoch", type=int, default=20,
-        help="启用 Top-1 硬路由的起始 epoch"
+        "--hard-route-epoch", type=int, default=35,
+        help="启用 Top-1 硬路由的起始 epoch（建议 30+，"
+        "给 Router 更长的软路由学习期，避免 winner-take-all 过早）"
     )
     parser.add_argument(
-        "--route-weight", type=float, default=0.05,
-        help="尺度路由监督(CE)损失权重"
+        "--route-weight", type=float, default=0.15,
+        help="尺度路由监督(CE)损失权重（0.05 太弱，Router 会被"
+        "分类/计数梯度带偏，建议 0.15~0.25）"
     )
     parser.add_argument(
         "--match-top-k", type=int, default=2000,
