@@ -212,6 +212,11 @@ class PointMoELoss(nn.Module):
                         normalized_pred[pred_indices],
                         normalized_gt[gt_indices],
                         reduction="sum",
+                        # 归一化坐标下典型定位误差 ~0.005(≈2px/384)，
+                        # 默认 beta=1.0 使所有误差落入二次区，损失被压到
+                        # ~1e-5 量级、定位分支几乎没有梯度；
+                        # beta=0.02(≈8px) 让 2-8px 误差走线性/准线性区
+                        beta=0.02,
                     )
                     / number_of_gt
                 )
