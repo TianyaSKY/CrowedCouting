@@ -45,13 +45,13 @@ pip install -r requirements.txt
 `scripts/data/` 下提供各公开人群计数数据集的下载脚本（仅用标准库，带进度条，
 从项目根目录以模块方式执行）。原始数据统一落在 `data/`。
 
-| 数据集 | 脚本 | 图像数量 | 标注/说明 |
-| --- | --- | --- | --- |
-| JHU-Crowd++ (Sindagi 2019) | `python -m scripts.data.download_jhu_crowd` | 4,372（train 2,272 / val 500 / test 1,600） | 约 151 万点标注；单图最多 25,791 人；含恶劣天气与无人图像 |
-| ShanghaiTech A (Zhang 2016) | `python -m scripts.data.download_shanghaitech`（A+B 一并下载） | 482（官方 train 300 / test 182） | 官方 train 再切 270 train / 30 val |
-| ShanghaiTech B (Zhang 2016) | 同上 | 716（官方 train 400 / test 316） | 官方 train 再切 360 train / 40 val |
-| UCF-CC-50 (Idrees 2013) | `python -m scripts.data.download_ucf_cc50` | 50 | 5 折 outer test；每折 36 train / 4 val / 10 test |
-| UCF-QNRF (Idrees 2018) | `python -m scripts.data.download_ucf_qnrf` | 1,535（官方 Train 1,201 / Test 334） | 官方 Train 再切约 1,081 train / 120 val；约 125 万点标注 |
+| 数据集                      | 脚本                                                             | 图像数量                                    | 标注/说明                                                 |
+| --------------------------- | ---------------------------------------------------------------- | ------------------------------------------- | --------------------------------------------------------- |
+| JHU-Crowd++ (Sindagi 2019)  | `python -m scripts.data.download_jhu_crowd`                    | 4,372（train 2,272 / val 500 / test 1,600） | 约 151 万点标注；单图最多 25,791 人；含恶劣天气与无人图像 |
+| ShanghaiTech A (Zhang 2016) | `python -m scripts.data.download_shanghaitech`（A+B 一并下载） | 482（官方 train 300 / test 182）            | 官方 train 再切 270 train / 30 val                        |
+| ShanghaiTech B (Zhang 2016) | 同上                                                             | 716（官方 train 400 / test 316）            | 官方 train 再切 360 train / 40 val                        |
+| UCF-CC-50 (Idrees 2013)     | `python -m scripts.data.download_ucf_cc50`                     | 50                                          | 5 折 outer test；每折 36 train / 4 val / 10 test          |
+| UCF-QNRF (Idrees 2018)      | `python -m scripts.data.download_ucf_qnrf`                     | 1,535（官方 Train 1,201 / Test 334）        | 官方 Train 再切约 1,081 train / 120 val；约 125 万点标注  |
 
 各脚本均支持 `--data-dir`（默认 `data/`）与 `--keep-zip`/`--keep-rar`；已存在目标目录时
 自动跳过；解压后打印实际顶层结构。大文件支持**断点续传**：下载中断会保留 `.part` 文件，
@@ -109,11 +109,15 @@ python -m scripts.data.prepare_all
 # 在所有数据集上联合训练（batch 混合 + 逐数据集验证，超参数同 train_moe）
 python -m scripts.training.train_all \
     --weights yolo11n.pt \
+    --crop-size 640 \
+    --batch-size 32 \
     --save-dir runs/moe_point_all
 
 # 跨数据集分组评估（对训练出的 best.pt）
 python -m scripts.evaluation.evaluate_datasets \
     --checkpoint runs/moe_point_all/best.pt \
+    --imgsz 384 \
+    --batch-size 8 \
     --dataset shanghaitech=datasets/shanghaitech_AB:val \
     --dataset jhu=datasets/jhu_crowd:val \
     --dataset qnrf=datasets/ucf_qnrf:test \
@@ -131,18 +135,18 @@ python -m scripts.training.train_moe \
 
 常用参数（默认值见 `python -m scripts.training.train_moe --help`）：
 
-| 参数 | 默认 | 说明 |
-| --- | --- | --- |
-| `--crop-size` | 384 | 训练/验证裁剪尺寸 |
-| `--batch-size` | 8 | |
-| `--epochs` | 100 | |
-| `--backbone-lr` / `--head-lr` | 1e-4 / 1e-3 | YOLO 主干 / MoE Head 两组 AdamW 学习率 |
-| `--num-references` | 4 | 每网格参考点数 K（1/4/9） |
-| `--freeze-epochs` | 3 | 前 N 个 epoch 冻结 YOLO 主干 |
-| `--route-weight` | 0.15 | 尺度路由监督 macro CE 权重 |
-| `--match-top-k` | 2000 | 匈牙利匹配候选点上限（K=max(K, n_gt)） |
-| `--force-hard-epoch` | None | 强制切换硬路由的 epoch；默认由 Router 毕业条件决定 |
-| `--resume` | None | 从 checkpoint 恢复（正式修复实验应从 `yolo11n.pt` 新开 run） |
+| 参数                              | 默认        | 说明                                                          |
+| --------------------------------- | ----------- | ------------------------------------------------------------- |
+| `--crop-size`                   | 384         | 训练/验证裁剪尺寸                                             |
+| `--batch-size`                  | 8           |                                                               |
+| `--epochs`                      | 100         |                                                               |
+| `--backbone-lr` / `--head-lr` | 1e-4 / 1e-3 | YOLO 主干 / MoE Head 两组 AdamW 学习率                        |
+| `--num-references`              | 4           | 每网格参考点数 K（1/4/9）                                     |
+| `--freeze-epochs`               | 3           | 前 N 个 epoch 冻结 YOLO 主干                                  |
+| `--route-weight`                | 0.15        | 尺度路由监督 macro CE 权重                                    |
+| `--match-top-k`                 | 2000        | 匈牙利匹配候选点上限（K=max(K, n_gt)）                        |
+| `--force-hard-epoch`            | None        | 强制切换硬路由的 epoch；默认由 Router 毕业条件决定            |
+| `--resume`                      | None        | 从 checkpoint 恢复（正式修复实验应从`yolo11n.pt` 新开 run） |
 
 训练要点：
 
@@ -188,6 +192,8 @@ MoE 计数口径：全部候选点 `logits.sigmoid()` 求和（无需置信度�
 ```bash
 python -m scripts.evaluation.evaluate_datasets \
     --checkpoint runs/moe_point/best.pt \
+    --imgsz 384 \
+    --batch-size 8 \
     --dataset shanghaitech=datasets/shanghaitech_AB:val \
     --dataset jhu=datasets/jhu_crowd:val \
     --dataset qnrf=datasets/ucf_qnrf:test \

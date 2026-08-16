@@ -71,7 +71,11 @@ python -m scripts.data.prepare_ucf_cc50
 
 ```bash
 python -m scripts.data.prepare_all        # 一个命令转换全部数据集（--force 重转）
-python -m scripts.training.train_all      # 在所有数据集上联合训练
+python -m scripts.training.train_all \
+    --weights yolo11n.pt \
+    --crop-size 384 \
+    --batch-size 8 \
+    --save-dir runs/moe_point_all
 ```
 
 `prepare_all` 幂等（已存在跳过）；`train_all` 把各数据集 train split 拼成
@@ -106,6 +110,8 @@ UCF-CC-50 为 5 折交叉验证：逐折训练（fold0..fold4），每折用对�
 # 跨数据集分组评估（hard 路由 + Σsigmoid 计数）
 python -m scripts.evaluation.evaluate_datasets \
     --checkpoint runs/moe_point/best.pt \
+    --imgsz 384 \
+    --batch-size 8 \
     --dataset shanghaitech=datasets/shanghaitech_AB:val \
     --dataset jhu=datasets/jhu_crowd:val \
     --dataset qnrf=datasets/ucf_qnrf:test \
