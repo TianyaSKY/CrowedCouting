@@ -48,10 +48,10 @@ pip install -r requirements.txt
 | 数据集 | 脚本 | 图像数量 | 标注/说明 |
 | --- | --- | --- | --- |
 | JHU-Crowd++ (Sindagi 2019) | `python -m scripts.data.download_jhu_crowd` | 4,372（train 2,272 / val 500 / test 1,600） | 约 151 万点标注；单图最多 25,791 人；含恶劣天气与无人图像 |
-| ShanghaiTech A (Zhang 2016) | `python -m scripts.data.download_shanghaitech`（A+B 一并下载） | 482（train 300 / test 182） | 本项目另从 train 随机抽 30 张作 val |
-| ShanghaiTech B (Zhang 2016) | 同上 | 716（train 400 / test 316） | 本项目另从 train 随机抽 40 张作 val |
-| UCF-CC-50 (Idrees 2013) | `python -m scripts.data.download_ucf_cc50` | 50 | 极端密集人群；按标准协议 5 折交叉验证（每折 40 train / 10 test） |
-| UCF-QNRF (Idrees 2018) | `python -m scripts.data.download_ucf_qnrf` | 1,535（train 1,201 / test 334） | 约 125 万点标注；压缩包约 4.5 GB |
+| ShanghaiTech A (Zhang 2016) | `python -m scripts.data.download_shanghaitech`（A+B 一并下载） | 482（官方 train 300 / test 182） | 官方 train 再切 270 train / 30 val |
+| ShanghaiTech B (Zhang 2016) | 同上 | 716（官方 train 400 / test 316） | 官方 train 再切 360 train / 40 val |
+| UCF-CC-50 (Idrees 2013) | `python -m scripts.data.download_ucf_cc50` | 50 | 5 折 outer test；每折 36 train / 4 val / 10 test |
+| UCF-QNRF (Idrees 2018) | `python -m scripts.data.download_ucf_qnrf` | 1,535（官方 Train 1,201 / Test 334） | 官方 Train 再切约 1,081 train / 120 val；约 125 万点标注 |
 
 各脚本均支持 `--data-dir`（默认 `data/`）与 `--keep-zip`/`--keep-rar`；已存在目标目录时
 自动跳过；解压后打印实际顶层结构。大文件支持**断点续传**：下载中断会保留 `.part` 文件，
@@ -73,8 +73,8 @@ pip install -r requirements.txt
 python -m scripts.data.download_shanghaitech
 
 # 1. 合并 A/B 生成 datasets/shanghaitech_AB：
-#    images/{train,val}/*.jpg + labels/{train,val}/*.txt（YOLO 虚拟框 0 nx ny 0.010000 0.010000）
-#    验证集 = 原始 test_data 映射（part_A_/part_B_ 前缀区分）
+#    images/{train,val,test}/*.jpg + labels/{train,val,test}/*.txt
+#    每个 Part 的官方 train 独立切 90/10；官方 test_data 保留为 test
 python -m scripts.data.prepare_combined
 
 # 2. 虚拟框标签转纯点标签（labels/ 每行第 2、3 列 -> points/ 每行 "nx ny"）
@@ -91,10 +91,10 @@ python -m scripts.data.prepare_point_labels
 ```bash
 # JHU-Crowd++（gt 为逐图 txt，取 x y 两列）: datasets/jhu_crowd/{train,val,test}
 python -m scripts.data.prepare_jhu
-# UCF-QNRF（2024 版扁平布局 Train/Test，annPoints 点标注）: datasets/ucf_qnrf/{train,test}
+# UCF-QNRF（2024 版扁平布局 Train/Test，annPoints 点标注）: datasets/ucf_qnrf/{train,val,test}
 python -m scripts.data.prepare_qnrf
-# UCF-CC-50（5 折交叉验证，seed=0 打乱，每折 40 train / 10 test）:
-#   datasets/ucf_cc50/{fold0_train,fold0_test,...,fold4_train,fold4_test}
+# UCF-CC-50（5 折，seed=0；每折 36 train / 4 val / 10 test）:
+#   datasets/ucf_cc50/{fold0_train,fold0_val,fold0_test,...}
 python -m scripts.data.prepare_ucf_cc50
 ```
 
@@ -142,7 +142,7 @@ python -m scripts.training.train_moe \
 | `--route-weight` | 0.15 | 尺度路由监督 macro CE 权重 |
 | `--match-top-k` | 2000 | 匈牙利匹配候选点上限（K=max(K, n_gt)） |
 | `--force-hard-epoch` | None | 强制切换硬路由的 epoch；默认由 Router 毕业条件决定 |
-| `--resume` | None | 从 checkpoint 恢复（模型/优化器/epoch/best_mae/路由状态） |
+| `--resume` | None | 从 checkpoint 恢复（正式修复实验应从 `yolo11n.pt` 新开 run） |
 
 训练要点：
 
@@ -153,8 +153,10 @@ python -m scripts.training.train_moe \
 - **Router 梯度隔离**：epoch < `--router-grad-epoch`(15) 时，cls/point/count 不经过 gate
   向 Router 回传，Router 只由 `L_route` 训练，避免 winner-take-all 饿死少数专家。
 - **日志**：每 epoch 输出 `route`（路由 CE）、`T`、`hard_route`、`router_grad`、
-  `soft_MAE`/`hard_MAE`、GT 尺度目标分布 `target` vs 预测 `gate`、硬路由使用率与混淆矩阵。
-- **best.pt 选取**：软路由阶段按 soft MAE、硬路由生效后按 hard MAE 选 best（最终推理即硬路由）。
+  `soft_raw_macro`/`hard_raw_macro`、`soft_norm_macro`/`hard_norm_macro`、
+  GT 尺度目标分布 `target` vs 预测 `gate`、硬路由使用率与混淆矩阵。
+- **best.pt 选取**：保留原始 MAE 日志，但按各验证集 MAE 除以平均 GT 人数后的
+  normalized macro score 选 best；官方 test 只在训练结束后评估。
   未传 `--save-dir` 时输出到 `runs/moe_point_<时间戳>/{best,last}.pt` + `train.log`
   （每次启动自动带时间戳，互不覆盖；`--resume` 时沿用原 run 目录）。
 

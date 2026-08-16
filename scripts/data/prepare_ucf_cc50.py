@@ -1,10 +1,13 @@
 """转换 UCF-CC-50 到项目标准数据集布局，并按 Idrees et al. 2013 协议划分 5 折。
 
 源: data/UCF_CC_50/{1..50}.jpg + {1..50}_ann.mat（annPoints, Nx2）
-目标: datasets/ucf_cc50/  {images,labels,points}/{fold{i}_train,fold{i}_test}/ + dataset.yaml
+目标: datasets/ucf_cc50/  {images,labels,points}/
+      {fold{i}_train,fold{i}_val,fold{i}_test}/ + dataset.yaml
 
 划分: 50 张图随机打乱（固定 seed=0，可 --seed 覆盖）后等分 5 折，
-每折 10 张 test / 40 张 train，训练第 i 折时用 fold{i}_train + fold{i}_test。
+每折 10 张 outer test；剩余 40 张再按固定 seed+fold 切成 36 张 train
+和 4 张 val。训练第 i 折时只用 fold{i}_train，fold{i}_test 只在训练
+结束后评估。
 """
 
 import argparse
@@ -36,12 +39,28 @@ def prepare_ucf_cc50(data_dir="data", dest_dir="datasets/ucf_cc50", seed=0):
 
     splits = {}
     for fold in range(5):
-        test_ids = order[fold * 10 : (fold + 1) * 10]
-        train_ids = [i for i in order if i not in set(test_ids)]
+        outer_test_ids = order[fold * 10 : (fold + 1) * 10]
+        outer_test_set = set(outer_test_ids)
+        outer_train_ids = [
+            i for i in order if i not in outer_test_set
+        ]
+
+        inner_rng = random.Random(seed + fold)
+        inner_ids = list(outer_train_ids)
+        inner_rng.shuffle(inner_ids)
+        val_size = max(1, round(len(inner_ids) * 0.1))
+
+        val_ids = inner_ids[:val_size]
+        train_ids = inner_ids[val_size:]
+
         splits[f"fold{fold}_train"] = [items[i] for i in train_ids]
-        splits[f"fold{fold}_test"] = [items[i] for i in test_ids]
+        splits[f"fold{fold}_val"] = [items[i] for i in val_ids]
+        splits[f"fold{fold}_test"] = [
+            items[i] for i in outer_test_ids
+        ]
         print(
-            f"fold{fold}: train {len(train_ids)} / test {len(test_ids)}"
+            f"fold{fold}: train {len(train_ids)} / val {len(val_ids)} "
+            f"/ test {len(outer_test_ids)}"
         )
 
     if os.path.isdir(dest_dir):

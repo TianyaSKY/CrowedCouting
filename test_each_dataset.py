@@ -339,7 +339,7 @@ def parse_args() -> argparse.Namespace:
         "--split",
         type=str,
         default="val",
-        help="评估 split。prepare_combined.py 将原始 test_data 映射为 val",
+        help="评估 split（训练期默认 val；官方 test 应在训练结束后指定）",
     )
     parser.add_argument(
         "--checkpoint",

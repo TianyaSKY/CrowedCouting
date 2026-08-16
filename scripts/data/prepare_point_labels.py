@@ -36,8 +36,8 @@ def convert_split_labels(label_dir, out_dir):
 
 
 def prepare_point_labels(dest_dir="datasets/shanghaitech_AB"):
-    """为训练集和验证集分别转换点标签。"""
-    for split in ("train", "val"):
+    """为 train/val/test 分别转换 PointDataset 所需的点标签。"""
+    for split in ("train", "val", "test"):
         label_dir = os.path.join(dest_dir, "labels", split)
         out_dir = os.path.join(dest_dir, "points", split)
 

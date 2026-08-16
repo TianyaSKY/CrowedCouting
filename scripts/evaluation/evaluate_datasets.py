@@ -47,6 +47,18 @@ def parse_dataset_spec(spec: str) -> tuple[str, str, str]:
     return name, root, split
 
 
+def format_row(name: str, metrics: CountMetrics) -> str:
+    """格式化单个数据集的汇总日志。"""
+    values = metrics.as_dict()
+    return (
+        f"{name:<12} n={values['num_images']:>5} "
+        f"MAE={values['mae']:8.3f} "
+        f"RMSE={values['rmse']:8.3f} "
+        f"GT={values['gt_total']:>7} "
+        f"Pred={values['pred_total']:8.1f}"
+    )
+
+
 def evaluate_datasets(args: argparse.Namespace) -> None:
     os.makedirs(args.out_dir, exist_ok=True)
     setup_logging(os.path.join(args.out_dir, "evaluate.log"))

@@ -5,10 +5,11 @@
     python -m scripts.data.prepare_all --force    # 全部重新转换
 
 产出（datasets/ 下）:
-    shanghaitech_AB  train 700 / val 498
+    shanghaitech_AB  train 630 / val 70 / test 498
     jhu_crowd        train 2,272 / val 500 / test 1,600
-    ucf_qnrf         train 1,201 / test 334
-    ucf_cc50         5 折 × fold{i}_train(40) / fold{i}_test(10)
+    ucf_qnrf         train 约 1,081 / val 约 120 / test 334
+    ucf_cc50         5 折 × fold{i}_train(36) / fold{i}_val(4) /
+                     fold{i}_test(10)
 """
 
 import argparse

@@ -9,11 +9,11 @@ UCF-CC-50）。原始数据在 `data/`，转换后的标准布局在 `datasets/`
 
 | 数据集 | 划分 | 点标注总数 | 说明 |
 | --- | --- | --- | --- |
-| ShanghaiTech A (Zhang 2016) | train 300 / val 182（原 test_data） | A 241,677 | 点标注 |
-| ShanghaiTech B (Zhang 2016) | train 400 / val 316（原 test_data） | B 88,488 | 点标注 |
+| ShanghaiTech A (Zhang 2016) | train 270 / val 30 / test 182 | A 241,677 | 官方 train 切 90/10，官方 test 留作最终评估 |
+| ShanghaiTech B (Zhang 2016) | train 360 / val 40 / test 316 | B 88,488 | 官方 train 切 90/10，官方 test 留作最终评估 |
 | JHU-Crowd++ (Sindagi 2019) | train 2,272 / val 500 / test 1,600 | 1,515,005 | 单图最多 25,791 人 |
-| UCF-QNRF (Idrees 2018) | train 1,201 / test 334 | 1,251,642 | test 标注不公开 |
-| UCF-CC-50 (Idrees 2013) | 5 折 × 40 train / 10 test | 每折 63,974 | 极端密集 |
+| UCF-QNRF (Idrees 2018) | train 约 1,081 / val 约 120 / test 334 | 1,251,642 | 官方 Train 切 90/10，Test 留作最终评估 |
+| UCF-CC-50 (Idrees 2013) | 5 折 × 36 train / 4 val / 10 test | 每折 63,974 | 极端密集；每折独立训练 |
 
 标准布局（`datasets/<name>/`，images 与 points 一一对应）：
 
@@ -42,7 +42,7 @@ python -m scripts.data.download_ucf_cc50       # 官方 CRCV 直链（约 8 MB�
 ## 2. 转换
 
 ```bash
-# ShanghaiTech -> datasets/shanghaitech_AB（val = 原始 test_data，part_A_/part_B_ 前缀）
+# ShanghaiTech -> datasets/shanghaitech_AB（官方 train 切 train/val，官方 test_data 为 test）
 python -m scripts.data.prepare_combined
 python -m scripts.data.prepare_point_labels
 
@@ -75,9 +75,10 @@ python -m scripts.training.train_all      # 在所有数据集上联合训练
 ```
 
 `prepare_all` 幂等（已存在跳过）；`train_all` 把各数据集 train split 拼成
-ConcatDataset（batch 内随机混合），逐数据集验证并输出各数据集 MAE，best 按
-各数据集 MAE 的算术平均选取。默认覆盖 4 个数据集；`--dataset NAME=ROOT:TRAIN[:TRAIN2...]:EVAL`
-可自定义（如 UCF-CC-50 逐折：`--dataset cc50=datasets/ucf_cc50:fold0_train:fold0_test`）。
+ConcatDataset（batch 内随机混合），逐数据集用内部 val 验证并输出各数据集 MAE，best 按
+归一化 validation score 选取。默认覆盖 4 个数据集；`--dataset NAME=ROOT:TRAIN[:TRAIN2...]:EVAL`
+可自定义（如 UCF-CC-50 逐折：`--dataset cc50=datasets/ucf_cc50:fold0_train:fold0_val`）。
+训练期间默认拒绝任何 `test` split；如有特殊实验需显式传 `--allow-test-as-eval`。
 超参数与 `train_moe` 共享 argparse，checkpoint 兼容 `evaluate_datasets` / `test_each_dataset`。
 
 单数据集训练：
@@ -93,11 +94,11 @@ python -m scripts.training.train_moe \
 | --- | --- | --- | --- |
 | ShanghaiTech A+B | datasets/shanghaitech_AB | train | val |
 | JHU-Crowd++ | datasets/jhu_crowd | train | val |
-| UCF-QNRF | datasets/ucf_qnrf | train | test |
-| UCF-CC-50 | datasets/ucf_cc50 | fold{i}_train | fold{i}_test |
+| UCF-QNRF | datasets/ucf_qnrf | train | val |
+| UCF-CC-50 | datasets/ucf_cc50 | fold{i}_train | fold{i}_val |
 
 UCF-CC-50 为 5 折交叉验证：逐折训练（fold0..fold4），每折用对应 `fold{i}_train`
-训练、`fold{i}_test` 评估，最终报告 5 折平均 MAE/RMSE。
+训练、`fold{i}_val` 选 best，训练结束后才用对应 `fold{i}_test` 评估，最终报告 5 折平均 MAE/RMSE。
 
 ## 4. 评估
 

@@ -2,7 +2,8 @@
 
 训练数据 = 各数据集 train split 的 ConcatDataset（batch 内随机混合），
 验证 = 每个数据集各自跑 soft/hard MAE；Router 毕业判定用各数据集
-混淆矩阵之和，best 模型按各数据集 MAE 的算术平均选取（每个数据集等权）。
+混淆矩阵之和，best 模型按各数据集 mean-GT-count 归一化后的 MAE
+算术平均选取（每个数据集等权）。官方 test 只允许在训练结束后评估。
 
 用法（GPU 机器，从项目根目录）:
 
@@ -14,12 +15,12 @@
 默认数据集（--dataset 可覆盖，可重复）:
     shanghaitech=datasets/shanghaitech_AB:train:val
     jhu=datasets/jhu_crowd:train:val
-    qnrf=datasets/ucf_qnrf:train:test
-    cc50=datasets/ucf_cc50:fold0_train+fold1_train+fold2_train+fold3_train+fold4_train:fold0_test
+    qnrf=datasets/ucf_qnrf:train:val
+    cc50=datasets/ucf_cc50:fold0_train:fold0_val
 
 --dataset 格式: name=root:train_split[:train_split2...]:eval_split
-（train split 用 + 连接多个；CC-50 联合训练默认吃满全部 50 张，
- 验证用 fold0_test 留出 10 张。）
+（train split 用 + 连接多个；CC-50 默认只训练 fold0 的 36 张，
+ 验证用同一 outer fold 的 fold0_val 留出 4 张。）
 
 超参数与 train_moe 完全一致（共享 argparse），checkpoint 格式兼容
 evaluate_datasets / test_each_dataset。先转换数据:
@@ -28,6 +29,7 @@ evaluate_datasets / test_each_dataset。先转换数据:
 """
 
 import argparse
+import glob
 import os
 import shutil
 
@@ -49,10 +51,8 @@ from scripts.training import train_moe as tm
 DEFAULT_DATASETS = [
     "shanghaitech=datasets/shanghaitech_AB:train:val",
     "jhu=datasets/jhu_crowd:train:val",
-    "qnrf=datasets/ucf_qnrf:train:test",
-    "cc50=datasets/ucf_cc50:"
-    "fold0_train+fold1_train+fold2_train+fold3_train+fold4_train:"
-    "fold0_test",
+    "qnrf=datasets/ucf_qnrf:train:val",
+    "cc50=datasets/ucf_cc50:fold0_train:fold0_val",
 ]
 
 
@@ -70,6 +70,102 @@ def parse_dataset_spec(spec: str) -> tuple[str, str, list[str], str]:
     return name, root, train_splits, eval_split
 
 
+def assert_disjoint_splits(
+    root: str,
+    train_splits: list[str],
+    eval_split: str,
+) -> None:
+    """确认训练 split 与训练期评估 split 没有同名图片。"""
+    train_names = set()
+
+    for split in train_splits:
+        paths = glob.glob(
+            os.path.join(root, "images", split, "*.jpg")
+        )
+        train_names.update(
+            os.path.basename(path) for path in paths
+        )
+
+    eval_paths = glob.glob(
+        os.path.join(root, "images", eval_split, "*.jpg")
+    )
+    eval_names = {
+        os.path.basename(path) for path in eval_paths
+    }
+
+    overlap = train_names & eval_names
+
+    if overlap:
+        examples = sorted(overlap)[:10]
+        raise RuntimeError(
+            f"检测到 train/eval 数据泄漏: "
+            f"{len(overlap)} 张重复，例如 {examples}"
+        )
+
+
+def reject_test_as_validation(eval_split: str) -> None:
+    """默认禁止用官方 test split 参与训练期选模。"""
+    if "test" in eval_split.lower():
+        raise ValueError(
+            f"训练期间禁止使用 test split 选模: {eval_split}"
+        )
+
+
+def reject_test_as_training(train_splits: list[str]) -> None:
+    """官方 test split 不得通过训练 split 进入反向传播。"""
+    invalid = [
+        split for split in train_splits
+        if "test" in split.lower()
+    ]
+    if invalid:
+        raise ValueError(
+            "训练期间禁止使用 test split: "
+            f"{invalid}"
+        )
+
+
+def reject_multiple_outer_fold_train_splits(
+    train_splits: list[str],
+) -> None:
+    """禁止把不同 CC50 outer fold 的 train 拼成一个训练集。"""
+    fold_train_splits = [
+        split for split in train_splits
+        if split.lower().startswith("fold")
+        and split.lower().endswith("_train")
+    ]
+    if len(fold_train_splits) > 1:
+        raise ValueError(
+            "CC50 每次只能训练一个 outer fold，禁止拼接: "
+            f"{fold_train_splits}"
+        )
+
+
+def mean_gt_count(dataset: PointDataset) -> float:
+    """读取验证集平均 GT 人数，用于归一化 MAE 选模。"""
+    total_points = 0
+    for image_path in dataset.image_paths:
+        base_name = os.path.splitext(os.path.basename(image_path))[0]
+        point_path = os.path.join(
+            dataset.points_dir,
+            base_name + ".txt",
+        )
+        if not os.path.exists(point_path):
+            continue
+
+        with open(point_path, "r") as point_file:
+            for line in point_file:
+                if len(line.split()) >= 2:
+                    total_points += 1
+
+    mean_count = total_points / max(len(dataset), 1)
+    if mean_count <= 0:
+        raise ValueError(
+            f"验证集 {dataset.image_dir} 的平均 GT 人数为 0，"
+            "无法计算 normalized MAE"
+        )
+    return mean_count
+
+
 def train_all(args: argparse.Namespace) -> None:
     # 未显式指定输出目录时自动加时间戳；--resume 沿用原 run 目录
     if args.save_dir is None:
@@ -85,6 +181,11 @@ def train_all(args: argparse.Namespace) -> None:
     os.makedirs(args.save_dir, exist_ok=True)
     tm.setup_logging(os.path.join(args.save_dir, "train.log"))
     logging.info("输出目录: %s", args.save_dir)
+    if args.resume:
+        logging.warning(
+            "resume 仅用于调试；正式修复实验必须从 yolo11n.pt 新开 run，"
+            "避免继承旧 checkpoint 的 test 泄漏"
+        )
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     logging.info("使用设备: %s", device)
@@ -94,11 +195,25 @@ def train_all(args: argparse.Namespace) -> None:
         if args.dataset
         else [parse_dataset_spec(s) for s in DEFAULT_DATASETS]
     )
+    allow_test_as_eval = getattr(args, "allow_test_as_eval", False)
+    for name, root, train_splits, eval_split in specs:
+        reject_test_as_training(train_splits)
+        reject_multiple_outer_fold_train_splits(train_splits)
+        if not allow_test_as_eval:
+            reject_test_as_validation(eval_split)
+        assert_disjoint_splits(root, train_splits, eval_split)
+
     logging.info("联合数据集:")
     for name, root, train_splits, eval_split in specs:
         logging.info(
             "  %s: train=%s (%s) eval=%s", name, train_splits, root, eval_split
         )
+        if allow_test_as_eval and "test" in eval_split.lower():
+            logging.warning(
+                "显式允许 test 参与训练期评估: %s (%s)",
+                name,
+                eval_split,
+            )
 
     graduate_recalls = tuple(
         float(v) for v in args.graduate_recalls.split(",")
@@ -150,6 +265,7 @@ def train_all(args: argparse.Namespace) -> None:
 
     # 验证集：每数据集一个 loader，逐数据集报告 MAE
     val_loaders = {}
+    val_mean_gt_counts = {}
     for name, root, train_splits, eval_split in specs:
         val_dataset = PointDataset(
             root,
@@ -157,12 +273,18 @@ def train_all(args: argparse.Namespace) -> None:
             crop_size=args.crop_size,
             augment=False,
         )
+        val_mean_gt_counts[name] = mean_gt_count(val_dataset)
         val_loaders[name] = DataLoader(
             val_dataset,
             batch_size=args.batch_size,
             shuffle=False,
             num_workers=args.workers,
             collate_fn=point_collate_fn,
+        )
+        logging.info(
+            "  %s 验证集平均 GT 人数: %.3f",
+            name,
+            val_mean_gt_counts[name],
         )
     logging.info(
         "训练样本总数: %d（%d 个数据集 split 拼接）",
@@ -179,7 +301,7 @@ def train_all(args: argparse.Namespace) -> None:
     optimizer = tm.build_optimizer(model, args)
 
     start_epoch = 0
-    best_mae = float("inf")
+    best_selection_score = float("inf")
     hard_started = False
     grad_streak = 0
     first_hard_epoch = None
@@ -204,7 +326,10 @@ def train_all(args: argparse.Namespace) -> None:
             )
             optimizer = tm.build_optimizer(model, args)
         start_epoch = checkpoint.get("epoch", 0) + 1
-        best_mae = checkpoint.get("best_mae", float("inf"))
+        best_selection_score = checkpoint.get(
+            "best_selection_score",
+            checkpoint.get("best_mae", float("inf")),
+        )
         hard_started = checkpoint.get("hard_started", False)
         grad_streak = checkpoint.get("grad_streak", 0)
         first_hard_epoch = checkpoint.get("first_hard_epoch")
@@ -230,8 +355,10 @@ def train_all(args: argparse.Namespace) -> None:
         if hard_route and not was_hard_route:
             was_hard_route = True
             first_hard_epoch = epoch
-            best_mae = float("inf")
-            logging.info("切换硬路由，best 基准重置为 hard MAE")
+            best_selection_score = float("inf")
+            logging.info(
+                "切换硬路由，best 基准重置为 hard normalized macro MAE"
+            )
 
         temperature = tm.temperature_for_epoch(
             epoch, hard_route, first_hard_epoch, args
@@ -305,15 +432,24 @@ def train_all(args: argparse.Namespace) -> None:
             confusion_sum += route_confusion
             matched_sum += matched
 
-        soft_overall = sum(v[0] for v in per_dataset.values()) / len(
-            per_dataset
-        )
-        hard_overall = sum(v[1] for v in per_dataset.values()) / len(
-            per_dataset
-        )
+        soft_raw_macro = sum(
+            value[0] for value in per_dataset.values()
+        ) / len(per_dataset)
+        hard_raw_macro = sum(
+            value[1] for value in per_dataset.values()
+        ) / len(per_dataset)
+        soft_norm_macro = sum(
+            per_dataset[name][0] / val_mean_gt_counts[name]
+            for name in per_dataset
+        ) / len(per_dataset)
+        hard_norm_macro = sum(
+            per_dataset[name][1] / val_mean_gt_counts[name]
+            for name in per_dataset
+        ) / len(per_dataset)
 
         per_dataset_str = " | ".join(
-            f"{name}: soft={v[0]:.3f}/hard={v[1]:.3f}"
+            f"{name}: soft={v[0]:.3f}/{v[0] / val_mean_gt_counts[name]:.4f} "
+            f"hard={v[1]:.3f}/{v[1] / val_mean_gt_counts[name]:.4f}"
             for name, v in per_dataset.items()
         )
         logging.info(
@@ -326,8 +462,10 @@ def train_all(args: argparse.Namespace) -> None:
             f"T={temperature:.2f} "
             f"hard_route={hard_route} "
             f"router_grad={router_grad} "
-            f"soft_overall={soft_overall:.3f} "
-            f"hard_overall={hard_overall:.3f}"
+            f"soft_raw_macro={soft_raw_macro:.3f} "
+            f"soft_norm_macro={soft_norm_macro:.6f} "
+            f"hard_raw_macro={hard_raw_macro:.3f} "
+            f"hard_norm_macro={hard_norm_macro:.6f}"
         )
         logging.info("  分数据集: %s", per_dataset_str)
 
@@ -362,39 +500,65 @@ def train_all(args: argparse.Namespace) -> None:
                     f"macro={macro_recall:.2f})"
                 )
 
-        # best 选择：软阶段按 soft 整体 MAE、硬阶段按 hard 整体 MAE
-        val_mae_for_best = hard_overall if hard_route else soft_overall
-        metric_name = "hard overall MAE" if hard_route else "soft overall MAE"
+        # best 选择：原始 MAE 保留用于日志，checkpoint 使用归一化
+        # validation score，避免高人数 CC50 的绝对误差支配所有数据集。
+        val_score_for_best = (
+            hard_norm_macro if hard_route else soft_norm_macro
+        )
+        metric_name = (
+            "hard normalized macro MAE"
+            if hard_route
+            else "soft normalized macro MAE"
+        )
 
-        if val_mae_for_best < best_mae:
-            best_mae = val_mae_for_best
+        if val_score_for_best < best_selection_score:
+            best_selection_score = val_score_for_best
             best_path = os.path.join(args.save_dir, "best.pt")
             torch.save(
                 {
                     "model": model.state_dict(),
                     "optimizer": optimizer.state_dict(),
                     "epoch": epoch,
-                    "best_mae": best_mae,
+                    # 保留 best_mae 作为旧 checkpoint 读取兼容字段；
+                    # 现在它表示 normalized selection score。
+                    "best_mae": best_selection_score,
+                    "best_selection_score": best_selection_score,
+                    "selection_metric": metric_name,
                     "hard_started": hard_started,
                     "grad_streak": grad_streak,
                     "first_hard_epoch": first_hard_epoch,
                     "per_dataset": per_dataset,
+                    "val_mean_gt_counts": val_mean_gt_counts,
+                    "soft_raw_macro": soft_raw_macro,
+                    "soft_norm_macro": soft_norm_macro,
+                    "hard_raw_macro": hard_raw_macro,
+                    "hard_norm_macro": hard_norm_macro,
                     "args": vars(args),
                 },
                 best_path,
             )
-            logging.info(f"  -> 新的最佳 {metric_name}: {best_mae:.3f}")
+            logging.info(
+                f"  -> 新的最佳 {metric_name}: "
+                f"{best_selection_score:.6f}"
+            )
 
         torch.save(
             {
                 "model": model.state_dict(),
                 "optimizer": optimizer.state_dict(),
                 "epoch": epoch,
-                "best_mae": best_mae,
+                "best_mae": best_selection_score,
+                "best_selection_score": best_selection_score,
+                "selection_metric": metric_name,
                 "hard_started": hard_started,
                 "grad_streak": grad_streak,
                 "first_hard_epoch": first_hard_epoch,
                 "per_dataset": per_dataset,
+                "val_mean_gt_counts": val_mean_gt_counts,
+                "soft_raw_macro": soft_raw_macro,
+                "soft_norm_macro": soft_norm_macro,
+                "hard_raw_macro": hard_raw_macro,
+                "hard_norm_macro": hard_norm_macro,
                 "args": vars(args),
             },
             os.path.join(args.save_dir, "last.pt"),
@@ -412,6 +576,11 @@ def build_parser():
         "--dataset", type=str, action="append", default=[],
         metavar="NAME=ROOT:TRAIN[:TRAIN2...]:EVAL",
         help="可多次指定；默认覆盖全部 4 个数据集（见模块 docstring）",
+    )
+    parser.add_argument(
+        "--allow-test-as-eval",
+        action="store_true",
+        help="显式允许 test split 参与训练期评估（默认禁止）",
     )
     return parser
 
