@@ -83,9 +83,13 @@ python -m scripts.data.prepare_combined
 python -m scripts.data.prepare_point_labels
 ```
 
-`PointDataset`（`scripts/data/point_dataset.py`）读取 `images/ + points/`：训练走 5 步在线增强
-（随机缩放 0.8–1.2、随机裁剪 `crop_size=640`、翻转 p=0.5、亮度 α∈[0.8,1.2]、β∈[−20,20]）；
+`PointDataset`（`scripts/data/point_dataset.py`）读取 `images/ + points/`：训练走 7 步在线增强
+（随机缩放 0.8–1.2、随机裁剪 `crop_size=640`、翻转 p=0.5、随机旋转 ±10° p=0.5、
+亮度 α∈[0.8,1.2]、β∈[−20,20]、HSV 色相/饱和度抖动）；
 验证走 letterbox（保持纵横比 + 居中填充 114，不改变人的尺度）。
+离线增强（对合并后的数据集静态扩充，可选）：`python -m scripts.data.augment`
+对 train 每张原图生成水平翻转、2 张 512×512 随机裁剪、±15° 随机旋转共 4 张增强样本，
+同时写出 `labels/`（5 列）与 `points/`（2 列），重复运行自动跳过已增强文件。
 
 其余数据集同样转换为标准布局（纯标准库，无需 scipy/h5py/cv2，`_matlab_utils.py`
 内置 Matlab v5 .mat 解析与 JPEG/PNG 尺寸读取）：
@@ -110,7 +114,7 @@ python -m scripts.data.prepare_all
 
 # 在所有数据集上联合训练（按图片自然采样 + 逐数据集验证）
 python -m scripts.training.train_all \
-    --weights yolo11n.pt \
+    --weights yolo11m.pt \
     --crop-size 640 \
     --batch-size 32 \
     --save-dir runs/moe_point_all
@@ -129,7 +133,7 @@ python -m scripts.evaluation.evaluate_datasets \
 
 ```bash
 python -m scripts.training.train_moe \
-    --weights yolo11n.pt \
+    --weights yolo11m.pt \
     --data-root datasets/shanghaitech_AB \
     --save-dir runs/moe_point
 ```
@@ -147,7 +151,7 @@ python -m scripts.training.train_moe \
 | `--route-weight`                | 0.15        | 尺度路由监督 macro CE 权重                                    |
 | `--match-top-k`                 | 2000        | 匈牙利匹配候选点上限（K=max(K, n_gt)）                        |
 | `--force-hard-epoch`            | None        | 强制切换硬路由的 epoch；默认由 Router 毕业条件决定            |
-| `--resume`                      | None        | 从 checkpoint 恢复（正式修复实验应从`yolo11n.pt` 新开 run） |
+| `--resume`                      | None        | 从 checkpoint 恢复（正式修复实验应从`yolo11m.pt` 新开 run） |
 
 训练要点：
 

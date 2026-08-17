@@ -72,7 +72,7 @@ python -m scripts.data.prepare_ucf_cc50
 ```bash
 python -m scripts.data.prepare_all        # 一个命令转换全部数据集（--force 重转）
 python -m scripts.training.train_all \
-    --weights yolo11n.pt \
+    --weights yolo11m.pt \
     --crop-size 640 \
     --batch-size 8 \
     --save-dir runs/moe_point_all
@@ -89,7 +89,7 @@ ConcatDataset（batch 内随机混合），逐数据集用内部 val 验证并�
 
 ```bash
 python -m scripts.training.train_moe \
-    --weights yolo11n.pt \
+    --weights yolo11m.pt \
     --data-root datasets/shanghaitech_AB \
     --save-dir runs/moe_point
 ```

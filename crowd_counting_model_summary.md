@@ -25,9 +25,9 @@ graph TD
 
 ### 2.1 YOLO11Pyramid（`models/yolo11_pyramid.py`）
 
-- 加载 `YOLO(weights)`（默认 `yolo11n.pt`），删除末尾 Detect Head，保留 Backbone + Neck。
-- 输出层索引与步长**从 Detect Head 的 `f` / `stride` 字段动态读取**（yolo11n 为第 16/19/22 层，
-  stride 8/16/32），不硬编码，可平滑换 yolo11s/m/l 等尺寸。
+- 加载 `YOLO(weights)`（默认 `yolo11m.pt`），删除末尾 Detect Head，保留 Backbone + Neck。
+- 输出层索引与步长**从 Detect Head 的 `f` / `stride` 字段动态读取**（yolo11m 为第 16/19/22 层，
+  stride 8/16/32），不硬编码，可平滑换 yolo11n/s/l 等尺寸。
 - 前向用 `save_indices` 缓存中间层，返回 `[P3, P4, P5]`。
 
 ### 2.2 MoEPointHead（`models/moe_point_head.py`）
@@ -35,7 +35,7 @@ graph TD
 输入 P3/P4/P5，输出统一候选点集合（**P3 网格 × K 个参考点**，K=`num_references`∈{1,4,9}，
 默认 4；网格 384²/8²=2304，总候选 Q=2304×4=9216）：
 
-- 投影：`proj3/4/5`（1×1 Conv + GroupNorm + SiLU）把三尺度压到 `hidden_channels=128`；
+- 投影：`proj3/4/5`（1×1 Conv + GroupNorm + SiLU）把三尺度压到 `hidden_channels=256`；
   f4/f5 双线性上采样到 P3 尺寸。
 - **专家**：三个 `PointExpert` 只在 P3 网格上预测，输入为各自尺度特征
   `E3(F3)`、`E4(Up(F4)+α4·F3)`、`E5(Up(F5)+α5·F3)`；α4/α5 为可学习横向融合系数、
