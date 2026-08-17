@@ -1003,7 +1003,7 @@ def build_parser():
         description="训练 YOLO11 + 点级 Scale-MoE Head 人群计数模型"
     )
     parser.add_argument(
-        "--weights", type=str, default="yolo11n.pt",
+        "--weights", type=str, default="yolo11m.pt",
         help="YOLO11 预训练权重"
     )
     parser.add_argument(
@@ -1022,7 +1022,7 @@ def build_parser():
         "--epochs", type=int, default=100
     )
     parser.add_argument(
-        "--hidden-channels", type=int, default=128
+        "--hidden-channels", type=int, default=256
     )
     parser.add_argument(
         "--num-references", type=int, default=4,

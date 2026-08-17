@@ -219,7 +219,7 @@ def parse_args():
         help="MoE checkpoint 路径（优先使用 best_hard.pt）",
     )
     parser.add_argument(
-        "--weights", type=str, default="yolo11n.pt",
+        "--weights", type=str, default="yolo11m.pt",
         help="checkpoint 未记录 weights 时的 fallback Backbone 权重",
     )
     parser.add_argument(

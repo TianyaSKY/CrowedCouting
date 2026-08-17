@@ -129,7 +129,7 @@ class MoEPointHead(nn.Module):
     def __init__(
         self,
         feature_channels: tuple[int, int, int],
-        hidden_channels: int = 128,
+        hidden_channels: int = 256,
         num_references: int = 4,
         output_stride: int = 8,
         offset_range: float = 2.0,

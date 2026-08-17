@@ -453,7 +453,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--weights",
         type=str,
-        default="yolo11n.pt",
+        default="yolo11m.pt",
         help="旧 checkpoint 未记录 weights 时使用的 fallback Backbone 权重",
     )
     parser.add_argument(

@@ -9,7 +9,7 @@ normalized MAE 选取，macro normalized MAE 仅作为跨数据集泛化参考�
 用法（GPU 机器，从项目根目录）:
 
     python -m scripts.training.train_all \
-        --weights yolo11n.pt \
+        --weights yolo11m.pt \
         --save-dir runs/moe_point_all \
         --epochs 100
 
@@ -205,12 +205,13 @@ def train_all(args: argparse.Namespace) -> None:
     logging.info("输出目录: %s", args.save_dir)
     if args.resume:
         logging.warning(
-            "resume 仅用于调试；正式修复实验必须从 yolo11n.pt 新开 run，"
+            "resume 仅用于调试；正式修复实验必须从 yolo11m.pt 新开 run，"
             "避免继承旧 checkpoint 的 test 泄漏"
         )
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     logging.info("使用设备: %s", device)
+    tm.validate_cuda_device(device)
 
     specs = (
         [parse_dataset_spec(s) for s in args.dataset]

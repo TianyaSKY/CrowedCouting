@@ -212,7 +212,7 @@ def parse_args():
         help="输入图片路径"
     )
     parser.add_argument(
-        "--weights", type=str, default="yolo11n.pt",
+        "--weights", type=str, default="yolo11m.pt",
         help="YOLO11 预训练权重（用于构建 Backbone+Neck）"
     )
     parser.add_argument(

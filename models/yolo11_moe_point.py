@@ -16,8 +16,8 @@ class YOLO11MoEPoint(nn.Module):
 
     def __init__(
         self,
-        weights: str = "yolo11n.pt",
-        hidden_channels: int = 128,
+        weights: str = "yolo11m.pt",
+        hidden_channels: int = 256,
         num_references: int = 4,
     ) -> None:
         super().__init__()
