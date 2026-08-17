@@ -42,6 +42,10 @@ class PointDataset(Dataset):
     输出：
         "img":    Tensor[3, H, W]（RGB，0~1，当前图像像素坐标空间）
         "points": Tensor[N, 2]（像素坐标）
+
+    训练在线增强（augment=True）：
+        缩放 0.8–1.2 → 随机裁剪 crop_size → 水平翻转 p=0.5
+        → 随机旋转 ±10° p=0.5 → 亮度/对比度 → HSV 色相/饱和度抖动
     """
 
     def __init__(
@@ -207,12 +211,73 @@ class PointDataset(Dataset):
             if points.shape[0] > 0:
                 points[:, 0] = crop_size - 1 - points[:, 0]
 
-        # 5. 亮度与对比度变化
+        # 5. 随机旋转（小角度，保持头部近似圆形；点与图像用同一
+        #    旋转矩阵同步变换，旋转出界点直接丢弃）
+        if random.random() < 0.5:
+            angle = random.uniform(-10.0, 10.0)
+            rotation_matrix = cv2.getRotationMatrix2D(
+                (crop_size / 2.0, crop_size / 2.0),
+                angle,
+                1.0,
+            ).astype(np.float32)
+            image = cv2.warpAffine(
+                image,
+                rotation_matrix,
+                (crop_size, crop_size),
+                flags=cv2.INTER_LINEAR,
+                borderMode=cv2.BORDER_CONSTANT,
+                borderValue=(114, 114, 114),
+            )
+            if points.shape[0] > 0:
+                ones = np.ones(
+                    (points.shape[0], 1),
+                    dtype=np.float32,
+                )
+                points = (
+                    rotation_matrix
+                    @ np.hstack([points, ones]).T
+                ).T
+                keep = (
+                    (points[:, 0] >= 0)
+                    & (points[:, 0] < crop_size)
+                    & (points[:, 1] >= 0)
+                    & (points[:, 1] < crop_size)
+                )
+                points = points[keep]
+                if points.shape[0] > 0:
+                    points[:, 0] = np.clip(
+                        points[:, 0], 0, crop_size - 1
+                    )
+                    points[:, 1] = np.clip(
+                        points[:, 1], 0, crop_size - 1
+                    )
+
+        # 6. 亮度与对比度变化
         alpha = random.uniform(0.8, 1.2)
         beta = random.uniform(-20.0, 20.0)
         image = cv2.convertScaleAbs(
             image, alpha=alpha, beta=beta
         )
+
+        # 7. 色相/饱和度抖动（HSV 空间；亮度已由第 6 步控制）
+        if random.random() < 0.5:
+            image_hsv = cv2.cvtColor(
+                image, cv2.COLOR_RGB2HSV
+            ).astype(np.float32)
+            hue_delta = random.uniform(-5.0, 5.0)
+            saturation_scale = random.uniform(0.85, 1.15)
+            image_hsv[..., 0] = (
+                image_hsv[..., 0] + hue_delta
+            ) % 180.0
+            image_hsv[..., 1] = np.clip(
+                image_hsv[..., 1] * saturation_scale,
+                0.0,
+                255.0,
+            )
+            image = cv2.cvtColor(
+                image_hsv.astype(np.uint8),
+                cv2.COLOR_HSV2RGB,
+            )
 
         return image, points
 
