@@ -8,7 +8,7 @@ whole requested split.
 Example:
     python test_each_dataset.py \
         --data-root datasets/shanghaitech_AB \
-        --checkpoint runs/moe_point/best.pt \
+        --checkpoint runs/moe_point/best_hard.pt \
         --split val \
         --batch-size 16 \
         --out-dir runs/moe_point/test_eval
@@ -146,10 +146,67 @@ def load_checkpoint_model(
     checkpoint_args = checkpoint.get("args", {})
     if not isinstance(checkpoint_args, dict):
         checkpoint_args = {}
+    saved_config = checkpoint.get("config", {})
+    if not isinstance(saved_config, dict):
+        saved_config = {}
 
-    weights = str(checkpoint_args.get("weights", fallback_weights))
-    hidden_channels = int(checkpoint_args.get("hidden_channels", 128))
-    num_references = int(checkpoint_args.get("num_references", 4))
+    def saved_value(name: str, default: object) -> object:
+        if name in saved_config:
+            return saved_config[name]
+        return checkpoint_args.get(name, default)
+
+    weights = str(
+        checkpoint_args.get("weights", fallback_weights)
+    )
+    hidden_channels = int(
+        checkpoint_args.get("hidden_channels", 128)
+    )
+    num_references = int(saved_value("num_references", 4))
+    crop_size = int(saved_value("crop_size", 384))
+    temperature_schedule = saved_config.get(
+        "temperature_schedule",
+        {
+            name: checkpoint_args.get(name)
+            for name in (
+                "init_temperature",
+                "phase1_temp",
+                "soft_temp_floor",
+                "min_temperature",
+                "temp_floor_epoch",
+                "hard_temp_epochs",
+            )
+            if name in checkpoint_args
+        },
+    )
+    if not isinstance(temperature_schedule, dict):
+        temperature_schedule = {}
+    hard_started = bool(
+        saved_value(
+            "hard_started",
+            checkpoint.get("hard_started", False),
+        )
+    )
+    hard_route = bool(
+        saved_value(
+            "hard_route",
+            checkpoint.get("hard_route", hard_started),
+        )
+    )
+    router_grad_epoch = int(
+        saved_value(
+            "router_grad_epoch",
+            checkpoint_args.get("router_grad_epoch", 15),
+        )
+    )
+    expert_uniform_floor = float(
+        saved_value("expert_uniform_floor", 0.0)
+    )
+    scale_centers = saved_value(
+        "scale_centers",
+        [10.0, 20.0, 40.0],
+    )
+    if not isinstance(scale_centers, (list, tuple)):
+        scale_centers = [10.0, 20.0, 40.0]
 
     model = YOLO11MoEPoint(
         weights=weights,
@@ -167,9 +224,20 @@ def load_checkpoint_model(
     metadata: dict[str, object] = {
         "epoch": checkpoint.get("epoch"),
         "best_mae": checkpoint.get("best_mae"),
+        "selection_metric": checkpoint.get("selection_metric"),
         "weights": weights,
         "hidden_channels": hidden_channels,
         "num_references": num_references,
+        "crop_size": crop_size,
+        "temperature_schedule": temperature_schedule,
+        "hard_started": hard_started,
+        "hard_route": hard_route,
+        "router_grad_epoch": router_grad_epoch,
+        "expert_uniform_floor": expert_uniform_floor,
+        "scale_centers": [
+            float(center) for center in scale_centers
+        ],
+        "config": saved_config,
     }
     return model, metadata
 
@@ -197,18 +265,53 @@ def evaluate(args: argparse.Namespace) -> None:
         args.weights,
         device,
     )
+    temperature_schedule = checkpoint_metadata[
+        "temperature_schedule"
+    ]
+    if args.temperature is None:
+        if isinstance(temperature_schedule, dict):
+            temperature = float(
+                temperature_schedule.get("min_temperature", 0.5)
+            )
+        else:
+            temperature = 0.5
+    else:
+        temperature = args.temperature
+
+    crop_size = (
+        args.imgsz
+        if args.imgsz is not None
+        else int(checkpoint_metadata["crop_size"])
+    )
     logging.info(
-        "checkpoint: epoch=%s best_mae=%s hidden=%s refs=%s",
+        "checkpoint: epoch=%s best_mae=%s metric=%s hidden=%s refs=%s "
+        "crop_size=%s temperature=%s hard_started=%s hard_route=%s "
+        "router_grad_epoch=%s scale_centers=%s",
         checkpoint_metadata["epoch"],
         checkpoint_metadata["best_mae"],
+        checkpoint_metadata["selection_metric"],
         checkpoint_metadata["hidden_channels"],
         checkpoint_metadata["num_references"],
+        crop_size,
+        temperature,
+        checkpoint_metadata["hard_started"],
+        checkpoint_metadata["hard_route"],
+        checkpoint_metadata["router_grad_epoch"],
+        checkpoint_metadata["scale_centers"],
     )
+    if (
+        not checkpoint_metadata["hard_started"]
+        or not checkpoint_metadata["hard_route"]
+    ):
+        logging.warning(
+            "当前 checkpoint 尚未完成 hard phase；测试仍请求 hard inference，"
+            "请优先使用 best_hard.pt。"
+        )
 
     base_dataset = PointDataset(
         args.data_root,
         split=args.split,
-        crop_size=args.imgsz,
+        crop_size=crop_size,
         augment=False,
     )
     dataset = NamedPointDataset(base_dataset)
@@ -253,7 +356,7 @@ def evaluate(args: argparse.Namespace) -> None:
 
                 predictions = model(
                     images,
-                    temperature=args.temperature,
+                    temperature=temperature,
                     hard_route=True,
                 )
                 pred_counts = (
@@ -294,8 +397,8 @@ def evaluate(args: argparse.Namespace) -> None:
     summary = {
         "split": args.split,
         "count_metric": "hard_route_sum_sigmoid",
-        "temperature": args.temperature,
-        "imgsz": args.imgsz,
+        "temperature": temperature,
+        "imgsz": crop_size,
         "checkpoint": args.checkpoint,
         "checkpoint_metadata": checkpoint_metadata,
         "overall": metrics["overall"].as_dict(),
@@ -344,8 +447,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--checkpoint",
         type=str,
-        default="runs/moe_point/best.pt",
-        help="MoE checkpoint，测试应优先使用 best.pt",
+        default="runs/moe_point/best_hard.pt",
+        help="MoE checkpoint，默认使用 hard phase 的 best_hard.pt",
     )
     parser.add_argument(
         "--weights",
@@ -356,14 +459,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--imgsz",
         type=int,
-        default=640,
-        help="测试 letterbox 尺寸，应与训练 crop_size 一致",
+        default=None,
+        help="覆盖 checkpoint crop_size；默认读取 checkpoint 配置",
     )
     parser.add_argument(
         "--temperature",
         type=float,
-        default=0.5,
-        help="hard route 的 softmax 温度；默认与训练后期验证一致",
+        default=None,
+        help="覆盖 hard inference 温度；默认读取 checkpoint schedule",
     )
     parser.add_argument(
         "--batch-size",

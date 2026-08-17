@@ -6,7 +6,7 @@
 用法（在 GPU 机器上，从项目根目录）:
 
     python -m scripts.evaluation.evaluate_datasets \
-        --checkpoint runs/moe_point/best.pt \
+        --checkpoint runs/moe_point_all/best_hard.pt \
         --dataset shanghaitech=datasets/shanghaitech_AB:val \
         --dataset jhu=datasets/jhu_crowd:val \
         --dataset qnrf=datasets/ucf_qnrf:test \
@@ -69,13 +69,45 @@ def evaluate_datasets(args: argparse.Namespace) -> None:
     model, metadata = load_checkpoint_model(
         args.checkpoint, args.weights, device
     )
+    temperature_schedule = metadata["temperature_schedule"]
+    if args.temperature is None:
+        if isinstance(temperature_schedule, dict):
+            temperature = float(
+                temperature_schedule.get("min_temperature", 0.5)
+            )
+        else:
+            temperature = 0.5
+    else:
+        temperature = args.temperature
+    crop_size = (
+        args.imgsz
+        if args.imgsz is not None
+        else int(metadata["crop_size"])
+    )
     logging.info(
-        "checkpoint: epoch=%s best_mae=%s hidden=%s refs=%s",
+        "checkpoint: epoch=%s best_mae=%s metric=%s hidden=%s refs=%s "
+        "crop_size=%s temperature=%s hard_started=%s hard_route=%s "
+        "router_grad_epoch=%s scale_centers=%s",
         metadata["epoch"],
         metadata["best_mae"],
+        metadata["selection_metric"],
         metadata["hidden_channels"],
         metadata["num_references"],
+        crop_size,
+        temperature,
+        metadata["hard_started"],
+        metadata["hard_route"],
+        metadata["router_grad_epoch"],
+        metadata["scale_centers"],
     )
+    if (
+        not metadata["hard_started"]
+        or not metadata["hard_route"]
+    ):
+        logging.warning(
+            "当前 checkpoint 尚未完成 hard phase；测试仍请求 hard inference，"
+            "请优先使用 best_hard.pt。"
+        )
 
     specs = [parse_dataset_spec(s) for s in args.dataset]
     if not specs:
@@ -84,10 +116,8 @@ def evaluate_datasets(args: argparse.Namespace) -> None:
     combined: dict[str, dict] = {}
 
     for name, root, split in specs:
-        logging.info("== 评估数据集 %s (%s, split=%s) ==", name, root, split)
-
         dataset = PointDataset(
-            root, split=split, crop_size=args.imgsz, augment=False
+            root, split=split, crop_size=crop_size, augment=False
         )
         loader = DataLoader(
             dataset,
@@ -116,7 +146,7 @@ def evaluate_datasets(args: argparse.Namespace) -> None:
                 with torch.no_grad():
                     predictions = model(
                         images,
-                        temperature=args.temperature,
+                        temperature=temperature,
                         hard_route=True,
                         router_grad=False,
                     )
@@ -160,8 +190,9 @@ def evaluate_datasets(args: argparse.Namespace) -> None:
         json.dump(
             {
                 "checkpoint": args.checkpoint,
-                "imgsz": args.imgsz,
-                "temperature": args.temperature,
+                "imgsz": crop_size,
+                "temperature": temperature,
+                "checkpoint_metadata": metadata,
                 "datasets": combined,
             },
             f,
@@ -185,7 +216,7 @@ def parse_args():
     )
     parser.add_argument(
         "--checkpoint", type=str, required=True,
-        help="MoE checkpoint 路径（runs/moe_point/best.pt）",
+        help="MoE checkpoint 路径（优先使用 best_hard.pt）",
     )
     parser.add_argument(
         "--weights", type=str, default="yolo11n.pt",
@@ -196,9 +227,18 @@ def parse_args():
         metavar="NAME=ROOT:SPLIT",
         help="可多次指定；例如 shanghaitech=datasets/shanghaitech_AB:val",
     )
-    parser.add_argument("--imgsz", type=int, default=640,
-                        help="letterbox 尺寸，应与训练 crop_size 一致")
-    parser.add_argument("--temperature", type=float, default=0.5)
+    parser.add_argument(
+        "--imgsz",
+        type=int,
+        default=None,
+        help="覆盖 checkpoint crop_size；默认读取 checkpoint 配置",
+    )
+    parser.add_argument(
+        "--temperature",
+        type=float,
+        default=None,
+        help="覆盖 hard inference 温度；默认读取 checkpoint schedule",
+    )
     parser.add_argument("--batch-size", type=int, default=16)
     parser.add_argument("--workers", type=int, default=4)
     parser.add_argument("--out-dir", type=str,
