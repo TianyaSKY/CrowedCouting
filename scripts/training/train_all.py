@@ -445,6 +445,10 @@ def train_all(args: argparse.Namespace) -> None:
         matched_gate_entropy_sum = torch.zeros(
             (), device=device
         )
+        target_mean = torch.zeros(
+            3, device=device
+        )
+        target_points = 0
         loss_sums = {
             name: torch.zeros((), device=device)
             for name in ("cls", "point", "count", "route")
