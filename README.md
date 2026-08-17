@@ -2,6 +2,8 @@
 
 基于 YOLO11 的人群计数项目。模型不回归边界框，只预测人头中心点，支持多数据集。
 
+2026 Aug 17 remark:To boost training effeicney,I remove data which larger than 1000.
+
 两个分支：
 
 1. **点级 Scale-MoE Head 分支（当前推荐）**：保留 YOLO11 Backbone+Neck、删除原始
