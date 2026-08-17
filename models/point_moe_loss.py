@@ -132,7 +132,7 @@ class PointMoELoss(nn.Module):
         logits = predictions["logits"]
         points = predictions["points"]
         route_logits = predictions["route_logits"]
-
+        gates = predictions["gates"]
         batch_size = logits.shape[0]
         image_height, image_width = image_size
 
@@ -158,6 +158,12 @@ class PointMoELoss(nn.Module):
             logits.new_zeros(()) for _ in range(num_experts)
         ]
         route_class_counts = [0 for _ in range(num_experts)]
+
+        # 只统计 Hungarian 匹配到的正样本 gate，避免 25,600 个候选
+        # 中的大量背景点污染 Router 分布与熵诊断。
+        matched_gate_hist = logits.new_zeros(num_experts)
+        matched_gate_entropy = logits.new_zeros(())
+        matched_gate_points = 0
 
         # 诊断：GT 尺度目标的 argmax 分布，与预测 gate 分布对比
         target_gate_hist = logits.new_zeros(num_experts)
@@ -279,6 +285,20 @@ class PointMoELoss(nn.Module):
                         dim=1
                     ).bincount(minlength=num_experts).float()
                     target_gate_points += number_of_gt
+                    matched_gates = gates[batch_index][
+                        matched_full_indices
+                    ].detach()
+                    matched_gate_hist += matched_gates.sum(
+                        dim=0
+                    )
+                    safe_matched_gates = matched_gates.clamp_min(
+                        1e-8
+                    )
+                    matched_gate_entropy += -(
+                        safe_matched_gates
+                        * safe_matched_gates.log()
+                    ).sum()
+                    matched_gate_points += number_of_gt
 
                     matched_route = route_logits_flat[
                         batch_index
@@ -360,4 +380,9 @@ class PointMoELoss(nn.Module):
             "gate_target_count": logits.new_tensor(
                 target_gate_points, dtype=logits.dtype
             ),
+            "matched_gate_hist": matched_gate_hist.detach(),
+            "matched_gate_count": logits.new_tensor(
+                matched_gate_points, dtype=logits.dtype
+            ),
+            "matched_gate_entropy": matched_gate_entropy.detach(),
         }

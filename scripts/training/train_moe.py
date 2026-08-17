@@ -124,6 +124,13 @@ def _routing_confusion(
     image_size: tuple[int, int],
     device: torch.device,
     match_top_k: int = 2000,
+    knn_k: int = 1,
+    scale_centers: tuple[float, float, float] = (
+        10.0,
+        20.0,
+        40.0,
+    ),
+    scale_sigma_octaves: float = 0.6,
 ) -> tuple[torch.Tensor, int]:
     """单个 batch 的路由混淆矩阵：GT 尺度目标类(行) x 预测专家(列)。
 
@@ -132,9 +139,8 @@ def _routing_confusion(
     行 = GT 最近邻间距映射的尺度目标类(E0/E1/E2)，
     列 = 匹配候选在硬路由 gate 上的 argmax 专家。
 
-    这是"Router 是否学到尺度分工"的直接证据：若某行集中到对角元，
-    说明该尺度的 GT 点确实路由到了对应专家；若某行集中到 E0，
-    说明对应尺度的专家在 hard 阶段根本没有拿到正样本。
+    ``knn_k``、``scale_centers`` 和 ``scale_sigma_octaves`` 必须来自训练
+    criterion，确保 Router graduation 使用与 route loss 相同的标签。
     """
     from models.point_moe_loss import PointMoELoss
 
@@ -144,7 +150,6 @@ def _routing_confusion(
 
     batch_size = logits.shape[0]
     image_height, image_width = image_size
-
     scale = points.new_tensor(
         [float(image_width), float(image_height)]
     )
@@ -158,8 +163,8 @@ def _routing_confusion(
         gt = gt_points[batch_index].to(device)
         number_of_gt = gt.shape[0]
 
-        # 至少 2 个点才能计算最近邻间距尺度目标（与损失一致）
-        if number_of_gt < 2:
+        # 至少 knn_k+1 个点才能计算第 knn_k 近邻间距。
+        if number_of_gt < knn_k + 1:
             continue
 
         pred_logits = logits[batch_index]
@@ -167,25 +172,23 @@ def _routing_confusion(
         pred_gates = gates[batch_index]
 
         top_k = max(match_top_k, number_of_gt)
-
         if pred_logits.shape[0] > top_k:
             match_indices = pred_logits.topk(top_k).indices
             match_logits = pred_logits[match_indices]
             match_points = pred_points[match_indices]
-            match_gates = pred_gates[match_indices]
         else:
+            match_indices = None
             match_logits = pred_logits
             match_points = pred_points
-            match_gates = pred_gates
-            match_indices = None
 
         normalized_gt = gt / scale
         normalized_pred = match_points / scale
-
         total_cost = (
             5.0
             * torch.cdist(
-                normalized_gt, normalized_pred, p=1
+                normalized_gt,
+                normalized_pred,
+                p=1,
             )
             - match_logits.sigmoid().unsqueeze(0)
         )
@@ -193,12 +196,15 @@ def _routing_confusion(
         gt_indices, pred_indices = linear_sum_assignment(
             total_cost.detach().float().cpu().numpy()
         )
-
         gt_indices = torch.as_tensor(
-            gt_indices, dtype=torch.long, device=device
+            gt_indices,
+            dtype=torch.long,
+            device=device,
         )
         pred_indices = torch.as_tensor(
-            pred_indices, dtype=torch.long, device=device
+            pred_indices,
+            dtype=torch.long,
+            device=device,
         )
 
         if match_indices is not None:
@@ -206,15 +212,13 @@ def _routing_confusion(
         else:
             matched_full_indices = pred_indices
 
-        # 尺度目标与 PointMoELoss 默认参数一致
         target_gate = PointMoELoss.scale_targets(
             gt,
-            knn_k=1,
-            scale_centers=(10.0, 20.0, 40.0),
-            scale_sigma_octaves=0.6,
+            knn_k=knn_k,
+            scale_centers=scale_centers,
+            scale_sigma_octaves=scale_sigma_octaves,
         )
         target_class = target_gate.argmax(dim=1)
-
         pred_class = pred_gates[
             matched_full_indices
         ].argmax(dim=1)
@@ -223,7 +227,8 @@ def _routing_confusion(
             0,
             target_class,
             torch.nn.functional.one_hot(
-                pred_class, num_classes=3
+                pred_class,
+                num_classes=3,
             ).to(device),
         )
         matched_points += number_of_gt
@@ -238,6 +243,13 @@ def evaluate_count_mae(
     match_top_k: int = 2000,
     soft_temperature: float = 1.0,
     hard_temperature: float = 0.5,
+    knn_k: int = 1,
+    scale_centers: tuple[float, float, float] = (
+        10.0,
+        20.0,
+        40.0,
+    ),
+    scale_sigma_octaves: float = 0.6,
 ):
     """验证集人数 MAE（以所有候选点置信度和作为预测人数）。
 
@@ -309,7 +321,10 @@ def evaluate_count_mae(
                             gt_points,
                             images.shape[-2:],
                             device,
-                            match_top_k,
+                            match_top_k=match_top_k,
+                            knn_k=knn_k,
+                            scale_centers=scale_centers,
+                            scale_sigma_octaves=scale_sigma_octaves,
                         )
                     )
                     route_confusion += batch_confusion
@@ -663,11 +678,13 @@ def train_moe(args):
         model.train()
         total_loss = 0.0
         num_batches = 0
-        gate_mean = torch.zeros(3, device=device)
-        target_mean = torch.zeros(3, device=device)
-        target_points = 0
-        router_entropy_sum = torch.zeros((), device=device)
-        router_gate_count = 0
+        matched_gate_sum = torch.zeros(
+            3, device=device
+        )
+        matched_gate_points = 0
+        matched_gate_entropy_sum = torch.zeros(
+            (), device=device
+        )
         loss_sums = {
             name: torch.zeros((), device=device)
             for name in ("cls", "point", "count", "route")
@@ -697,17 +714,17 @@ def train_moe(args):
                 image_size=images.shape[-2:],
             )
 
-            # 诊断：本 batch 候选点的平均 gate 分布（软阶段=soft 门，
-            # 硬阶段=one-hot 使用率），与 GT 目标分布对比
-            gate_values = predictions["gates"].reshape(
-                -1, 3
-            ).detach()
-            gate_mean += gate_values.mean(dim=0)
-            router_entropy_sum += -(
-                gate_values.clamp_min(1e-8)
-                * gate_values.clamp_min(1e-8).log()
-            ).sum()
-            router_gate_count += gate_values.shape[0]
+            # 诊断只统计 Hungarian 匹配到的正样本，避免背景候选
+            # 污染 gate 分布与 Router entropy。
+            matched_gate_sum += loss_items[
+                "matched_gate_hist"
+            ].to(device)
+            matched_gate_points += int(
+                loss_items["matched_gate_count"].item()
+            )
+            matched_gate_entropy_sum += loss_items[
+                "matched_gate_entropy"
+            ].to(device)
             target_mean += loss_items["gate_target_hist"].to(
                 device
             )
@@ -753,9 +770,16 @@ def train_moe(args):
             device,
             args.match_top_k,
             soft_temperature=temperature,
+            knn_k=criterion.knn_k,
+            scale_centers=criterion.scale_centers,
+            scale_sigma_octaves=criterion.scale_sigma_octaves,
         )
 
-        gate_pct = gate_mean / max(num_batches, 1) * 100
+        gate_pct = (
+            matched_gate_sum
+            / max(matched_gate_points, 1)
+            * 100
+        )
         target_pct = target_mean / max(target_points, 1) * 100
         usage_pct = (
             hard_usage.float()
@@ -763,7 +787,8 @@ def train_moe(args):
             * 100
         )
         router_entropy = (
-            router_entropy_sum / max(router_gate_count, 1)
+            matched_gate_entropy_sum
+            / max(matched_gate_points, 1)
         ).item()
 
         logging.info(
@@ -778,11 +803,11 @@ def train_moe(args):
             f"router_grad={router_grad} "
             f"soft_MAE={soft_mae:.3f} "
             f"hard_MAE={hard_mae:.3f} "
-            f"router_entropy={router_entropy:.4f}"
+            f"matched_entropy={router_entropy:.4f}"
         )
         logging.info(
-            f"  gate  =E0:{gate_pct[0]:.1f}% E1:{gate_pct[1]:.1f}% "
-            f"E2:{gate_pct[2]:.1f}%"
+            f"  matched_gate=E0:{gate_pct[0]:.1f}% "
+            f"E1:{gate_pct[1]:.1f}% E2:{gate_pct[2]:.1f}%"
             f" | target=E0:{target_pct[0]:.1f}% "
             f"E1:{target_pct[1]:.1f}% E2:{target_pct[2]:.1f}%"
             f" | 硬路由使用=E0:{usage_pct[0]:.1f}% "

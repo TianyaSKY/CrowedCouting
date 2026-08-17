@@ -153,22 +153,40 @@ class PointDataset(Dataset):
         if height >= crop_size and width >= crop_size:
             y0 = random.randint(0, height - crop_size)
             x0 = random.randint(0, width - crop_size)
-            image = image[y0:y0 + crop_size, x0:x0 + crop_size]
-            points = points - np.array(
-                [x0, y0], dtype=np.float32
-            )
         else:
-            # 图像小于裁剪尺寸时直接放大
+            # 小图先等比例放大到短边至少为 crop_size，再随机裁剪。
+            # 禁止直接拉伸成正方形，否则 x/y 像素尺度会被分别改变，
+            # 进而污染点间距与 Router 尺度标签。
+            scale_up = max(
+                crop_size / max(height, 1),
+                crop_size / max(width, 1),
+            )
+            new_height = max(
+                crop_size,
+                int(round(height * scale_up)),
+            )
+            new_width = max(
+                crop_size,
+                int(round(width * scale_up)),
+            )
             image = cv2.resize(
                 image,
-                (crop_size, crop_size),
+                (new_width, new_height),
                 interpolation=cv2.INTER_LINEAR,
             )
-            fx = crop_size / max(width, 1)
-            fy = crop_size / max(height, 1)
             points = points * np.array(
-                [fx, fy], dtype=np.float32
+                [new_width / max(width, 1),
+                 new_height / max(height, 1)],
+                dtype=np.float32,
             )
+            height, width = new_height, new_width
+            y0 = random.randint(0, height - crop_size)
+            x0 = random.randint(0, width - crop_size)
+
+        image = image[y0:y0 + crop_size, x0:x0 + crop_size]
+        points = points - np.array(
+            [x0, y0], dtype=np.float32
+        )
 
         # 3. 保留裁剪区域内的点
         keep = (

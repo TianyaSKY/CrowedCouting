@@ -438,11 +438,13 @@ def train_all(args: argparse.Namespace) -> None:
         model.train()
         total_loss = 0.0
         num_batches = 0
-        gate_mean = torch.zeros(3, device=device)
-        target_mean = torch.zeros(3, device=device)
-        target_points = 0
-        router_entropy_sum = torch.zeros((), device=device)
-        router_gate_count = 0
+        matched_gate_sum = torch.zeros(
+            3, device=device
+        )
+        matched_gate_points = 0
+        matched_gate_entropy_sum = torch.zeros(
+            (), device=device
+        )
         loss_sums = {
             name: torch.zeros((), device=device)
             for name in ("cls", "point", "count", "route")
@@ -467,15 +469,23 @@ def train_all(args: argparse.Namespace) -> None:
                 predictions, gt_points, image_size=images.shape[-2:]
             )
 
-            gate_values = predictions["gates"].reshape(-1, 3).detach()
-            gate_mean += gate_values.mean(dim=0)
-            router_entropy_sum += -(
-                gate_values.clamp_min(1e-8)
-                * gate_values.clamp_min(1e-8).log()
-            ).sum()
-            router_gate_count += gate_values.shape[0]
-            target_mean += loss_items["gate_target_hist"].to(device)
-            target_points += int(loss_items["gate_target_count"].item())
+            # 诊断只统计 Hungarian 匹配到的正样本，避免背景候选
+            # 污染 gate 分布与 Router entropy。
+            matched_gate_sum += loss_items[
+                "matched_gate_hist"
+            ].to(device)
+            matched_gate_points += int(
+                loss_items["matched_gate_count"].item()
+            )
+            matched_gate_entropy_sum += loss_items[
+                "matched_gate_entropy"
+            ].to(device)
+            target_mean += loss_items["gate_target_hist"].to(
+                device
+            )
+            target_points += int(
+                loss_items["gate_target_count"].item()
+            )
 
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
@@ -513,6 +523,9 @@ def train_all(args: argparse.Namespace) -> None:
                 val_loader,
                 device,
                 soft_temperature=temperature,
+                knn_k=criterion.knn_k,
+                scale_centers=criterion.scale_centers,
+                scale_sigma_octaves=criterion.scale_sigma_octaves,
             )
             per_dataset[name] = (soft_mae, hard_mae)
             hard_usage_sum += hard_usage
@@ -547,7 +560,9 @@ def train_all(args: argparse.Namespace) -> None:
         )
 
         train_gate_pct = (
-            gate_mean / max(num_batches, 1) * 100
+            matched_gate_sum
+            / max(matched_gate_points, 1)
+            * 100
         )
         target_pct = (
             target_mean / max(target_points, 1) * 100
@@ -558,7 +573,8 @@ def train_all(args: argparse.Namespace) -> None:
             * 100
         )
         router_entropy = (
-            router_entropy_sum / max(router_gate_count, 1)
+            matched_gate_entropy_sum
+            / max(matched_gate_points, 1)
         ).item()
         if matched_sum > 0:
             recalls, macro_recall = tm.router_recalls(
@@ -602,10 +618,10 @@ def train_all(args: argparse.Namespace) -> None:
         )
         logging.info("  分数据集: %s", per_dataset_str)
         logging.info(
-            "  train gate=E0:%.1f%% E1:%.1f%% E2:%.1f%% "
+            "  matched train gate=E0:%.1f%% E1:%.1f%% E2:%.1f%% "
             "| GT target=E0:%.1f%% E1:%.1f%% E2:%.1f%% "
             "| val hard usage=E0:%.1f%% E1:%.1f%% E2:%.1f%% "
-            "| entropy=%.4f",
+            "| matched entropy=%.4f",
             train_gate_pct[0],
             train_gate_pct[1],
             train_gate_pct[2],
@@ -726,8 +742,9 @@ def train_all(args: argparse.Namespace) -> None:
             "hard_raw_macro": hard_raw_macro,
             "hard_norm_macro": hard_norm_macro,
             "hard_weighted_norm_mae": hard_weighted_norm_mae,
+            # 该字段保持兼容，但现在严格采用 matched-positive 口径。
             "train_gate_distribution": (
-                gate_mean / max(num_batches, 1)
+                matched_gate_sum / max(matched_gate_points, 1)
             ).detach().cpu(),
             "gt_target_distribution": (
                 target_mean / max(target_points, 1)
