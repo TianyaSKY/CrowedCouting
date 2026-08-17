@@ -43,6 +43,38 @@ def setup_logging(log_path: str) -> None:
     )
 
 
+def validate_cuda_device(device: str) -> None:
+    """Fail fast when the installed PyTorch wheel cannot target the GPU."""
+    if device != "cuda":
+        return
+
+    capability = torch.cuda.get_device_capability()
+    target_arch = f"sm_{capability[0] * 10 + capability[1]}"
+    supported_arches = tuple(torch.cuda.get_arch_list())
+    if supported_arches and target_arch not in supported_arches:
+        supported = ", ".join(supported_arches)
+        raise RuntimeError(
+            "当前 PyTorch CUDA wheel 不支持当前 GPU: "
+            f"{torch.cuda.get_device_name()} ({target_arch})。"
+            f"torch={torch.__version__}, "
+            f"CUDA={torch.version.cuda}, "
+            f"支持的架构: {supported}。"
+            "请按 requirements.txt 安装支持该 GPU 的 CUDA 版 PyTorch，"
+            "例如: python -m pip install torch torchvision "
+            "--index-url https://download.pytorch.org/whl/cu130。"
+            "不要继续使用当前环境训练。"
+        )
+
+    try:
+        torch.zeros(1, device="cuda").sum().item()
+        torch.cuda.synchronize()
+    except RuntimeError as error:
+        raise RuntimeError(
+            "CUDA 设备初始化/基础算子探测失败；"
+            "请检查 NVIDIA 驱动与 PyTorch CUDA 版本是否匹配。"
+        ) from error
+
+
 def parse_scale_centers(value: str) -> tuple[float, float, float]:
     """Parse and validate the three fixed Router scale centers."""
     centers = tuple(float(item.strip()) for item in value.split(","))
@@ -450,6 +482,7 @@ def train_moe(args):
         "cuda" if torch.cuda.is_available() else "cpu"
     )
     logging.info(f"使用设备: {device}")
+    validate_cuda_device(device)
 
     graduate_recalls = tuple(
         float(value)
