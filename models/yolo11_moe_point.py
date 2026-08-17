@@ -38,6 +38,7 @@ class YOLO11MoEPoint(nn.Module):
         temperature: float = 1.0,
         hard_route: bool = False,
         router_grad: bool = True,
+        expert_uniform_floor: float = 0.0,
     ) -> dict[str, torch.Tensor]:
         features = self.yolo(image)
 
@@ -46,4 +47,5 @@ class YOLO11MoEPoint(nn.Module):
             temperature=temperature,
             hard_route=hard_route,
             router_grad=router_grad,
+            expert_uniform_floor=expert_uniform_floor,
         )

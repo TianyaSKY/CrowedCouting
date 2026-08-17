@@ -150,12 +150,18 @@ class PointMoELoss(nn.Module):
         cls_loss = logits.new_zeros(())
         point_loss = logits.new_zeros(())
         count_loss = logits.new_zeros(())
-        route_loss = logits.new_zeros(())
+        # Route CE is accumulated across all matched GT points in this
+        # batch, then macro-averaged by target class.  Averaging inside each
+        # image would give a small image the same Router weight as a dense
+        # image and make the effective class balance depend on image order.
+        route_class_sums = [
+            logits.new_zeros(()) for _ in range(num_experts)
+        ]
+        route_class_counts = [0 for _ in range(num_experts)]
 
         # 诊断：GT 尺度目标的 argmax 分布，与预测 gate 分布对比
         target_gate_hist = logits.new_zeros(num_experts)
         target_gate_points = 0
-
         for batch_index in range(batch_size):
             gt = ground_truth_points[batch_index].to(
                 points.device
@@ -278,11 +284,9 @@ class PointMoELoss(nn.Module):
                         batch_index
                     ][matched_full_indices]
 
-                    # macro 类别平衡：GT 目标 E0~60%/E1~27%/E2~13%，
-                    # 逐点 CE 会让 E0 天然主导 route 梯度，E2 永远学不动。
-                    # 改为：按 hard 目标类别分组，组内 soft-target CE 取
-                    # 均值，再对三个类别取均值——各类别对 Router 训练
-                    # 同等重要，但不强制最终路由比例 33/33/33。
+                    # batch-level macro 类别平衡：先收集当前 batch 的
+                    # 所有 matched GT route CE，按 E0/E1/E2 分组求均值，
+                    # 再对 batch 中出现的类别做 macro average。
                     per_point_route = -(
                         target_gate[gt_indices]
                         * F.log_softmax(
@@ -294,18 +298,16 @@ class PointMoELoss(nn.Module):
                         gt_indices
                     ].argmax(dim=-1)
 
-                    class_route_losses = []
                     for expert_id in range(num_experts):
                         mask = hard_target == expert_id
                         if mask.any():
-                            class_route_losses.append(
-                                per_point_route[mask].mean()
+                            route_class_sums[expert_id] = (
+                                route_class_sums[expert_id]
+                                + per_point_route[mask].sum()
                             )
-
-                    if class_route_losses:
-                        route_loss = route_loss + torch.stack(
-                            class_route_losses
-                        ).mean()
+                            route_class_counts[expert_id] += int(
+                                mask.sum().item()
+                            )
 
             cls_loss = cls_loss + (
                 sigmoid_focal_loss(
@@ -327,7 +329,17 @@ class PointMoELoss(nn.Module):
         cls_loss = cls_loss / batch_size
         point_loss = point_loss / batch_size
         count_loss = count_loss / batch_size
-        route_loss = route_loss / batch_size
+        route_terms = [
+            route_class_sums[expert_id]
+            / route_class_counts[expert_id]
+            for expert_id in range(num_experts)
+            if route_class_counts[expert_id] > 0
+        ]
+        route_loss = (
+            torch.stack(route_terms).mean()
+            if route_terms
+            else logits.new_zeros(())
+        )
 
         total_loss = (
             cls_loss
@@ -344,4 +356,8 @@ class PointMoELoss(nn.Module):
             "gate_target": (
                 target_gate_hist / max(target_gate_points, 1)
             ).detach(),
+            "gate_target_hist": target_gate_hist.detach(),
+            "gate_target_count": logits.new_tensor(
+                target_gate_points, dtype=logits.dtype
+            ),
         }

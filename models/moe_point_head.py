@@ -226,6 +226,7 @@ class MoEPointHead(nn.Module):
         temperature: float = 1.0,
         hard_route: bool = False,
         router_grad: bool = True,
+        expert_uniform_floor: float = 0.0,
     ) -> dict[str, torch.Tensor]:
         p3, p4, p5 = features
 
@@ -306,11 +307,17 @@ class MoEPointHead(nn.Module):
 
         # 梯度隔离：router_grad=False 时，混合用的 gate 不携带梯度，
         # cls/point/count 不会通过 gate 反向传播到 Router（避免
-        # winner-take-all 正反馈：质量好的专家被选中更多 -> 更多任务梯度
-        # -> 更强，少数专家饿死）。Router 此时只由 L_route 训练。
-        # predictions 仍返回未 detach 的 gate / route_logits 供诊断。
+        # winner-take-all 正反馈）。训练 warm-up 期间保留 uniform floor，
+        # 让每个专家都拿到最低限度的 task gradient；floor 本身不向
+        # Router 回传梯度。评估或 hard route 不使用该 floor。
         if router_grad:
             mix_gate = gate
+        elif self.training and not hard_route:
+            floor = min(max(float(expert_uniform_floor), 0.0), 1.0)
+            mix_gate = (
+                (1.0 - floor) * gate.detach()
+                + floor / self.num_experts
+            )
         else:
             mix_gate = gate.detach()
 
