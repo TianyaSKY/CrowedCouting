@@ -106,17 +106,16 @@ python -m scripts.data.prepare_ucf_cc50
 # 一个命令转换全部数据集（已存在则跳过，--force 强制重转）
 python -m scripts.data.prepare_all
 
-# 在所有数据集上联合训练（batch 混合 + 逐数据集验证，超参数同 train_moe）
+# 在所有数据集上联合训练（按图片自然采样 + 逐数据集验证）
 python -m scripts.training.train_all \
     --weights yolo11n.pt \
-    --crop-size 640 \
+    --crop-size 384 \
     --batch-size 32 \
     --save-dir runs/moe_point_all
 
-# 跨数据集分组评估（对训练出的 best.pt）
+# 跨数据集分组评估（默认从 checkpoint 读取 crop_size）
 python -m scripts.evaluation.evaluate_datasets \
-    --checkpoint runs/moe_point_all/best.pt \
-    --imgsz 384 \
+    --checkpoint runs/moe_point_all/best_hard.pt \
     --batch-size 8 \
     --dataset shanghaitech=datasets/shanghaitech_AB:val \
     --dataset jhu=datasets/jhu_crowd:val \
@@ -154,14 +153,16 @@ python -m scripts.training.train_moe \
   路由混淆矩阵 E0/E1/E2 行 recall 连续 3 轮 ≥ 0.60/0.40/0.30 且 macro recall ≥ 0.50，
   下一轮起切 Top-1 硬路由（Straight-Through）。可用 `--force-hard-epoch` 覆盖。
 - **温度调度**：软阶段 2.0 →（epoch 15 处 1.3）→ 1.0；硬阶段 1.0 → 0.5（20 个 epoch）。
-- **Router 梯度隔离**：epoch < `--router-grad-epoch`(15) 时，cls/point/count 不经过 gate
-  向 Router 回传，Router 只由 `L_route` 训练，避免 winner-take-all 饿死少数专家。
-- **日志**：每 epoch 输出 `route`（路由 CE）、`T`、`hard_route`、`router_grad`、
-  `soft_raw_macro`/`hard_raw_macro`、`soft_norm_macro`/`hard_norm_macro`、
-  GT 尺度目标分布 `target` vs 预测 `gate`、硬路由使用率与混淆矩阵。
-- **best.pt 选取**：保留原始 MAE 日志，但按各验证集 MAE 除以平均 GT 人数后的
-  normalized macro score 选 best；官方 test 只在训练结束后评估。
-  未传 `--save-dir` 时输出到 `runs/moe_point_<时间戳>/{best,last}.pt` + `train.log`
+- **Router 梯度隔离与防饿死**：epoch < `--router-grad-epoch`(15) 时，cls/point/count 不经过
+  gate 向 Router 回传；`--expert-uniform-floor` 默认 0.3 让每个专家获得最低 task gradient。
+- **日志**：每 epoch 输出 `route`（batch-level macro CE）、`T`、`hard_route`、`router_grad`、
+  weighted/macro normalized MAE、GT target/gate/val hard usage、混淆矩阵、各类 support、
+  recall/macro recall 与 Router entropy。
+- **checkpoint**：`best_soft.pt`、`best_hard.pt` 分别记录两个 phase 的最优模型，`last.pt`
+  保存完整训练状态。主选模指标是按验证图片数加权的 normalized MAE；macro normalized MAE
+  仅作跨数据集泛化参考。checkpoint 同时记录 crop size、参考点数、温度 schedule、hard 状态、
+  Router 梯度 epoch 与 scale centers。Router 未毕业时不会生成 `best_hard.pt`，训练结束会告警。
+  未传 `--save-dir` 时输出到 `runs/moe_point_<时间戳>/` + `train.log`
   （每次启动自动带时间戳，互不覆盖；`--resume` 时沿用原 run 目录）。
 
 ### 3. 评估与推理
@@ -170,29 +171,29 @@ python -m scripts.training.train_moe \
 # 单图推理（红/绿/蓝 = E3 精细 / E4 中层 / E5 大范围）
 python -m scripts.visualization.predict_moe \
     --image path/to/img.jpg \
-    --checkpoint runs/moe_point/best.pt
+    --checkpoint runs/moe_point/best_hard.pt
 
 # 验证集批量推理：images/*_pred.jpg + predictions.csv（逐图计数）+ summary.json（MAE/RMSE）
 python -m scripts.visualization.predict_moe_batch \
     --data-root datasets/shanghaitech_AB \
-    --checkpoint runs/moe_point/best.pt \
+    --checkpoint runs/moe_point/best_hard.pt \
     --out-dir runs/moe_point/val_pred
 
 # 分 Part 评估（Part A/B/overall 的 MAE/RMSE；hard 路由 + Σsigmoid 计数口径）
 python test_each_dataset.py \
     --data-root datasets/shanghaitech_AB \
-    --checkpoint runs/moe_point/best.pt
+    --checkpoint runs/moe_point/best_hard.pt
 ```
 
 MoE 计数口径：全部候选点 `logits.sigmoid()` 求和（无需置信度阈值/去重，与评估一致）；
-验证固定 `temperature=0.5`。定位类指标（P/R/F1）见下文 v4 评估脚本，MoE 分支以 MAE/RMSE 为准。
+soft 验证使用当前训练温度，hard 使用 0.5（argmax 不受温度影响）。测试脚本默认读取
+checkpoint 的 `crop_size`，若 checkpoint 不是 hard phase 会显式告警。
 
 ### 3.5 跨数据集分组评估
 
 ```bash
 python -m scripts.evaluation.evaluate_datasets \
-    --checkpoint runs/moe_point/best.pt \
-    --imgsz 384 \
+    --checkpoint runs/moe_point_all/best_hard.pt \
     --batch-size 8 \
     --dataset shanghaitech=datasets/shanghaitech_AB:val \
     --dataset jhu=datasets/jhu_crowd:val \

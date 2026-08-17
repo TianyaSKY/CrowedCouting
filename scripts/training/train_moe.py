@@ -43,6 +43,54 @@ def setup_logging(log_path: str) -> None:
     )
 
 
+def parse_scale_centers(value: str) -> tuple[float, float, float]:
+    """Parse and validate the three fixed Router scale centers."""
+    centers = tuple(float(item.strip()) for item in value.split(","))
+    if len(centers) != 3 or any(center <= 0 for center in centers):
+        raise ValueError(
+            "--scale-centers 需要三个正数，例如 10,20,40"
+        )
+    return (centers[0], centers[1], centers[2])
+
+
+def build_checkpoint_config(
+    args,
+    criterion: PointMoELoss,
+    *,
+    hard_started: bool,
+    hard_route: bool,
+    temperature: float,
+) -> dict[str, object]:
+    """Build the canonical train/eval settings stored in every checkpoint."""
+    temperature_schedule = {
+        name: getattr(args, name)
+        for name in (
+            "init_temperature",
+            "phase1_temp",
+            "soft_temp_floor",
+            "min_temperature",
+            "temp_floor_epoch",
+            "hard_temp_epochs",
+        )
+    }
+    return {
+        "crop_size": int(args.crop_size),
+        "num_references": int(args.num_references),
+        "temperature_schedule": temperature_schedule,
+        "temperature": float(temperature),
+        "hard_started": bool(hard_started),
+        "hard_route": bool(hard_route),
+        "router_grad_epoch": int(args.router_grad_epoch),
+        "scale_centers": [
+            float(center) for center in criterion.scale_centers
+        ],
+        "scale_sigma_octaves": float(criterion.scale_sigma_octaves),
+        "expert_uniform_floor": float(
+            getattr(args, "expert_uniform_floor", 0.0)
+        ),
+    }
+
+
 def build_optimizer(model, args):
     """两个学习率组：YOLO 主干 1e-4，MoE Point Head 1e-3。
 
@@ -188,12 +236,14 @@ def evaluate_count_mae(
     val_loader,
     device,
     match_top_k: int = 2000,
+    soft_temperature: float = 1.0,
+    hard_temperature: float = 0.5,
 ):
     """验证集人数 MAE（以所有候选点置信度和作为预测人数）。
 
     同时评估软路由与硬路由两种模式：
-    - 训练早期为软路由，soft_MAE 与训练一致；
-    - hard routing 生效后以 hard_MAE 作为 best 模型选择依据。
+    - soft 使用当前 epoch 的训练温度；
+    - hard 固定使用 0.5（hard argmax 不受温度影响）。
     另外复用 hard 前向的预测做 GT 匹配，统计路由混淆矩阵
     （见 _routing_confusion），回答"Router 是否学到尺度分工"。
     """
@@ -225,7 +275,11 @@ def evaluate_count_mae(
             ):
                 predictions = model(
                     images,
-                    temperature=0.5,
+                    temperature=(
+                        soft_temperature
+                        if not hard_route
+                        else hard_temperature
+                    ),
                     hard_route=hard_route,
                 )
 
@@ -361,8 +415,8 @@ def timestamped_save_dir(base: str) -> str:
 
 
 def train_moe(args):
-    # 未显式指定输出目录时自动加时间戳；--resume 则沿用原 run 目录，
-    # 保证恢复训练仍写回同一目录（best/last 覆盖逻辑不变）。
+    # 未显式指定输出目录时自动加时间戳；--resume 沿用原 run 目录，
+    # 保证恢复训练仍写回同一目录（best_soft/best_hard/last 覆盖逻辑不变）。
     if args.save_dir is None:
         if args.resume:
             args.save_dir = os.path.dirname(
@@ -391,17 +445,19 @@ def train_moe(args):
             "--graduate-recalls 需要 3 个值，如 0.60,0.40,0.30"
         )
 
-    # 覆盖保护：从头训练进入已有 save-dir 时，备份现有 best.pt，
-    # 防止新 run 第一个 epoch 就把历史最佳覆盖掉
+    # 覆盖保护：从头训练进入已有 save-dir 时备份旧 phase best。
     if not args.resume:
-        old_best = os.path.join(args.save_dir, "best.pt")
-        if os.path.exists(old_best):
+        for best_name in ("best_soft.pt", "best_hard.pt"):
+            old_best = os.path.join(args.save_dir, best_name)
+            if not os.path.exists(old_best):
+                continue
             backup = os.path.join(
-                args.save_dir, "best_prev.pt"
+                args.save_dir,
+                best_name.replace(".pt", "_prev.pt"),
             )
             if not os.path.exists(backup):
                 shutil.copy2(old_best, backup)
-                logging.info(f"旧 best 已备份到 {backup}")
+                logging.info(f"旧 {best_name} 已备份到 {backup}")
 
     # 1. 模型
     model = YOLO11MoEPoint(
@@ -413,6 +469,7 @@ def train_moe(args):
     # 2. 损失
     criterion = PointMoELoss(
         route_weight=args.route_weight,
+        scale_centers=parse_scale_centers(args.scale_centers),
         match_top_k=args.match_top_k,
     )
 
@@ -468,12 +525,14 @@ def train_moe(args):
             param.requires_grad = False
 
     optimizer = build_optimizer(model, args)
-
     start_epoch = 0
-    best_mae = float("inf")
+    best_selection_score = float("inf")
+    best_soft_selection_score = float("inf")
+    best_hard_selection_score = float("inf")
     hard_started = False
     grad_streak = 0
     first_hard_epoch = None
+    last_hard_route = False
 
     if args.resume and os.path.exists(args.resume):
         logging.info(f"从 {args.resume} 恢复训练")
@@ -499,31 +558,54 @@ def train_moe(args):
                 f"优化器状态不兼容({error})，"
                 "使用全新优化器重新开始优化"
             )
-            optimizer = build_optimizer(model, args)
         start_epoch = checkpoint.get("epoch", 0) + 1
-        best_mae = checkpoint.get("best_mae", float("inf"))
+        best_selection_score = checkpoint.get(
+            "best_selection_score",
+            checkpoint.get("best_mae", float("inf")),
+        )
+        best_soft_selection_score = checkpoint.get(
+            "best_soft_selection_score",
+            float("inf"),
+        )
+        best_hard_selection_score = checkpoint.get(
+            "best_hard_selection_score",
+            float("inf"),
+        )
         hard_started = checkpoint.get(
             "hard_started",
-            # 旧版 checkpoint 无该字段：旧默认 hard_route_epoch=20，
-            # 用 checkpoint epoch 是否已过切换点做迁移推断
             checkpoint.get("epoch", 0) >= 20,
         )
+        last_hard_route = checkpoint.get(
+            "hard_route",
+            hard_started,
+        )
+        if (
+            best_soft_selection_score == float("inf")
+            and not last_hard_route
+        ):
+            best_soft_selection_score = best_selection_score
+        if (
+            best_hard_selection_score == float("inf")
+            and last_hard_route
+        ):
+            best_hard_selection_score = best_selection_score
         grad_streak = checkpoint.get("grad_streak", 0)
         first_hard_epoch = checkpoint.get(
             "first_hard_epoch",
             checkpoint.get("epoch") if hard_started else None,
         )
-
-        # 覆盖保护：resume 前把当前 best.pt 备份，防止新 run 覆盖掉
-        # 历史最佳（曾发生 epoch 47 的 45.68 覆盖 epoch 40 的 43.96 事故）
-        old_best = os.path.join(args.save_dir, "best.pt")
-        if os.path.exists(old_best):
+        # 覆盖保护：resume 前备份现有 phase best。
+        for best_name in ("best_soft.pt", "best_hard.pt"):
+            old_best = os.path.join(args.save_dir, best_name)
+            if not os.path.exists(old_best):
+                continue
             backup = os.path.join(
-                args.save_dir, "best_pre_resume.pt"
+                args.save_dir,
+                best_name.replace(".pt", "_pre_resume.pt"),
             )
             if not os.path.exists(backup):
                 shutil.copy2(old_best, backup)
-                logging.info(f"旧 best 已备份到 {backup}")
+                logging.info(f"旧 {best_name} 已备份到 {backup}")
 
         # 恢复后若已超过冻结期，解冻 YOLO（不重建优化器，保留状态）
         if start_epoch >= args.freeze_epochs:
@@ -534,7 +616,7 @@ def train_moe(args):
     # hard 路由由 Router 毕业条件决定（混淆矩阵 recall 连续达标），
     # 不由 epoch 决定；未达标就继续 soft——提前切 hard 等于
     # 正式宣布少数专家死刑。可选 --force-hard-epoch 强制覆盖。
-    was_hard_route = hard_started
+    was_hard_route = bool(last_hard_route)
 
     for epoch in range(start_epoch, args.epochs):
         hard_route = hard_started
@@ -552,13 +634,14 @@ def train_moe(args):
                 f"{args.force_hard_epoch}）"
             )
 
-        # 软->硬切换：best 基准重置为 hard 口径
+        # 软->硬切换：best_hard 基准重置
         if hard_route and not was_hard_route:
             was_hard_route = True
             first_hard_epoch = epoch
-            best_mae = float("inf")
+            best_selection_score = float("inf")
+            best_hard_selection_score = float("inf")
             logging.info(
-                "切换硬路由，best 基准重置为 hard MAE"
+                "切换硬路由，best_hard 基准重置为 hard MAE"
             )
 
         temperature = temperature_for_epoch(
@@ -582,8 +665,9 @@ def train_moe(args):
         num_batches = 0
         gate_mean = torch.zeros(3, device=device)
         target_mean = torch.zeros(3, device=device)
-        # 各损失分量的 epoch 均值：只记最后一个 batch 的 loss_items
-        # 会误导调参（如 Epoch 38 后 cls/count 骤增是否真实）。
+        target_points = 0
+        router_entropy_sum = torch.zeros((), device=device)
+        router_gate_count = 0
         loss_sums = {
             name: torch.zeros((), device=device)
             for name in ("cls", "point", "count", "route")
@@ -604,6 +688,7 @@ def train_moe(args):
                 temperature=temperature,
                 hard_route=hard_route,
                 router_grad=router_grad,
+                expert_uniform_floor=args.expert_uniform_floor,
             )
 
             loss, loss_items = criterion(
@@ -614,11 +699,20 @@ def train_moe(args):
 
             # 诊断：本 batch 候选点的平均 gate 分布（软阶段=soft 门，
             # 硬阶段=one-hot 使用率），与 GT 目标分布对比
-            gate_mean += predictions["gates"].reshape(
+            gate_values = predictions["gates"].reshape(
                 -1, 3
-            ).mean(dim=0)
-            target_mean += loss_items["gate_target"].to(
+            ).detach()
+            gate_mean += gate_values.mean(dim=0)
+            router_entropy_sum += -(
+                gate_values.clamp_min(1e-8)
+                * gate_values.clamp_min(1e-8).log()
+            ).sum()
+            router_gate_count += gate_values.shape[0]
+            target_mean += loss_items["gate_target_hist"].to(
                 device
+            )
+            target_points += int(
+                loss_items["gate_target_count"].item()
             )
 
             optimizer.zero_grad(set_to_none=True)
@@ -654,16 +748,23 @@ def train_moe(args):
             route_confusion,
             matched_points,
         ) = evaluate_count_mae(
-            model, val_loader, device, args.match_top_k
+            model,
+            val_loader,
+            device,
+            args.match_top_k,
+            soft_temperature=temperature,
         )
 
         gate_pct = gate_mean / max(num_batches, 1) * 100
-        target_pct = target_mean / max(num_batches, 1) * 100
+        target_pct = target_mean / max(target_points, 1) * 100
         usage_pct = (
             hard_usage.float()
             / max(int(hard_usage.sum()), 1)
             * 100
         )
+        router_entropy = (
+            router_entropy_sum / max(router_gate_count, 1)
+        ).item()
 
         logging.info(
             f"[Epoch {epoch + 1}/{args.epochs}] "
@@ -676,7 +777,8 @@ def train_moe(args):
             f"hard_route={hard_route} "
             f"router_grad={router_grad} "
             f"soft_MAE={soft_mae:.3f} "
-            f"hard_MAE={hard_mae:.3f}"
+            f"hard_MAE={hard_mae:.3f} "
+            f"router_entropy={router_entropy:.4f}"
         )
         logging.info(
             f"  gate  =E0:{gate_pct[0]:.1f}% E1:{gate_pct[1]:.1f}% "
@@ -714,103 +816,123 @@ def train_moe(args):
 
         # Router 毕业检查：E0/E1/E2 recall 均达标且 macro recall 达标，
         # 连续 graduate-stable-epochs 轮后才切 hard（下一 epoch 生效）。
-        # 未达标就继续 soft，不因 epoch 到了就强制切换。
-        if not hard_started:
-            if matched_points > 0:
-                recalls, macro_recall = router_recalls(
-                    route_confusion
-                )
-                if (
-                    recalls[0] >= graduate_recalls[0]
-                    and recalls[1] >= graduate_recalls[1]
-                    and recalls[2] >= graduate_recalls[2]
-                    and macro_recall >= args.graduate_macro_recall
-                ):
-                    grad_streak += 1
-                    if (
-                        grad_streak
-                        >= args.graduate_stable_epochs
-                    ):
-                        hard_started = True
-                        # 立即记录首个 hard epoch（epoch+1）：若在此
-                        # checkpoint 处 resume，hard 温度调度才能续上
-                        first_hard_epoch = epoch + 1
-                        logging.info(
-                            f"Router 毕业（连续 {grad_streak} 轮达标，"
-                            f"recall=E0:{recalls[0]:.2f} "
-                            f"E1:{recalls[1]:.2f} "
-                            f"E2:{recalls[2]:.2f} "
-                            f"macro={macro_recall:.2f}），"
-                            "下一 epoch 进入 hard 路由"
-                        )
-                    else:
-                        logging.info(
-                            f"Router 达标 streak="
-                            f"{grad_streak}/"
-                            f"{args.graduate_stable_epochs} "
-                            f"(recall=E0:{recalls[0]:.2f} "
-                            f"E1:{recalls[1]:.2f} "
-                            f"E2:{recalls[2]:.2f} "
-                            f"macro={macro_recall:.2f})"
-                        )
-                else:
-                    grad_streak = 0
+        if not hard_started and matched_points > 0:
+            recalls, macro_recall = router_recalls(
+                route_confusion
+            )
+            if (
+                recalls[0] >= graduate_recalls[0]
+                and recalls[1] >= graduate_recalls[1]
+                and recalls[2] >= graduate_recalls[2]
+                and macro_recall >= args.graduate_macro_recall
+            ):
+                grad_streak += 1
+                if grad_streak >= args.graduate_stable_epochs:
+                    hard_started = True
+                    first_hard_epoch = epoch + 1
                     logging.info(
-                        f"Router 未达标，继续 soft "
+                        f"Router 毕业（连续 {grad_streak} 轮达标，"
+                        f"recall=E0:{recalls[0]:.2f} "
+                        f"E1:{recalls[1]:.2f} "
+                        f"E2:{recalls[2]:.2f} "
+                        f"macro={macro_recall:.2f}），"
+                        "下一 epoch 进入 hard 路由"
+                    )
+                else:
+                    logging.info(
+                        f"Router 达标 streak={grad_streak}/"
+                        f"{args.graduate_stable_epochs} "
                         f"(recall=E0:{recalls[0]:.2f} "
                         f"E1:{recalls[1]:.2f} "
                         f"E2:{recalls[2]:.2f} "
                         f"macro={macro_recall:.2f})"
                     )
+            else:
+                grad_streak = 0
+                logging.info(
+                    f"Router 未达标，继续 soft "
+                    f"(recall=E0:{recalls[0]:.2f} "
+                    f"E1:{recalls[1]:.2f} "
+                    f"E2:{recalls[2]:.2f} "
+                    f"macro={macro_recall:.2f})"
+                )
 
-        # best 选择：软路由阶段按 soft MAE、硬路由阶段按 hard MAE
-        # （最终推理使用硬路由）。软->硬切换时的基准重置已由循环开头
-        # 的切换检测完成。必须先于 last.pt 保存执行：否则 last.pt
-        # 记录的还是旧的（软路由口径）best_mae，从该 last.pt resume
-        # 时会把旧基准继续作为 hard 阶段门槛。
+        # best 选择：soft/hard 分开保存，避免 hard 阶段覆盖 soft 证据。
         if hard_route:
-            val_mae_for_best = hard_mae
+            val_score_for_best = hard_mae
             metric_name = "hard MAE"
+            active_best_score = best_hard_selection_score
         else:
-            val_mae_for_best = soft_mae
+            val_score_for_best = soft_mae
             metric_name = "soft MAE"
+            active_best_score = best_soft_selection_score
 
-        if val_mae_for_best < best_mae:
-            best_mae = val_mae_for_best
-            best_path = os.path.join(args.save_dir, "best.pt")
-            torch.save(
-                {
-                    "model": model.state_dict(),
-                    "optimizer": optimizer.state_dict(),
-                    "epoch": epoch,
-                    "best_mae": best_mae,
-                    "hard_started": hard_started,
-                    "grad_streak": grad_streak,
-                    "first_hard_epoch": first_hard_epoch,
-                    "args": vars(args),
-                },
-                best_path,
-            )
+        improved = val_score_for_best < active_best_score
+        if improved:
+            best_selection_score = val_score_for_best
+            if hard_route:
+                best_hard_selection_score = val_score_for_best
+                best_path = os.path.join(
+                    args.save_dir, "best_hard.pt"
+                )
+            else:
+                best_soft_selection_score = val_score_for_best
+                best_path = os.path.join(
+                    args.save_dir, "best_soft.pt"
+                )
+        else:
+            best_selection_score = active_best_score
+            best_path = None
+
+        checkpoint_data = {
+            "model": model.state_dict(),
+            "optimizer": optimizer.state_dict(),
+            "epoch": epoch,
+            "best_mae": best_selection_score,
+            "best_selection_score": best_selection_score,
+            "best_soft_selection_score": best_soft_selection_score,
+            "best_hard_selection_score": best_hard_selection_score,
+            "selection_metric": metric_name,
+            "hard_started": hard_started,
+            "hard_route": hard_route,
+            "grad_streak": grad_streak,
+            "first_hard_epoch": first_hard_epoch,
+            "soft_MAE": soft_mae,
+            "hard_MAE": hard_mae,
+            "val_hard_expert_usage": hard_usage.detach().cpu(),
+            "router_confusion": route_confusion.detach().cpu(),
+            "router_recalls": (
+                router_recalls(route_confusion)[0]
+                if matched_points > 0
+                else [0.0, 0.0, 0.0]
+            ),
+            "router_entropy": router_entropy,
+            "args": vars(args),
+            "config": build_checkpoint_config(
+                args,
+                criterion,
+                hard_started=hard_started,
+                hard_route=hard_route,
+                temperature=temperature,
+            ),
+        }
+        if improved:
+            torch.save(checkpoint_data, best_path)
             logging.info(
-                f"  -> 新的最佳 {metric_name}: {best_mae:.3f}，"
+                f"  -> 新的最佳 {metric_name}: {best_selection_score:.3f}，"
                 f"已保存 {best_path}"
             )
 
-        last_path = os.path.join(args.save_dir, "last.pt")
         torch.save(
-            {
-                "model": model.state_dict(),
-                "optimizer": optimizer.state_dict(),
-                "epoch": epoch,
-                "best_mae": best_mae,
-                "hard_started": hard_started,
-                "grad_streak": grad_streak,
-                "first_hard_epoch": first_hard_epoch,
-                "args": vars(args),
-            },
-            last_path,
+            checkpoint_data,
+            os.path.join(args.save_dir, "last.pt"),
         )
 
+    if not hard_started:
+        logging.warning(
+            "Router never graduated to hard routing; "
+            "best_hard.pt was not produced."
+        )
     logging.info("训练结束。")
 
 
@@ -843,6 +965,12 @@ def build_parser():
     parser.add_argument(
         "--num-references", type=int, default=4,
         help="每个网格参考点数 K（1/4/9）"
+    )
+    parser.add_argument(
+        "--scale-centers",
+        type=str,
+        default="10,20,40",
+        help="Router 三个尺度中心（像素），默认 10,20,40",
     )
     parser.add_argument(
         "--backbone-lr", type=float, default=1e-4
@@ -883,6 +1011,12 @@ def build_parser():
         "--router-grad-epoch", type=int, default=15,
         help="从该 epoch 起允许 cls/point/count 梯度流入 Router；"
         "之前 Router 只接受 balanced L_route（梯度隔离）"
+    )
+    parser.add_argument(
+        "--expert-uniform-floor",
+        type=float,
+        default=0.3,
+        help="Router warm-up 时每个专家获得的最小 task gradient 比例",
     )
     parser.add_argument(
         "--force-hard-epoch", type=int, default=None,

@@ -94,9 +94,9 @@ balance loss：
 - **温度**：软阶段 `init_temperature=2.0` →（`--router-grad-epoch`=15 处 1.3）→
   `--soft-temp-floor`=1.0（`--temp-floor-epoch`=30）；硬阶段 1.0 → `--min-temperature`=0.5
   （`--hard-temp-epochs`=20）。高温下 gate 接近均匀，避免训练初期路由坍缩。
-- **Router 梯度隔离**：epoch < 15 时 `router_grad=False`，混合用 gate detach——
-  cls/point/count 不向 Router 回传，Router 只由 `L_route` 训练。否则 winner-take-all
-  正反馈（质量好的专家被选中更多 → 更多任务梯度 → 更强）会让少数专家饿死。
+- **Router 梯度隔离与防饿死**：epoch < 15 时 `router_grad=False`，混合用
+  `(1-floor) * gate.detach() + floor / 3`，默认 `floor=0.3`；cls/point/count 不向
+  Router 回传，但三个专家都获得最低 task gradient。
 - **软混合在概率空间**：`p = Σ gᵢ·σ(zᵢ)` 再转回 logit，避免 logits 线性混合时专家
   置信度相互抵消；硬路由 one-hot 时退化为 `logit(σ(z_j)) = z_j` 的单专家 logit。
 - **硬路由切换由毕业条件触发**（非固定 epoch）：验证集路由混淆矩阵 E0/E1/E2 行 recall
@@ -106,10 +106,10 @@ balance loss：
 
 ## 6. 与评估的关系
 
-评估固定 `temperature=0.5`，同时报告 soft/hard MAE；人数 = `Σσ(logits)`。MoE 分支的
-计数不经过置信度阈值/NMS，因此 MAE/RMSE 可直接复现；`best.pt` 在软阶段按 soft MAE、
-硬阶段按 hard MAE 选取（最终推理即硬路由）。若要比较不同 checkpoint，请固定
-`--crop-size`（验证 letterbox 到该尺寸）与 `--temperature`。
+soft 验证使用当前 epoch 的训练温度，hard 使用 `temperature=0.5`（argmax 不受温度影响）；
+人数 = `Σσ(logits)`。MoE 分支的计数不经过置信度阈值/NMS，因此 MAE/RMSE 可直接复现；
+`best_soft.pt` / `best_hard.pt` 分别按 phase 的 weighted normalized MAE 选取，Router 未毕业时
+不生成 `best_hard.pt`。评估脚本默认从 checkpoint 读取 `crop_size` 与其它训练配置。
 
 ## 附录：v4 CrowdPointLoss（旧，对照用）
 

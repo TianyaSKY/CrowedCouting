@@ -107,10 +107,9 @@ UCF-CC-50 为 5 折交叉验证：逐折训练（fold0..fold4），每折用对�
 ## 4. 评估
 
 ```bash
-# 跨数据集分组评估（hard 路由 + Σsigmoid 计数）
+# 跨数据集分组评估（hard 路由 + Σsigmoid 计数；默认读取 checkpoint crop_size）
 python -m scripts.evaluation.evaluate_datasets \
-    --checkpoint runs/moe_point/best.pt \
-    --imgsz 384 \
+    --checkpoint runs/moe_point_all/best_hard.pt \
     --batch-size 8 \
     --dataset shanghaitech=datasets/shanghaitech_AB:val \
     --dataset jhu=datasets/jhu_crowd:val \
@@ -126,7 +125,7 @@ python -m scripts.evaluation.evaluate_datasets \
 # 单数据集分 Part 评估（ShanghaiTech A/B）
 python test_each_dataset.py \
     --data-root datasets/shanghaitech_AB \
-    --checkpoint runs/moe_point/best.pt
+    --checkpoint runs/moe_point_all/best_hard.pt
 ```
 
 ## 附录：Matlab v5 .mat 解析（`scripts/data/_matlab_utils.py`）

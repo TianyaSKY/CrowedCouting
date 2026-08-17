@@ -91,23 +91,24 @@ soft\_target = softmax\Big(-\tfrac12 \big(\tfrac{\log_2 d - \log_2 c_j}{0.6}\big
 $$
 
 `scale_centers = (10, 20, 40) px`，`scale_sigma_octaves = 0.6`：间距小（密集人群）→ E3 精细，
-间距大（稀疏/大目标）→ E5 大范围。路由损失为匹配点上的软目标 CE，并按硬目标类别分组
-**macro 平均**（GT 目标约 E0 60% / E1 27% / E2 13%，逐点 CE 会让 E2 永远学不动；分组后
-三个类别对 Router 训练同等重要，但不强制最终路由比例 33/33/33）。
+间距大（稀疏/大目标）→ E5 大范围。路由损失收集一个 batch 的所有匹配点，
+按硬目标类别分别求均值后再做 macro 平均；三个类别对 Router 训练同等重要，
+但不强制最终路由比例 33/33/33。
 
-返回 `(total, {cls, point, count, route, gate_target})`，`gate_target` 为 GT 尺度目标
-argmax 分布，用于训练日志对照。
+返回 `(total, {cls, point, count, route, gate_target, gate_target_hist, gate_target_count})`；
+`gate_target` 为 GT 尺度目标 argmax 分布，另两个字段用于按真实 support 聚合训练日志。
 
 ## 4. 训练与评估口径（train_moe.py）
 
 - 训练：AdamW 两组学习率（YOLO 主干 1e-4 / MoE Head 1e-3），前 3 epoch 冻结主干；
-  温度 2.0→0.5；硬路由切换由 **Router 毕业条件**触发（验证集混淆矩阵 E0/E1/E2 行 recall
+  温度按 schedule 变化；硬路由切换由 **Router 毕业条件**触发（验证集混淆矩阵 E0/E1/E2 行 recall
   连续 3 轮 ≥ 0.60/0.40/0.30 且 macro recall ≥ 0.50），可用 `--force-hard-epoch` 覆盖。
-  详细参数见 `python -m scripts.training.train_moe --help` 与 README。
-- 评估：固定 `temperature=0.5`，同时算 soft/hard 两种模式的 MAE；**人数 = 全部候选点
-  `logits.sigmoid()` 之和**（无阈值、无去重）。`best.pt` 在软阶段按 soft MAE、硬阶段按
-  hard MAE 选取（最终推理即硬路由）。
-- 验证用 letterbox（保持纵横比 + 居中填充 114）而非压成正方形，避免人为改变人头尺度。
+  `router_grad=False` 的 warm-up 使用 uniform floor（默认 0.3）保护少数专家。
+- 评估：soft 使用当前 epoch 的训练温度，hard 使用 0.5；**人数 = 全部候选点
+  `logits.sigmoid()` 之和**（无阈值、无去重）。`best_soft.pt` / `best_hard.pt` 分别按对应
+  phase 的 weighted normalized MAE 选取；Router 未毕业时不生成 `best_hard.pt`。
+- 验证用 letterbox（保持纵横比 + 居中填充 114）而非压成正方形，评估脚本默认读取 checkpoint
+  记录的 `crop_size`、`num_references`、temperature schedule 和 Router 配置。
 
 ## 5. 附录：v4 PointDetect 分支（旧，对照用）
 
