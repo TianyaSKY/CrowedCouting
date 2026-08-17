@@ -57,7 +57,7 @@ def predict_image(
     model,
     image_bgr: np.ndarray,
     device: str,
-    imgsz: int = 384,
+    imgsz: int = 640,
     conf_threshold: float = 0.5,
 ):
     """对单张图像推理，返回 (像素坐标点, 路由索引, 置信度)。
@@ -191,8 +191,8 @@ def parse_args():
         help="训练好的 MoE 模型权重"
     )
     parser.add_argument(
-        "--imgsz", type=int, default=384,
-        help="推理输入尺寸"
+        "--imgsz", type=int, default=640,
+        help="推理输入尺寸（默认与训练 crop_size=640 一致）"
     )
     parser.add_argument(
         "--conf", type=float, default=0.5,

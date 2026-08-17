@@ -392,8 +392,8 @@ def parse_args():
         help="训练好的 MoE 模型权重"
     )
     parser.add_argument(
-        "--imgsz", type=int, default=384,
-        help="推理输入尺寸（与训练 crop_size 一致）"
+        "--imgsz", type=int, default=640,
+        help="推理输入尺寸（默认与训练 crop_size=640 一致）"
     )
     parser.add_argument(
         "--conf", type=float, default=0.5,

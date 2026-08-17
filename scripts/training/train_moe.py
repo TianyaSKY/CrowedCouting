@@ -950,7 +950,7 @@ def build_parser():
         help="数据集根目录（含 images/ 与 points/）"
     )
     parser.add_argument(
-        "--crop-size", type=int, default=384,
+        "--crop-size", type=int, default=640,
         help="训练/验证裁剪尺寸"
     )
     parser.add_argument(

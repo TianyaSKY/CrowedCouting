@@ -82,7 +82,7 @@ python -m scripts.data.prepare_point_labels
 ```
 
 `PointDataset`（`scripts/data/point_dataset.py`）读取 `images/ + points/`：训练走 5 步在线增强
-（随机缩放 0.8–1.2、随机裁剪 `crop_size=384`、翻转 p=0.5、亮度 α∈[0.8,1.2]、β∈[−20,20]）；
+（随机缩放 0.8–1.2、随机裁剪 `crop_size=640`、翻转 p=0.5、亮度 α∈[0.8,1.2]、β∈[−20,20]）；
 验证走 letterbox（保持纵横比 + 居中填充 114，不改变人的尺度）。
 
 其余数据集同样转换为标准布局（纯标准库，无需 scipy/h5py/cv2，`_matlab_utils.py`
@@ -109,7 +109,7 @@ python -m scripts.data.prepare_all
 # 在所有数据集上联合训练（按图片自然采样 + 逐数据集验证）
 python -m scripts.training.train_all \
     --weights yolo11n.pt \
-    --crop-size 384 \
+    --crop-size 640 \
     --batch-size 32 \
     --save-dir runs/moe_point_all
 
@@ -136,7 +136,7 @@ python -m scripts.training.train_moe \
 
 | 参数                              | 默认        | 说明                                                          |
 | --------------------------------- | ----------- | ------------------------------------------------------------- |
-| `--crop-size`                   | 384         | 训练/验证裁剪尺寸                                             |
+| `--crop-size`                   | 640         | 训练/验证裁剪尺寸                                             |
 | `--batch-size`                  | 8           |                                                               |
 | `--epochs`                      | 100         |                                                               |
 | `--backbone-lr` / `--head-lr` | 1e-4 / 1e-3 | YOLO 主干 / MoE Head 两组 AdamW 学习率                        |

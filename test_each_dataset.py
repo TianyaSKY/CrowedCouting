@@ -162,7 +162,7 @@ def load_checkpoint_model(
         checkpoint_args.get("hidden_channels", 128)
     )
     num_references = int(saved_value("num_references", 4))
-    crop_size = int(saved_value("crop_size", 384))
+    crop_size = int(saved_value("crop_size", 640))
     temperature_schedule = saved_config.get(
         "temperature_schedule",
         {

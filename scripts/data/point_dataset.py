@@ -48,7 +48,7 @@ class PointDataset(Dataset):
         self,
         root: str,
         split: str = "train",
-        crop_size: int = 384,
+        crop_size: int = 640,
         augment: bool = True,
     ) -> None:
         super().__init__()
