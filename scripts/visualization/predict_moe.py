@@ -17,15 +17,45 @@ EXPERT_COLORS = [
 
 
 def load_model(weights_path, checkpoint_path, device):
-    """构建模型并加载训练好的权重。"""
-    model = YOLO11MoEPoint(weights=weights_path).to(device)
+    """构建模型并加载训练好的权重。
+
+    优先从 checkpoint 的 args 读取 weights / hidden_channels /
+    num_references，保证模型结构与训练时完全一致（例如 yolo11m +
+    hidden 256）；仅当 checkpoint 未记录时才回退到命令行默认值。
+    """
+    weights = weights_path
+    hidden_channels = 256
+    num_references = 4
 
     if checkpoint_path and os.path.exists(checkpoint_path):
-        logging.info(f"从 {checkpoint_path} 加载权重")
         ckpt = torch.load(
             checkpoint_path,
             map_location="cpu",
             weights_only=False,
+        )
+        checkpoint_args = ckpt.get("args", {})
+        if isinstance(checkpoint_args, dict):
+            weights = str(
+                checkpoint_args.get("weights", weights_path)
+            )
+            hidden_channels = int(
+                checkpoint_args.get("hidden_channels", 256)
+            )
+            num_references = int(
+                checkpoint_args.get("num_references", 4)
+            )
+
+    model = YOLO11MoEPoint(
+        weights=weights,
+        hidden_channels=hidden_channels,
+        num_references=num_references,
+    ).to(device)
+
+    if checkpoint_path and os.path.exists(checkpoint_path):
+        logging.info(
+            f"从 {checkpoint_path} 加载权重 "
+            f"(weights={weights}, hidden_channels={hidden_channels}, "
+            f"num_references={num_references})"
         )
         state_dict = (
             ckpt["model"] if "model" in ckpt else ckpt
