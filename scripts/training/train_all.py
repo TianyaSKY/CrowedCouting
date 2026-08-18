@@ -1,9 +1,9 @@
 """在所有数据集上联合训练（batch 混合）+ 逐数据集验证。
 
 训练数据 = 各数据集 train split 的 ConcatDataset（按图片自然采样），
-验证 = 每个数据集各自跑 soft/hard MAE；hard 只作为验证指标。
-best_soft.pt 按验证图片数加权的 normalized MAE 选取，macro normalized
-MAE 仅作为跨数据集泛化参考。官方 test 只允许在训练结束后评估。
+验证 = 每个数据集各自跑 soft/hard MAE；hard weighted normalized MAE
+作为主选模指标，macro normalized MAE 仅作为跨数据集泛化参考。官方
+test 只允许在训练结束后评估。
 
 用法（GPU 机器，从项目根目录）:
 
@@ -192,7 +192,8 @@ def train_all(args: argparse.Namespace) -> None:
         raise ValueError("--router-warmup-epochs 不能为负数")
     if args.force_hard_epoch is not None:
         logging.warning(
-            "--force-hard-epoch 已废弃；Unsup-v0 全程 soft，参数被忽略"
+            "--force-hard-epoch 已废弃；H0 在 Router warm-up 后自动 "
+            "使用 Gumbel hard，参数被忽略"
         )
 
     # 未显式指定输出目录时自动加时间戳；--resume 沿用原 run 目录。
@@ -211,7 +212,8 @@ def train_all(args: argparse.Namespace) -> None:
     logging.info("输出目录: %s", args.save_dir)
     if args.resume:
         logging.warning(
-            "resume 仅用于调试；正式 Unsup-v0 实验应从 yolo11m.pt 新开 run"
+            "resume 仅用于调试；正式 H0 实验应从 yolo11m.pt "
+            "新开 run，禁止从 Unsup-v0 soft-only checkpoint resume"
         )
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -253,19 +255,19 @@ def train_all(args: argparse.Namespace) -> None:
                 eval_split,
             )
 
-    # 覆盖保护：从头训练进入已有 save-dir 时备份旧 best_soft。
+    # 覆盖保护：从头训练进入已有 save-dir 时备份旧 best_hard。
     if not args.resume:
         old_best = os.path.join(
-            args.save_dir, "best_soft.pt"
+            args.save_dir, "best_hard.pt"
         )
         if os.path.exists(old_best):
             backup = os.path.join(
-                args.save_dir, "best_soft_prev.pt"
+                args.save_dir, "best_hard_prev.pt"
             )
             if not os.path.exists(backup):
                 shutil.copy2(old_best, backup)
                 logging.info(
-                    f"旧 best_soft.pt 已备份到 {backup}"
+                    f"旧 best_hard.pt 已备份到 {backup}"
                 )
 
     model = YOLO11MoEPoint(
@@ -357,7 +359,6 @@ def train_all(args: argparse.Namespace) -> None:
     optimizer = tm.build_optimizer(model, args)
     start_epoch = 0
     best_selection_score = float("inf")
-    best_soft_selection_score = float("inf")
 
     if args.resume and os.path.exists(args.resume):
         logging.info(f"从 {args.resume} 恢复训练")
@@ -368,11 +369,12 @@ def train_all(args: argparse.Namespace) -> None:
         if (
             not isinstance(saved_config, dict)
             or saved_config.get("router_training_mode")
-            != "task_only"
+            != "task_only_gumbel_hard"
         ):
             raise ValueError(
-                "只能从 router_training_mode=task_only 的 checkpoint "
-                "恢复，避免混用 supervised Router 权重"
+                "H0 只能从 router_training_mode="
+                "'task_only_gumbel_hard' checkpoint 恢复；"
+                "禁止从 Unsup-v0 soft-only checkpoint resume"
             )
         try:
             model.load_state_dict(checkpoint["model"])
@@ -398,38 +400,45 @@ def train_all(args: argparse.Namespace) -> None:
             "best_selection_score",
             checkpoint.get("best_mae", float("inf")),
         )
-        best_soft_selection_score = checkpoint.get(
-            "best_soft_selection_score",
-            best_selection_score,
-        )
 
         old_best = os.path.join(
-            args.save_dir, "best_soft.pt"
+            args.save_dir, "best_hard.pt"
         )
         if os.path.exists(old_best):
             backup = os.path.join(
-                args.save_dir, "best_soft_pre_resume.pt"
+                args.save_dir, "best_hard_pre_resume.pt"
             )
             if not os.path.exists(backup):
                 shutil.copy2(old_best, backup)
                 logging.info(
-                    f"旧 best_soft.pt 已备份到 {backup}"
+                    f"旧 best_hard.pt 已备份到 {backup}"
                 )
         if start_epoch >= args.freeze_epochs:
             for param in model.yolo.parameters():
                 param.requires_grad = True
 
     for epoch in range(start_epoch, args.epochs):
-        hard_route = False
-        router_grad = epoch >= args.router_warmup_epochs
+        router_warmup = (
+            epoch < args.router_warmup_epochs
+        )
+        if router_warmup:
+            hard_route = False
+            router_grad = False
+            routing_mode = "warmup_uniform"
+        else:
+            hard_route = True
+            router_grad = True
+            routing_mode = "train_gumbel_hard"
         temperature = tm.temperature_for_epoch(
             epoch,
             hard_route,
             None,
             args,
         )
-
-        if args.freeze_epochs > 0 and epoch == args.freeze_epochs:
+        if (
+            args.freeze_epochs > 0
+            and epoch == args.freeze_epochs
+        ):
             for param in model.yolo.parameters():
                 param.requires_grad = True
             logging.info(
@@ -449,6 +458,16 @@ def train_all(args: argparse.Namespace) -> None:
         matched_gate_entropy_sum = torch.zeros(
             (), device=device
         )
+        train_sampled_usage = torch.zeros(
+            3, dtype=torch.int64, device=device
+        )
+        train_gate_entropy_sum = torch.zeros(
+            (), device=device
+        )
+        train_gate_margin_sum = torch.zeros(
+            (), device=device
+        )
+        train_gate_points = 0
         loss_sums = {
             name: torch.zeros((), device=device)
             for name in ("cls", "point", "count")
@@ -468,6 +487,16 @@ def train_all(args: argparse.Namespace) -> None:
                 hard_route=hard_route,
                 router_grad=router_grad,
             )
+            (
+                batch_usage,
+                batch_entropy,
+                batch_margin,
+                batch_points,
+            ) = tm.routing_statistics(predictions)
+            train_sampled_usage += batch_usage
+            train_gate_entropy_sum += batch_entropy
+            train_gate_margin_sum += batch_margin
+            train_gate_points += batch_points
             loss, loss_items = criterion(
                 predictions,
                 gt_points,
@@ -517,6 +546,13 @@ def train_all(args: argparse.Namespace) -> None:
             3, 3, dtype=torch.int64, device=device
         )
         matched_sum = 0
+        val_gate_entropy_sum = torch.zeros(
+            (), device=device
+        )
+        val_gate_margin_sum = torch.zeros(
+            (), device=device
+        )
+        val_gate_points = 0
         for name, val_loader in val_loaders.items():
             (
                 soft_mae,
@@ -524,6 +560,9 @@ def train_all(args: argparse.Namespace) -> None:
                 hard_usage,
                 route_confusion,
                 matched,
+                dataset_gate_entropy,
+                dataset_gate_margin,
+                dataset_gate_points,
             ) = tm.evaluate_count_mae(
                 model,
                 val_loader,
@@ -538,6 +577,9 @@ def train_all(args: argparse.Namespace) -> None:
             )
             per_dataset[name] = (soft_mae, hard_mae)
             hard_usage_sum += hard_usage
+            val_gate_entropy_sum += dataset_gate_entropy
+            val_gate_margin_sum += dataset_gate_margin
+            val_gate_points += dataset_gate_points
             if args.diagnose_scale_routing:
                 confusion_sum += route_confusion
                 matched_sum += matched
@@ -581,6 +623,27 @@ def train_all(args: argparse.Namespace) -> None:
             matched_gate_sum
             / max(matched_gate_points, 1)
         )
+        train_gate_entropy = (
+            train_gate_entropy_sum
+            / max(train_gate_points, 1)
+        ).item()
+        train_gate_margin = (
+            train_gate_margin_sum
+            / max(train_gate_points, 1)
+        ).item()
+        val_gate_entropy = (
+            val_gate_entropy_sum
+            / max(val_gate_points, 1)
+        ).item()
+        val_gate_margin = (
+            val_gate_margin_sum
+            / max(val_gate_points, 1)
+        ).item()
+        train_usage_pct = (
+            train_sampled_usage.float()
+            / max(int(train_sampled_usage.sum()), 1)
+            * 100
+        )
         top1_usage = (
             matched_gate_top1_sum
             / max(matched_gate_points, 1)
@@ -609,15 +672,16 @@ def train_all(args: argparse.Namespace) -> None:
             f"point={avg_loss_items['point']:.4f} "
             f"count={avg_loss_items['count']:.4f} "
             f"T={temperature:.2f} "
-            f"router_warmup={not router_grad} "
-            f"soft_raw_macro={soft_raw_macro:.3f} "
-            f"soft_norm_macro={soft_norm_macro:.6f} "
-            f"soft_weighted_norm_mae="
-            f"{soft_weighted_norm_mae:.6f} "
+            f"routing={routing_mode} "
+            f"router_warmup={router_warmup} "
             f"hard_raw_macro={hard_raw_macro:.3f} "
             f"hard_norm_macro={hard_norm_macro:.6f} "
             f"hard_weighted_norm_mae="
             f"{hard_weighted_norm_mae:.6f} "
+            f"soft_raw_macro={soft_raw_macro:.3f} "
+            f"soft_norm_macro={soft_norm_macro:.6f} "
+            f"soft_weighted_norm_mae="
+            f"{soft_weighted_norm_mae:.6f} "
             f"hard_soft_gap={hard_soft_gap:.6f} "
             f"hard_soft_ratio={hard_soft_ratio:.4f}"
         )
@@ -625,18 +689,28 @@ def train_all(args: argparse.Namespace) -> None:
         logging.info(
             "  matched gate mean=E0:%.1f%% E1:%.1f%% E2:%.1f%% "
             "| matched top1=E0:%.1f%% E1:%.1f%% E2:%.1f%% "
-            "| val hard top1=E0:%.1f%% E1:%.1f%% E2:%.1f%% "
-            "| gate entropy=%.4f",
+            "| train sampled usage=E0:%.1f%% E1:%.1f%% E2:%.1f%% "
+            "| val deterministic usage=E0:%.1f%% E1:%.1f%% E2:%.1f%% "
+            "| matched entropy=%.4f "
+            "| train entropy=%.4f val entropy=%.4f "
+            "| train margin=%.4f val margin=%.4f",
             gate_mean[0] * 100,
             gate_mean[1] * 100,
             gate_mean[2] * 100,
             top1_usage[0] * 100,
             top1_usage[1] * 100,
             top1_usage[2] * 100,
+            train_usage_pct[0],
+            train_usage_pct[1],
+            train_usage_pct[2],
             val_usage_pct[0],
             val_usage_pct[1],
             val_usage_pct[2],
             router_entropy,
+            train_gate_entropy,
+            val_gate_entropy,
+            train_gate_margin,
+            val_gate_margin,
         )
 
         if args.diagnose_scale_routing and matched_sum > 0:
@@ -667,16 +741,14 @@ def train_all(args: argparse.Namespace) -> None:
                 int(confusion_sum[2].sum()),
             )
 
-        val_score_for_best = soft_weighted_norm_mae
-        improved = val_score_for_best < best_soft_selection_score
+        val_score_for_best = hard_weighted_norm_mae
+        improved = val_score_for_best < best_selection_score
         if improved:
             best_selection_score = val_score_for_best
-            best_soft_selection_score = val_score_for_best
             best_path = os.path.join(
-                args.save_dir, "best_soft.pt"
+                args.save_dir, "best_hard.pt"
             )
         else:
-            best_selection_score = best_soft_selection_score
             best_path = None
 
         checkpoint_data = {
@@ -685,14 +757,15 @@ def train_all(args: argparse.Namespace) -> None:
             "epoch": epoch,
             "best_mae": best_selection_score,
             "best_selection_score": best_selection_score,
-            "best_soft_selection_score": (
-                best_soft_selection_score
+            "best_hard_selection_score": (
+                best_selection_score
             ),
             "selection_metric": (
-                "soft weighted normalized MAE"
+                "hard weighted normalized MAE"
             ),
-            "hard_started": False,
-            "hard_route": False,
+            "hard_started": True,
+            "hard_route": True,
+            "training_hard_route": True,
             "per_dataset": per_dataset,
             "val_image_counts": val_image_counts,
             "val_mean_gt_counts": val_mean_gt_counts,
@@ -710,17 +783,32 @@ def train_all(args: argparse.Namespace) -> None:
             "hard_soft_ratio": hard_soft_ratio,
             "gate_mean": gate_mean.detach().cpu(),
             "top1_usage": top1_usage.detach().cpu(),
-            "gate_entropy": router_entropy,
+            "gate_entropy": val_gate_entropy,
+            "gate_margin": val_gate_margin,
+            "matched_gate_entropy": router_entropy,
+            "train_gate_entropy": train_gate_entropy,
+            "train_gate_margin": train_gate_margin,
+            "val_gate_entropy": val_gate_entropy,
+            "val_gate_margin": val_gate_margin,
             "train_gate_distribution": (
-                gate_mean.detach().cpu()
+                train_sampled_usage.detach().cpu()
+            ),
+            "train_sampled_usage": (
+                train_sampled_usage.detach().cpu()
+            ),
+            "val_deterministic_usage": (
+                hard_usage_sum.detach().cpu()
             ),
             "val_hard_expert_usage": (
                 hard_usage_sum.detach().cpu()
             ),
-            "router_training_mode": "task_only",
+            "router_training_mode": (
+                "task_only_gumbel_hard"
+            ),
             "router_warmup_epochs": (
                 args.router_warmup_epochs
             ),
+            "route_supervision": False,
             "diagnose_scale_routing": (
                 args.diagnose_scale_routing
             ),
@@ -739,7 +827,7 @@ def train_all(args: argparse.Namespace) -> None:
         if improved:
             torch.save(checkpoint_data, best_path)
             logging.info(
-                f"  -> 新的最佳 soft weighted normalized MAE: "
+                f"  -> 新的最佳 hard weighted normalized MAE: "
                 f"{best_selection_score:.6f} ({best_path})"
             )
 
@@ -755,7 +843,8 @@ def train_all(args: argparse.Namespace) -> None:
 def build_parser():
     parser = tm.build_parser()
     parser.description = (
-        "在全部数据集上联合训练（batch 混合 + 逐数据集验证）"
+        "在全部数据集上联合训练（batch 混合 + 逐数据集验证）；"
+        "Router warm-up 后使用 Gumbel-ST hard"
     )
     parser.add_argument(
         "--dataset", type=str, action="append", default=[],

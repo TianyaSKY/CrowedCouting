@@ -217,8 +217,8 @@ def parse_args():
     )
     parser.add_argument(
         "--checkpoint", type=str,
-        default="runs/moe_point/best.pt",
-        help="训练好的 MoE 模型权重"
+        default="runs/moe_point/best_hard.pt",
+        help="训练好的 Hard-Only MoE checkpoint"
     )
     parser.add_argument(
         "--imgsz", type=int, default=640,

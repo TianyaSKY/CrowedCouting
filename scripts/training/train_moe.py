@@ -91,7 +91,7 @@ def build_checkpoint_config(
     *,
     temperature: float,
 ) -> dict[str, object]:
-    """Build the canonical task-only settings stored in checkpoints."""
+    """Build the canonical Hard-Only Task-Driven MoE settings."""
     temperature_schedule = {
         name: getattr(args, name)
         for name in (
@@ -108,14 +108,14 @@ def build_checkpoint_config(
         "num_references": int(args.num_references),
         "temperature_schedule": temperature_schedule,
         "temperature": float(temperature),
-        # Kept as explicit false values for older evaluation scripts. Unsup-v0
-        # never trains or graduates to a hard-routing phase.
-        "hard_started": False,
-        "hard_route": False,
-        "router_training_mode": "task_only",
+        "hard_started": True,
+        "hard_route": True,
+        "training_hard_route": True,
+        "router_training_mode": "task_only_gumbel_hard",
         "router_warmup_epochs": int(
             args.router_warmup_epochs
         ),
+        "route_supervision": False,
         "diagnose_scale_routing": bool(
             args.diagnose_scale_routing
         ),
@@ -273,6 +273,73 @@ def _routing_confusion(
 
     return confusion, matched_points
 
+def routing_statistics(
+    predictions: dict[str, torch.Tensor],
+    mask: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]:
+    """Return sampled usage, entropy, margin, and selected-point count.
+
+    ``gates`` is the actual forward assignment (Gumbel sample during
+    training, deterministic argmax during evaluation). Entropy and margin
+    use the Router's soft probabilities so they remain informative for a
+    hard route.
+    """
+    gates = predictions["gates"]
+    route_probabilities = predictions.get(
+        "route_probabilities"
+    )
+    if route_probabilities is None:
+        route_probabilities = torch.softmax(
+            predictions["route_logits"],
+            dim=2,
+        )
+    route_probabilities = route_probabilities.permute(
+        0, 3, 4, 1, 2
+    ).reshape_as(gates)
+
+    if mask is None:
+        selected_gates = gates.reshape(-1, gates.shape[-1])
+        selected_probabilities = route_probabilities.reshape(
+            -1, route_probabilities.shape[-1]
+        )
+    else:
+        selected_gates = gates[mask]
+        selected_probabilities = route_probabilities[mask]
+
+    selected_count = int(selected_gates.shape[0])
+    if selected_count == 0:
+        return (
+            torch.zeros(
+                gates.shape[-1],
+                dtype=torch.int64,
+                device=gates.device,
+            ),
+            gates.new_zeros(()),
+            gates.new_zeros(()),
+            0,
+        )
+
+    sampled_usage = selected_gates.argmax(dim=-1).bincount(
+        minlength=gates.shape[-1]
+    )
+    safe_probabilities = selected_probabilities.clamp_min(1e-8)
+    entropy_sum = -(
+        safe_probabilities * safe_probabilities.log()
+    ).sum()
+    margin_values = selected_probabilities.topk(
+        k=2,
+        dim=-1,
+    ).values
+    margin_sum = (
+        margin_values[:, 0] - margin_values[:, 1]
+    ).sum()
+    return (
+        sampled_usage,
+        entropy_sum.detach(),
+        margin_sum.detach(),
+        selected_count,
+    )
+
 
 def evaluate_count_mae(
     model,
@@ -290,10 +357,10 @@ def evaluate_count_mae(
     scale_sigma_octaves: float = 0.6,
     diagnose_scale_routing: bool = False,
 ):
-    """验证集人数 MAE，同时报告 soft 与 hard 的任务前向。
+    """Validate soft diagnostics and deterministic hard primary metrics.
 
-    训练全程使用 soft；hard 只作为验证指标。尺度混淆矩阵只有在
-    ``diagnose_scale_routing`` 开启时才计算，并且始终是 diagnostic only。
+    Hard validation never samples Gumbel noise. Scale confusion remains
+    diagnostic-only and does not affect training or checkpoint selection.
     """
     model.eval()
 
@@ -306,6 +373,13 @@ def evaluate_count_mae(
         3, 3, dtype=torch.int64, device=device
     )
     matched_points = 0
+    hard_gate_entropy_sum = torch.zeros(
+        (), device=device
+    )
+    hard_gate_margin_sum = torch.zeros(
+        (), device=device
+    )
+    hard_gate_points = 0
 
     with torch.no_grad():
         for batch in tqdm(
@@ -343,13 +417,21 @@ def evaluate_count_mae(
 
                 if hard_route:
                     # 仅统计置信度 > 0.5 的前景候选，避免背景污染
-                    # hard top-1 使用率。
+                    # deterministic hard top-1 使用率与 Router 诊断。
                     fg_mask = scores > 0.5
-                    hard_usage += (
-                        predictions["gates"][fg_mask]
-                        .argmax(dim=-1)
-                        .bincount(minlength=3)
+                    (
+                        batch_usage,
+                        batch_entropy,
+                        batch_margin,
+                        batch_points,
+                    ) = routing_statistics(
+                        predictions,
+                        mask=fg_mask,
                     )
+                    hard_usage += batch_usage
+                    hard_gate_entropy_sum += batch_entropy
+                    hard_gate_margin_sum += batch_margin
+                    hard_gate_points += batch_points
 
                     if diagnose_scale_routing:
                         (
@@ -387,6 +469,9 @@ def evaluate_count_mae(
         hard_usage,
         route_confusion,
         matched_points,
+        hard_gate_entropy_sum,
+        hard_gate_margin_sum,
+        hard_gate_points,
     )
 
 
@@ -396,29 +481,12 @@ def temperature_for_epoch(
     first_hard_epoch: int | None,
     args,
 ) -> float:
-    """保持 baseline 的 2.0 -> 1.3 -> 1.0 soft 温度曲线。
+    """Return the shared 2.0 -> 1.3 -> 1.0 temperature schedule.
 
-    Router warm-up 只控制 gate 是否固定均匀，不改变 temperature
-    schedule。默认 ``temp_floor_epoch=30`` 时，phase1 在 epoch 15
-    到达 ``phase1_temp=1.3``；Unsup-v0 训练不启用 hard 分支。
+    Hard routing changes the forward assignment, not this schedule. The
+    legacy parameters remain in the signature/config for checkpoint readers.
     """
-    if hard_route:
-        if first_hard_epoch is None:
-            return args.soft_temp_floor
-        progress = min(
-            epoch - first_hard_epoch,
-            args.hard_temp_epochs,
-        )
-        return max(
-            args.min_temperature,
-            args.soft_temp_floor
-            - (
-                args.soft_temp_floor
-                - args.min_temperature
-            )
-            * progress
-            / max(args.hard_temp_epochs, 1),
-        )
+    _ = hard_route, first_hard_epoch
 
     phase1_epoch = max(
         int(args.temp_floor_epoch) // 2,
@@ -482,7 +550,8 @@ def train_moe(args):
         raise ValueError("--router-warmup-epochs 不能为负数")
     if args.force_hard_epoch is not None:
         logging.warning(
-            "--force-hard-epoch 已废弃；Unsup-v0 全程 soft，参数被忽略"
+            "--force-hard-epoch 已废弃；H0 在 Router warm-up 后自动 "
+            "使用 Gumbel hard，参数被忽略"
         )
 
     # 未显式指定输出目录时自动加时间戳；--resume 沿用原 run 目录。
@@ -506,18 +575,20 @@ def train_moe(args):
     logging.info(f"使用设备: {device}")
     validate_cuda_device(device)
 
-    # 覆盖保护：从头训练进入已有 save-dir 时备份旧 best_soft。
+    # 覆盖保护：从头训练进入已有 save-dir 时备份旧 best_hard。
     if not args.resume:
         old_best = os.path.join(
-            args.save_dir, "best_soft.pt"
+            args.save_dir, "best_hard.pt"
         )
         if os.path.exists(old_best):
             backup = os.path.join(
-                args.save_dir, "best_soft_prev.pt"
+                args.save_dir, "best_hard_prev.pt"
             )
             if not os.path.exists(backup):
                 shutil.copy2(old_best, backup)
-                logging.info(f"旧 best_soft.pt 已备份到 {backup}")
+                logging.info(
+                    f"旧 best_hard.pt 已备份到 {backup}"
+                )
 
     model = YOLO11MoEPoint(
         weights=args.weights,
@@ -582,7 +653,6 @@ def train_moe(args):
     optimizer = build_optimizer(model, args)
     start_epoch = 0
     best_selection_score = float("inf")
-    best_soft_selection_score = float("inf")
 
     if args.resume and os.path.exists(args.resume):
         logging.info(f"从 {args.resume} 恢复训练")
@@ -593,11 +663,12 @@ def train_moe(args):
         if (
             not isinstance(saved_config, dict)
             or saved_config.get("router_training_mode")
-            != "task_only"
+            != "task_only_gumbel_hard"
         ):
             raise ValueError(
-                "只能从 router_training_mode=task_only 的 checkpoint "
-                "恢复，避免混用 supervised Router 权重"
+                "H0 只能从 router_training_mode="
+                "'task_only_gumbel_hard' checkpoint 恢复；"
+                "禁止从 Unsup-v0 soft-only checkpoint resume"
             )
 
         try:
@@ -624,22 +695,18 @@ def train_moe(args):
             "best_selection_score",
             checkpoint.get("best_mae", float("inf")),
         )
-        best_soft_selection_score = checkpoint.get(
-            "best_soft_selection_score",
-            best_selection_score,
-        )
 
         old_best = os.path.join(
-            args.save_dir, "best_soft.pt"
+            args.save_dir, "best_hard.pt"
         )
         if os.path.exists(old_best):
             backup = os.path.join(
-                args.save_dir, "best_soft_pre_resume.pt"
+                args.save_dir, "best_hard_pre_resume.pt"
             )
             if not os.path.exists(backup):
                 shutil.copy2(old_best, backup)
                 logging.info(
-                    f"旧 best_soft.pt 已备份到 {backup}"
+                    f"旧 best_hard.pt 已备份到 {backup}"
                 )
 
         if start_epoch >= args.freeze_epochs:
@@ -647,16 +714,27 @@ def train_moe(args):
                 param.requires_grad = True
 
     for epoch in range(start_epoch, args.epochs):
-        hard_route = False
-        router_grad = epoch >= args.router_warmup_epochs
+        router_warmup = (
+            epoch < args.router_warmup_epochs
+        )
+        if router_warmup:
+            hard_route = False
+            router_grad = False
+            routing_mode = "warmup_uniform"
+        else:
+            hard_route = True
+            router_grad = True
+            routing_mode = "train_gumbel_hard"
         temperature = temperature_for_epoch(
             epoch,
             hard_route,
             None,
             args,
         )
-
-        if args.freeze_epochs > 0 and epoch == args.freeze_epochs:
+        if (
+            args.freeze_epochs > 0
+            and epoch == args.freeze_epochs
+        ):
             for param in model.yolo.parameters():
                 param.requires_grad = True
             logging.info(
@@ -672,6 +750,16 @@ def train_moe(args):
         matched_gate_top1_sum = torch.zeros(
             3, device=device
         )
+        train_sampled_usage = torch.zeros(
+            3, dtype=torch.int64, device=device
+        )
+        train_gate_entropy_sum = torch.zeros(
+            (), device=device
+        )
+        train_gate_margin_sum = torch.zeros(
+            (), device=device
+        )
+        train_gate_points = 0
         matched_gate_points = 0
         matched_gate_entropy_sum = torch.zeros(
             (), device=device
@@ -697,6 +785,16 @@ def train_moe(args):
                 hard_route=hard_route,
                 router_grad=router_grad,
             )
+            (
+                batch_usage,
+                batch_entropy,
+                batch_margin,
+                batch_points,
+            ) = routing_statistics(predictions)
+            train_sampled_usage += batch_usage
+            train_gate_entropy_sum += batch_entropy
+            train_gate_margin_sum += batch_margin
+            train_gate_points += batch_points
 
             loss, loss_items = criterion(
                 predictions,
@@ -748,6 +846,9 @@ def train_moe(args):
             hard_usage,
             route_confusion,
             matched_points,
+            val_gate_entropy_sum,
+            val_gate_margin_sum,
+            val_gate_points,
         ) = evaluate_count_mae(
             model,
             val_loader,
@@ -763,8 +864,10 @@ def train_moe(args):
         )
 
         normalizer = max(val_mean_gt_count, 1e-12)
-        soft_weighted_norm_mae = soft_mae / normalizer
-        hard_weighted_norm_mae = hard_mae / normalizer
+        soft_norm_mae = soft_mae / normalizer
+        hard_norm_mae = hard_mae / normalizer
+        soft_weighted_norm_mae = soft_norm_mae
+        hard_weighted_norm_mae = hard_norm_mae
         hard_soft_gap = (
             hard_weighted_norm_mae
             - soft_weighted_norm_mae
@@ -786,6 +889,27 @@ def train_moe(args):
             matched_gate_entropy_sum
             / max(matched_gate_points, 1)
         ).item()
+        train_gate_entropy = (
+            train_gate_entropy_sum
+            / max(train_gate_points, 1)
+        ).item()
+        train_gate_margin = (
+            train_gate_margin_sum
+            / max(train_gate_points, 1)
+        ).item()
+        val_gate_entropy = (
+            val_gate_entropy_sum
+            / max(val_gate_points, 1)
+        ).item()
+        val_gate_margin = (
+            val_gate_margin_sum
+            / max(val_gate_points, 1)
+        ).item()
+        train_usage_pct = (
+            train_sampled_usage.float()
+            / max(int(train_sampled_usage.sum()), 1)
+            * 100
+        )
         val_usage_pct = (
             hard_usage.float()
             / max(int(hard_usage.sum()), 1)
@@ -799,31 +923,44 @@ def train_moe(args):
             f"point={avg_loss_items['point']:.4f} "
             f"count={avg_loss_items['count']:.4f} "
             f"T={temperature:.2f} "
-            f"router_warmup={not router_grad} "
-            f"soft_MAE={soft_mae:.3f} "
-            f"hard_MAE={hard_mae:.3f} "
-            f"soft_weighted_norm_mae="
-            f"{soft_weighted_norm_mae:.6f} "
+            f"routing={routing_mode} "
+            f"router_warmup={router_warmup} "
+            f"hard_raw_mae={hard_mae:.3f} "
+            f"hard_norm_mae={hard_norm_mae:.6f} "
             f"hard_weighted_norm_mae="
             f"{hard_weighted_norm_mae:.6f} "
+            f"soft_raw_mae={soft_mae:.3f} "
+            f"soft_norm_mae={soft_norm_mae:.6f} "
+            f"soft_weighted_norm_mae="
+            f"{soft_weighted_norm_mae:.6f} "
             f"hard_soft_gap={hard_soft_gap:.6f} "
             f"hard_soft_ratio={hard_soft_ratio:.4f}"
         )
         logging.info(
             "  matched gate mean=E0:%.1f%% E1:%.1f%% E2:%.1f%% "
             "| matched top1=E0:%.1f%% E1:%.1f%% E2:%.1f%% "
-            "| val hard top1=E0:%.1f%% E1:%.1f%% E2:%.1f%% "
-            "| gate entropy=%.4f",
+            "| train sampled usage=E0:%.1f%% E1:%.1f%% E2:%.1f%% "
+            "| val deterministic usage=E0:%.1f%% E1:%.1f%% E2:%.1f%% "
+            "| matched entropy=%.4f "
+            "| train entropy=%.4f val entropy=%.4f "
+            "| train margin=%.4f val margin=%.4f",
             gate_mean[0] * 100,
             gate_mean[1] * 100,
             gate_mean[2] * 100,
             top1_usage[0] * 100,
             top1_usage[1] * 100,
             top1_usage[2] * 100,
+            train_usage_pct[0],
+            train_usage_pct[1],
+            train_usage_pct[2],
             val_usage_pct[0],
             val_usage_pct[1],
             val_usage_pct[2],
             router_entropy,
+            train_gate_entropy,
+            val_gate_entropy,
+            train_gate_margin,
+            val_gate_margin,
         )
 
         if args.diagnose_scale_routing and matched_points > 0:
@@ -848,16 +985,14 @@ def train_moe(args):
                     f"(n={int(row_counts[expert_index])})"
                 )
 
-        val_score_for_best = soft_weighted_norm_mae
-        improved = val_score_for_best < best_soft_selection_score
+        val_score_for_best = hard_weighted_norm_mae
+        improved = val_score_for_best < best_selection_score
         if improved:
             best_selection_score = val_score_for_best
-            best_soft_selection_score = val_score_for_best
             best_path = os.path.join(
-                args.save_dir, "best_soft.pt"
+                args.save_dir, "best_hard.pt"
             )
         else:
-            best_selection_score = best_soft_selection_score
             best_path = None
 
         checkpoint_data = {
@@ -866,16 +1001,21 @@ def train_moe(args):
             "epoch": epoch,
             "best_mae": best_selection_score,
             "best_selection_score": best_selection_score,
-            "best_soft_selection_score": (
-                best_soft_selection_score
+            "best_hard_selection_score": (
+                best_selection_score
             ),
             "selection_metric": (
-                "soft weighted normalized MAE"
+                "hard weighted normalized MAE"
             ),
-            "hard_started": False,
-            "hard_route": False,
+            "hard_started": True,
+            "hard_route": True,
+            "training_hard_route": True,
             "soft_MAE": soft_mae,
             "hard_MAE": hard_mae,
+            "soft_raw_mae": soft_mae,
+            "hard_raw_mae": hard_mae,
+            "soft_norm_mae": soft_norm_mae,
+            "hard_norm_mae": hard_norm_mae,
             "soft_weighted_norm_mae": (
                 soft_weighted_norm_mae
             ),
@@ -886,12 +1026,27 @@ def train_moe(args):
             "hard_soft_ratio": hard_soft_ratio,
             "gate_mean": gate_mean.detach().cpu(),
             "top1_usage": top1_usage.detach().cpu(),
-            "gate_entropy": router_entropy,
+            "gate_entropy": val_gate_entropy,
+            "gate_margin": val_gate_margin,
+            "matched_gate_entropy": router_entropy,
+            "train_gate_entropy": train_gate_entropy,
+            "train_gate_margin": train_gate_margin,
+            "val_gate_entropy": val_gate_entropy,
+            "val_gate_margin": val_gate_margin,
+            "train_sampled_usage": (
+                train_sampled_usage.detach().cpu()
+            ),
+            "val_deterministic_usage": (
+                hard_usage.detach().cpu()
+            ),
             "val_hard_expert_usage": hard_usage.detach().cpu(),
-            "router_training_mode": "task_only",
+            "router_training_mode": (
+                "task_only_gumbel_hard"
+            ),
             "router_warmup_epochs": (
                 args.router_warmup_epochs
             ),
+            "route_supervision": False,
             "diagnose_scale_routing": (
                 args.diagnose_scale_routing
             ),
@@ -910,7 +1065,7 @@ def train_moe(args):
         if improved:
             torch.save(checkpoint_data, best_path)
             logging.info(
-                f"  -> 新的最佳 soft weighted normalized MAE: "
+                f"  -> 新的最佳 hard weighted normalized MAE: "
                 f"{best_selection_score:.6f} ({best_path})"
             )
 
@@ -925,8 +1080,8 @@ def train_moe(args):
 def build_parser():
     parser = argparse.ArgumentParser(
         description=(
-            "训练 YOLO11 + Task-Only MoE Point Head；"
-            "全程 soft routing"
+            "训练 YOLO11 + Hard-Only Task-Driven MoE Point Head；"
+            "Router warm-up 后使用 Gumbel-ST Top-1"
         )
     )
     parser.add_argument(
@@ -972,19 +1127,19 @@ def build_parser():
     )
     parser.add_argument(
         "--init-temperature", type=float, default=2.0,
-        help="soft 阶段起始温度"
+        help="Gumbel-ST backward surrogate 起始温度"
     )
     parser.add_argument(
         "--min-temperature", type=float, default=0.5,
-        help="保留的 hard 兼容路径温度下限"
+        help="旧 checkpoint 兼容字段；当前共享 schedule 不使用"
     )
     parser.add_argument(
         "--phase1-temp", type=float, default=1.3,
-        help="soft baseline 第一段结束温度（默认 epoch 15 到达）"
+        help="共享温度曲线第一段结束温度（默认 epoch 15 到达）"
     )
     parser.add_argument(
         "--soft-temp-floor", type=float, default=1.0,
-        help="soft 阶段温度下限"
+        help="共享温度曲线下限"
     )
     parser.add_argument(
         "--temp-floor-epoch", type=int, default=30,
@@ -992,15 +1147,15 @@ def build_parser():
     )
     parser.add_argument(
         "--hard-temp-epochs", type=int, default=20,
-        help="保留的 hard 兼容路径温度衰减 epoch 数"
+        help="旧 checkpoint 兼容字段；当前共享 schedule 不使用"
     )
     parser.add_argument(
         "--router-warmup-epochs", type=int, default=3,
-        help="前 N 个 epoch 使用精确均匀 gate；默认 3"
+        help="前 N 个 epoch 使用均匀 gate；之后使用 Gumbel-ST hard"
     )
     parser.add_argument(
         "--force-hard-epoch", type=int, default=None,
-        help="已废弃并忽略；Unsup-v0 始终全程 soft"
+        help="已废弃并忽略；warm-up 后自动使用 Gumbel-ST hard"
     )
     parser.add_argument(
         "--diagnose-scale-routing",
@@ -1028,7 +1183,7 @@ def build_parser():
     )
     parser.add_argument(
         "--resume", type=str, default=None,
-        help="从 task_only checkpoint 恢复训练"
+        help="仅从 task_only_gumbel_hard checkpoint 恢复"
     )
     return parser
 

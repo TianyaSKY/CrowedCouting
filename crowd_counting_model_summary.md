@@ -42,23 +42,25 @@ graph TD
   **初始 0**（专家先吃纯尺度输入，防止共享 P3 细节后退化成近似副本）。
   每个专家输出 `K×(confidence, dx, dy)`；confidence 偏置按先验 0.01 初始化。
 - **Router**：输入 `Concat(F3, Up(F4), Up(F5))`，输出 `[K, 3]` 原始路由 logits
-  （初始化全 0 → softmax 后三专家等权）。路由 logits 除以温度后 softmax 得到 gate。
+  （初始化全 0 → 初始 soft surrogate 三专家等权）。温度仅用于 soft surrogate。
 - **软/硬路由**：
-  - 软：在**概率空间**混合 `p = Σ gᵢ·σ(zᵢ)` 再转回 logit，避免 logits 线性混合时
-    专家置信度相互抵消；`g = softmax(route_logits / T)`。
-  - 硬：Top-1 one-hot；训练时走 Straight-Through（前向硬、梯度经软路由回传），
-    推理时纯硬路由。
-  - `router_grad=False`（训练早期）时混合用 gate 被 detach，cls/point/count 不向
-    Router 回传，Router 只由 `L_route` 训练。
+  - 软 diagnostic：在**概率空间**混合 `p = Σ gᵢ·σ(zᵢ)` 再转回 logit；
+    `g = softmax(route_logits / T)`。
+  - 训练 hard：Gumbel-ST `hard=True`，forward 是严格 one-hot，backward
+    经 soft surrogate 回传 Router。
+  - 推理 hard：无 Gumbel noise，直接 `argmax(route_logits)` 得到确定性 Top-1。
+  - warm-up 阶段使用固定 `g=[1/3,1/3,1/3]` 且 `router_grad=False`；
+    Router 从 task loss 学习，不存在独立 `L_route`。
 - **解码**：参考点 = (网格 + K 个相对偏移) × 8；预测点 = 参考点 + `tanh(dx,dy)·offset_range(2.0)·8`。
-- 输出：`logits [B,Q]`、`points [B,Q,2]`、`gates [B,Q,3]`、`base_points`、`route_logits`。
+- 输出：`logits [B,Q]`、`points [B,Q,2]`、`gates [B,Q,3]`、`base_points`、
+  `route_logits`、`route_probabilities`。
 
 ## 3. PointMoELoss（`models/point_moe_loss.py`）
 
 总损失：
 
 $$
-L = L_{cls} + 5L_{point} + 0.05L_{count} + 0.05L_{route}
+L = L_{cls} + 5L_{point} + 0.05L_{count}
 $$
 
 ### 3.1 匹配（匈牙利一对一）
@@ -78,35 +80,31 @@ $$
 - **L_point**：仅在匹配对上的 Smooth L1（**β=0.02**，归一化坐标下约对应 8 px，让 2–8 px
   误差走线性/准线性区，避免 β=1.0 时定位分支梯度被压到 ~1e-5 量级），`sum / n_gt`。
 - **L_count**：`|Σσ(logits) − n_gt| / (n_gt + 1)`，软计数监督。
-- **L_route**：尺度路由监督，替代强制 1/3 均匀使用的 balance loss（见下）。
+- 不使用 `L_route`、`L_balance`、`L_sharp` 或 Router recall graduation。
 
-### 3.3 尺度路由监督（L_route）
+### 3.3 尺度路由诊断（不参与训练）
 
-对每个匹配正样本，用 GT 点第 `knn_k`（默认 1，即最近邻）间距估计局部尺度，在
-**对数尺度空间**做高斯映射为三专家软目标：
+`scale_targets` 仍可用 GT 点第 `knn_k`（默认 1，即最近邻）间距估计局部尺度，
+在对数尺度空间映射为三专家软目标。它只用于 matched confusion diagnostic，
+不产生 Router 梯度，也不改变 task-only loss。
 
-$$
-log\_scale = \log_2(clamp(d_{knn}, 1)), \qquad
-soft\_target = softmax\Big(-\tfrac12 \big(\tfrac{\log_2 d - \log_2 c_j}{0.6}\big)^2\Big)_j
-$$
-
-`scale_centers = (10, 20, 40) px`，`scale_sigma_octaves = 0.6`：间距小（密集人群）→ E3 精细，
-间距大（稀疏/大目标）→ E5 大范围。路由损失收集一个 batch 的所有匹配点，
-按硬目标类别分别求均值后再做 macro 平均；三个类别对 Router 训练同等重要，
-但不强制最终路由比例 33/33/33。
-
-返回 `(total, {cls, point, count, route, gate_target, gate_target_hist, gate_target_count})`；
-`gate_target` 为 GT 尺度目标 argmax 分布，另两个字段用于按真实 support 聚合训练日志。
+`scale_centers = (10, 20, 40) px`，`scale_sigma_octaves = 0.6`；日志另外记录
+matched gate mean、sampled/deterministic usage、gate entropy 和 Router margin。
 
 ## 4. 训练与评估口径（train_moe.py）
 
 - 训练：AdamW 两组学习率（YOLO 主干 1e-4 / MoE Head 1e-3），前 3 epoch 冻结主干；
-  温度按 schedule 变化；硬路由切换由 **Router 毕业条件**触发（验证集混淆矩阵 E0/E1/E2 行 recall
-  连续 3 轮 ≥ 0.60/0.40/0.30 且 macro recall ≥ 0.50），可用 `--force-hard-epoch` 覆盖。
-  `router_grad=False` 的 warm-up 使用 uniform floor（默认 0.3）保护少数专家。
-- 评估：soft 使用当前 epoch 的训练温度，hard 使用 0.5；**人数 = 全部候选点
-  `logits.sigmoid()` 之和**（无阈值、无去重）。`best_soft.pt` / `best_hard.pt` 分别按对应
-  phase 的 weighted normalized MAE 选取；Router 未毕业时不生成 `best_hard.pt`。
+  默认前 3 epoch expert warm-up 使用均匀 gate，之后全程 Gumbel-ST Top-1 hard。
+  Router 只接收 `L_cls + 5L_point + 0.05L_count` 的梯度。
+- 温度按共享 schedule `2.0 → 1.3 → 1.0` 变化；hard forward 始终 one-hot，
+  温度只控制 backward surrogate。
+- 评估：soft 只作 diagnostic；hard 使用 deterministic argmax。**人数 = 全部候选点
+  `logits.sigmoid()` 之和**（无阈值、无去重）。`best_hard.pt` 按 hard weighted
+  normalized MAE 选取。
+- checkpoint 记录 `router_training_mode="task_only_gumbel_hard"`、
+  `router_warmup_epochs`、`training_hard_route=True` 和
+  `route_supervision=False`。正式 H0 从 `yolo11m.pt` 新开 run，不从 soft-only
+  Unsup-v0 checkpoint resume。
 - 验证用 letterbox（保持纵横比 + 居中填充 114）而非压成正方形，评估脚本默认读取 checkpoint
   记录的 `crop_size`、`num_references`、temperature schedule 和 Router 配置。
 

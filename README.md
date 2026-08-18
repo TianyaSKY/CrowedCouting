@@ -6,9 +6,11 @@
 
 两个分支：
 
-1. **点级 Scale-MoE Head 分支（当前推荐）**：保留 YOLO11 Backbone+Neck、删除原始
-   Detect Head，替换为统一候选点网格（P3 网格 × K 参考点）上的三专家 MoE 点检测头。
-   由 `scripts/training/train_moe.py` 训练，支持 JHU-Crowd++ 等多数据集。
+1. **Hard-Only Task-Driven MoE / Unsup-H0（当前推荐）**：保留 YOLO11
+   Backbone+Neck、删除原始 Detect Head，替换为统一候选点网格（P3 网格 × K
+   参考点）上的三专家 MoE 点检测头。Router warm-up 后训练使用 Gumbel-ST
+   Top-1 hard routing；由 `scripts/training/train_moe.py` 训练，支持
+   JHU-Crowd++ 等多数据集。
 2. **v4 PointDetect 分支（旧实现）**：在 YOLO11 各尺度（P2–P5）上添加逐尺度点检测头，
    走 ultralytics 训练管线。保留用于对照实验，不再推荐新训练。
 
@@ -36,7 +38,8 @@ pip install -r requirements.txt
   - `crowd_model.py` / `modules.py` / `loss.py` / `yolo11-crowd.yaml`：v4 分支（`CrowdCountingModel`
     + `PointDetect` + `CrowdPointLoss`）。
 - `scripts/data/`：数据集下载（6 个公开数据集）、ShanghaiTech 转换、离线增强与点标注转换。
-- `scripts/training/`：`train_moe.py`（Scale-MoE，argparse）与 v4/标准模型训练脚本。
+- `scripts/training/`：`train_moe.py`（Unsup-H0 Hard-Only MoE，argparse）
+  与 v4/标准模型训练脚本。
 - `scripts/evaluation/`：人数（MAE/RMSE）、点定位（P/R/F1）与模型对比评估。
 - `scripts/visualization/`：单图/批量预测、GT-Pred 对比与样本绘制。
 - `scripts/diagnostics/`：不修改数据的匹配逻辑检查工具。
@@ -65,7 +68,7 @@ pip install -r requirements.txt
 - ShanghaiTech：官方 Dropbox 镜像（约 166 MB），可 `--url` 换源。
 - UCF-CC-50 / UCF-QNRF：官方 CRCV 直链（rar / zip）。
 
-## 快速开始（Scale-MoE 分支）
+## 快速开始（Hard-Only Task-Driven MoE / Unsup-H0）
 
 ### 1. 准备数据
 
@@ -122,7 +125,7 @@ python -m scripts.training.train_all \
 
 # 跨数据集分组评估（默认从 checkpoint 读取 crop_size）
 python -m scripts.evaluation.evaluate_datasets \
-    --checkpoint runs/moe_point_all/best_soft.pt \
+    --checkpoint runs/moe_point_all/best_hard.pt \
     --batch-size 8 \
     --dataset shanghaitech=datasets/shanghaitech_AB:val \
     --dataset jhu=datasets/jhu_crowd:val \
@@ -149,65 +152,68 @@ python -m scripts.training.train_moe \
 | `--backbone-lr` / `--head-lr` | 1e-4 / 1e-3 | YOLO 主干 / MoE Head 两组 AdamW 学习率                        |
 | `--num-references`              | 4           | 每网格参考点数 K（1/4/9）                                     |
 | `--freeze-epochs`               | 3           | 前 N 个 epoch 冻结 YOLO 主干                                  |
-| `--router-warmup-epochs`        | 3           | 前 N 个 epoch 固定 `g=[1/3,1/3,1/3]`                          |
+| `--router-warmup-epochs`        | 3           | 前 N 个 epoch 固定 `g=[1/3,1/3,1/3]`；之后 Gumbel-ST hard |
 | `--match-top-k`                 | 2000        | 匈牙利匹配候选点上限（K=max(K, n_gt)）                        |
 | `--diagnose-scale-routing`     | off         | 可选输出尺度路由混淆矩阵；只作 diagnostic                      |
-| `--force-hard-epoch`            | None        | deprecated，忽略；Unsup-v0 全程 soft                         |
-| `--resume`                      | None        | 仅从 `router_training_mode=task_only` checkpoint 恢复         |
+| `--force-hard-epoch`            | None        | deprecated，忽略；warm-up 后自动进入 Gumbel-ST hard           |
+| `--resume`                      | None        | 仅从 `router_training_mode=task_only_gumbel_hard` checkpoint 恢复 |
 
 训练要点：
 
 - **Task-only Router**：总损失严格为
   `L_cls + 5 * L_point + 0.05 * L_count`。不使用 `L_route`、balance、
-  sharp 或 Router recall graduation。
-- **两段 Router gate**：Epoch 1–3 使用精确均匀 gate；Epoch 4 起使用
-  `softmax(router_logits / T)`，task loss 梯度直接回传 Router。训练全程
-  `hard_route=False`，hard Top-1 只在验证中计算。
-- **温度调度**：soft 阶段继续使用 baseline 的 `2.0 → 1.3 → 1.0`；
-  Router warm-up 不改变 temperature schedule，默认在 epoch 15/30 到达
-  `phase1-temp`/`soft-temp-floor`。
-- **验证指标**：每 epoch 同时输出 soft MAE、hard Top-1 MAE、
-  `hard_soft_gap = hard - soft` 与 `hard_soft_ratio = hard / soft`。
-  联合训练主选模指标为按验证图片数加权的 soft normalized MAE。
-- **Router 诊断**：matched positive 上记录 soft gate mean、Top-1 usage
-  和 entropy；这些指标只观察、不优化。尺度中心和混淆矩阵默认关闭，
-  `--diagnose-scale-routing` 开启后仍明确标记为 diagnostic only。
-- **checkpoint**：只保存 `best_soft.pt` 与 `last.pt`。checkpoint 记录
-  soft/hard MAE、gap/ratio、gate mean、Top-1 usage、entropy、
-  `router_training_mode="task_only"` 与 `router_warmup_epochs`。
-  `best_soft.pt` 按 soft weighted normalized MAE 选择。
-- 未传 `--save-dir` 时输出到 `runs/moe_point_<时间戳>/` + `train.log`
-  （每次启动自动带时间戳，互不覆盖；`--resume` 时沿用原 run 目录）。
-
+  `sharp` 或 Router recall graduation。
+- **Hard-only routing**：Epoch 1–3 使用精确均匀 gate，且
+  `router_grad=False`；Epoch 4 起 `hard_route=True`、
+  `router_grad=True`，训练 forward 每个候选严格只使用一个 expert。
+  Gumbel-ST 只把 soft surrogate 用于 backward，Router 仍只从 task loss
+  学习；不再优化 soft mixture。
+- **温度调度**：Gumbel hard 的 forward 从第一天就是 one-hot；温度只控制
+  backward surrogate 平滑度。默认继续使用 `2.0 → 1.3 → 1.0` schedule，
+  Router warm-up 不改变 schedule。
+- **验证指标**：每 epoch 以 deterministic hard argmax 为 primary，输出
+  `hard_raw_mae`、`hard_norm_mae`、`hard_weighted_norm_mae`；soft mixture
+  的 MAE 只作 diagnostic，并输出 `hard_soft_gap` 与 `hard_soft_ratio`。
+  选模依据是按验证图片数加权的 hard normalized MAE。
+- **Router 诊断**：matched positive 上记录 gate mean、Top-1 usage 和
+  entropy；另分开记录 `train sampled usage` 与 `val deterministic usage`，
+  以及 Router margin（最大与次大 soft probability 的差）。这些指标只观察、
+  不优化；尺度中心和混淆矩阵默认关闭，`--diagnose-scale-routing` 开启后
+  仍明确标记为 diagnostic only。
+- **checkpoint**：保存 `best_hard.pt` 与 `last.pt`。checkpoint 记录
+  hard/soft MAE、gap/ratio、usage、entropy、margin，以及
+  `router_training_mode="task_only_gumbel_hard"`、
+  `router_warmup_epochs=3`、`training_hard_route=True` 和
+  `route_supervision=False`。正式 H0 从 `yolo11m.pt` 新开 run；
 ### 3. 评估与推理
 
 ```bash
-# 单图推理（默认读取 soft checkpoint；可显式 hard_route 做诊断）
+# 单图推理默认使用 deterministic hard argmax
 python -m scripts.visualization.predict_moe \
     --image path/to/img.jpg \
-    --checkpoint runs/moe_point/best_soft.pt
+    --checkpoint runs/moe_point/best_hard.pt
 
 # 验证集批量推理：images/*_pred.jpg + predictions.csv（逐图计数）+ summary.json（MAE/RMSE）
 python -m scripts.visualization.predict_moe_batch \
     --data-root datasets/shanghaitech_AB \
-    --checkpoint runs/moe_point/best_soft.pt \
+    --checkpoint runs/moe_point/best_hard.pt \
     --out-dir runs/moe_point/val_pred
 
-# 分 Part 评估（MAE/RMSE；hard Top-1 仅作验证指标）
+# 分 Part 评估（deterministic hard Top-1）
 python test_each_dataset.py \
     --data-root datasets/shanghaitech_AB \
-    --checkpoint runs/moe_point/best_soft.pt
+    --checkpoint runs/moe_point/best_hard.pt
 ```
 
 MoE 计数口径：全部候选点 `logits.sigmoid()` 求和（无需置信度阈值/去重，与评估一致）；
-soft 验证使用当前训练温度，hard 使用 0.5（argmax 不受温度影响）。Unsup-v0 训练没有
-`best_hard.pt`；需要 hard 结果时直接读取同一 checkpoint 做验证前向。
+hard 验证和推理使用 deterministic `argmax(route_logits)`，不注入 Gumbel noise。
+soft mixture 只用于训练期 diagnostic，不用于 H0 选模。
 
 ### 3.5 跨数据集分组评估
 
 ```bash
 python -m scripts.evaluation.evaluate_datasets \
-    --checkpoint runs/moe_point_all/best_soft.pt \
+    --checkpoint runs/moe_point_all/best_hard.pt \
     --batch-size 8 \
     --dataset shanghaitech=datasets/shanghaitech_AB:val \
     --dataset jhu=datasets/jhu_crowd:val \
@@ -223,11 +229,12 @@ python -m scripts.evaluation.evaluate_datasets \
 
 ### 4. 观察 Router 行为
 
-默认日志只记录 matched positive 上的 soft gate mean、Top-1 usage 和 entropy。
-这些是诊断，不是优化目标，也不存在“Router 达标/未达标”或毕业 streak。
+默认日志记录 matched positive 上的 gate mean、Top-1 usage 和 entropy，
+并分开记录 `train sampled usage` 与 `val deterministic usage`，同时记录
+Router margin（最大与次大 soft probability 的差）。这些是诊断，不是优化目标，
+也不存在“Router 达标/未达标”或毕业 streak。
 `--diagnose-scale-routing` 开启后才输出 GT 尺度类到预测专家的混淆矩阵，
-并明确标记为 `diagnostic only`。若 gate 接近 `[1/3,1/3,1/3]`，
-表示尚未观察到 specialization；若 Top-1 usage 极度偏斜，先比较三个
+并明确标记为 `diagnostic only`。若 Top-1 usage 极度偏斜，先比较三个
 expert 的独立输出与单专家计数结果，再决定是否需要后续正则化。
 
 ## v4 PointDetect 分支（旧）

@@ -124,6 +124,7 @@ class MoEPointHead(nn.Module):
         gates:  [B, Q, 3]       每个候选点的路由权重
         base_points: [B, Q, 2]  未加偏移的参考点坐标（像素）
         route_logits: [B, K, 3, H, W]  原始路由 logits（未归一化）
+        route_probabilities: [B, K, 3, H, W] 温度缩放后的 soft surrogate
     """
 
     def __init__(
@@ -271,37 +272,33 @@ class MoEPointHead(nn.Module):
             dim=2,
         )
 
-        # Epoch 1~warm-up 使用精确均匀 gate；warm-up 之后直接使用
-        # softmax gate，task loss 的梯度自然回传到 Router。这里不
-        # detach gate，也不叠加 uniform floor。
+        # Epoch 1~warm-up 使用精确均匀 gate；warm-up 之后训练使用
+        # Gumbel-ST hard routing，验证使用确定性 Top-1。
         if self.training and not router_grad and not hard_route:
             gate = torch.full_like(
                 soft_gate,
                 1.0 / self.num_experts,
             )
         elif hard_route:
-            expert_index = soft_gate.argmax(
-                dim=2,
-                keepdim=True,
-            )
-            hard_gate = torch.zeros_like(
-                soft_gate
-            ).scatter_(
-                2,
-                expert_index,
-                1.0,
-            )
-
             if self.training:
-                # Straight-through Top-1 仅保留为显式 hard 前向的
-                # 兼容路径；Unsup-v0 训练循环始终传 hard_route=False。
-                gate = (
-                    hard_gate
-                    + soft_gate
-                    - soft_gate.detach()
+                gate = F.gumbel_softmax(
+                    route_logits,
+                    tau=temperature,
+                    hard=True,
+                    dim=2,
                 )
             else:
-                gate = hard_gate
+                expert_index = soft_gate.argmax(
+                    dim=2,
+                    keepdim=True,
+                )
+                gate = torch.zeros_like(
+                    soft_gate
+                ).scatter_(
+                    2,
+                    expert_index,
+                    1.0,
+                )
         else:
             gate = soft_gate
 
@@ -315,11 +312,11 @@ class MoEPointHead(nn.Module):
             dim=2,
         )
 
-        # soft gate 始终携带 task gradient；warm-up 的常量 gate 不携带
-        # Router 梯度，但仍让三个 expert 得到完全相同的混合权重。
+        # warm-up 使用常量 gate；hard 训练的 one-hot gate 由
+        # Gumbel-ST 携带 soft surrogate 的 Router 梯度。
         mix_gate = gate
 
-        # soft 阶段在概率空间混合: p = sum(g * sigmoid(z))，再转回 logit，
+        # soft diagnostic 在概率空间混合: p = sum(g * sigmoid(z))，再转回 logit，
         # 避免 logits 线性混合时专家置信度相互抵消。
         expert_probabilities = expert_scores.sigmoid()
         mixed_probability = (
@@ -397,4 +394,5 @@ class MoEPointHead(nn.Module):
                 -1,
             ),
             "route_logits": route_logits,
+            "route_probabilities": soft_gate,
         }

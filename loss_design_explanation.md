@@ -37,7 +37,7 @@ $$
 ## 4. 总损失
 
 $$
-L = L_{cls} + 5L_{point} + 0.05L_{count} + 0.05L_{route}
+L = L_{cls} + 5L_{point} + 0.05L_{count}
 $$
 
 ### 4.1 分类损失 `L_cls`
@@ -71,45 +71,30 @@ $$
 软计数监督：全图概率和逼近真实人数。相比 v4 已删除的旧计数损失（对全部网格无差别
 强梯度），这里权重低（0.05）、分母 +1 平滑，且分类已有 Focal 的难易样本控制。
 
-### 4.4 尺度路由损失 `L_route`
+### 4.4 路由诊断（不参与训练）
 
-用 GT 局部密度（最近邻间距）监督 Router 的尺度选择，替代早期强制 1/3 均匀使用的
-balance loss：
-
-1. **局部尺度**：第 `knn_k`（默认 1）近邻间距 `d`；
-2. **软目标**：对数尺度空间高斯映射
-   $$
-   soft\_target_j = \text{softmax}_j\Big(-\tfrac12 \big(\tfrac{\log_2 d - \log_2 c_j}{0.6}\big)^2\Big),
-   \quad c = (10, 20, 40)\ \text{px}
-   $$
-   间距小（密集）→ E3 精细；间距大（稀疏/大目标）→ E5 大范围；
-3. **macro 类别平衡**：按软目标 argmax 的类别把匹配点分组，组内软目标 CE 取均值后
-   再对三组取平均。GT 目标分布约 E0 60% / E1 27% / E2 13%，逐点 CE 会让 E2 永远学不动；
-   分组平均让三类对 Router 同等重要，但**不强制**路由比例 33/33/33。
-
-该监督只要求 GT 点数 ≥ knn_k+1（默认 ≥2），否则该图跳过 route 项。
+`scale_targets` 可用 GT 局部密度（最近邻间距）映射为三专家软目标，
+但只用于 matched confusion diagnostic。它不产生 Router 梯度，也不增加 loss 项。
+训练不使用 `L_route`、`L_balance`、`L_sharp` 或 Router recall graduation。
 
 ## 5. 训练时的路由动态（train_moe.py）
 
-- **温度**：软阶段 `init_temperature=2.0` →（`--router-grad-epoch`=15 处 1.3）→
-  `--soft-temp-floor`=1.0（`--temp-floor-epoch`=30）；硬阶段 1.0 → `--min-temperature`=0.5
-  （`--hard-temp-epochs`=20）。高温下 gate 接近均匀，避免训练初期路由坍缩。
-- **Router 梯度隔离与防饿死**：epoch < 15 时 `router_grad=False`，混合用
-  `(1-floor) * gate.detach() + floor / 3`，默认 `floor=0.3`；cls/point/count 不向
-  Router 回传，但三个专家都获得最低 task gradient。
-- **软混合在概率空间**：`p = Σ gᵢ·σ(zᵢ)` 再转回 logit，避免 logits 线性混合时专家
-  置信度相互抵消；硬路由 one-hot 时退化为 `logit(σ(z_j)) = z_j` 的单专家 logit。
-- **硬路由切换由毕业条件触发**（非固定 epoch）：验证集路由混淆矩阵 E0/E1/E2 行 recall
-  连续 `--graduate-stable-epochs`=3 轮 ≥ 0.60/0.40/0.30 且 macro recall ≥ 0.50 才切；
-  切硬路由时 best_mae 重置。日志中 `target`（GT 尺度分布）vs `gate`（预测路由分布）
-  与硬路由使用率用于判断路由是否学偏。
+- **Warm-up**：默认前 3 epoch 使用固定均匀 gate，`router_grad=False`；
+  之后 `hard_route=True`、`router_grad=True`，训练 forward 每个候选严格只使用
+  一个 expert。可用 `--router-warmup-epochs 0` 跳过 warm-up。
+- **Gumbel-ST**：训练 hard gate 使用 `F.gumbel_softmax(..., hard=True)`；
+  forward 是 one-hot，backward 经 soft surrogate 回传 Router。温度只控制
+  backward 平滑度，共享 schedule 默认 `2.0 → 1.3 → 1.0`。
+- **软混合只作 diagnostic**：soft forward 仍用于每 epoch 对照，但不参与 H0
+  checkpoint 选择。hard validation 使用 deterministic argmax，无 Gumbel noise。
+- **日志**：记录 loss 分解、hard/soft MAE、gap/ratio、matched gate statistics、
+  train sampled usage、val deterministic usage、gate entropy 与 Router margin。
 
 ## 6. 与评估的关系
 
-soft 验证使用当前 epoch 的训练温度，hard 使用 `temperature=0.5`（argmax 不受温度影响）；
 人数 = `Σσ(logits)`。MoE 分支的计数不经过置信度阈值/NMS，因此 MAE/RMSE 可直接复现；
-`best_soft.pt` / `best_hard.pt` 分别按 phase 的 weighted normalized MAE 选取，Router 未毕业时
-不生成 `best_hard.pt`。评估脚本默认从 checkpoint 读取 `crop_size` 与其它训练配置。
+`best_hard.pt` 按 hard weighted normalized MAE 选取。评估脚本默认从 checkpoint
+读取 `crop_size`、`num_references` 与其它 H0 训练配置。
 
 ## 附录：v4 CrowdPointLoss（旧，对照用）
 
