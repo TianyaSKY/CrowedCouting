@@ -1,12 +1,13 @@
 """跨数据集分组评估：对多个数据集分别输出 MAE/RMSE。
 
-复用 test_each_dataset.py 的计数口径（hard 路由 + 全部候选点 Σsigmoid）
-与模型加载逻辑；按数据集各自汇总，另输出合并汇总表。
+默认使用 D2 deterministic Soft Top-2；``--mode`` 可切换 full3-soft 或
+deterministic Top-1。三种模式都采用全部候选点 ``Σsigmoid`` 计数口径。
 
 用法（在 GPU 机器上，从项目根目录）:
 
     python -m scripts.evaluation.evaluate_datasets \
-        --checkpoint runs/moe_point_all/best_hard.pt \
+        --checkpoint runs/moe_point_all/best_top2.pt \
+        --mode top2 \
         --dataset shanghaitech=datasets/shanghaitech_AB:val \
         --dataset jhu=datasets/jhu_crowd:val \
         --dataset qnrf=datasets/ucf_qnrf:test \
@@ -16,7 +17,7 @@
 UCF-CC-50 的 5 折需逐折指定（fold0_test..fold4_test），汇总时自行取均值。
 
 输出 <out-dir>/:
-    <name>/predictions.csv   逐图计数
+    <name>/predictions.csv  逐图计数
     <name>/summary.json      该数据集 MAE/RMSE/GT/Pred 汇总
     summary.json             全部数据集合并汇总
     evaluate.log             控制台日志副本
@@ -69,16 +70,14 @@ def evaluate_datasets(args: argparse.Namespace) -> None:
     model, metadata = load_checkpoint_model(
         args.checkpoint, args.weights, device
     )
-    temperature_schedule = metadata["temperature_schedule"]
-    if args.temperature is None:
-        if isinstance(temperature_schedule, dict):
-            temperature = float(
-                temperature_schedule.get("min_temperature", 0.5)
-            )
-        else:
-            temperature = 0.5
-    else:
-        temperature = args.temperature
+    checkpoint_temperature = float(
+        metadata["temperature"]
+    )
+    temperature = (
+        checkpoint_temperature
+        if args.temperature is None
+        else args.temperature
+    )
     crop_size = (
         args.imgsz
         if args.imgsz is not None
@@ -86,8 +85,8 @@ def evaluate_datasets(args: argparse.Namespace) -> None:
     )
     logging.info(
         "checkpoint: epoch=%s best_mae=%s metric=%s hidden=%s refs=%s "
-        "crop_size=%s temperature=%s hard_started=%s hard_route=%s "
-        "router_grad_epoch=%s scale_centers=%s",
+        "crop_size=%s temperature=%s mode=%s router_active=%s "
+        "router_start_epoch=%s dropout=%s active_experts=%s",
         metadata["epoch"],
         metadata["best_mae"],
         metadata["selection_metric"],
@@ -95,18 +94,15 @@ def evaluate_datasets(args: argparse.Namespace) -> None:
         metadata["num_references"],
         crop_size,
         temperature,
-        metadata["hard_started"],
-        metadata["hard_route"],
-        metadata["router_grad_epoch"],
-        metadata["scale_centers"],
+        args.mode,
+        metadata["router_active"],
+        metadata["router_start_epoch"],
+        metadata["expert_dropout"],
+        metadata["active_experts"],
     )
-    if (
-        not metadata["hard_started"]
-        or not metadata["hard_route"]
-    ):
+    if not metadata["router_active"]:
         logging.warning(
-            "当前 checkpoint 尚未完成 hard phase；测试仍请求 hard inference，"
-            "请优先使用 best_hard.pt。"
+            "当前 checkpoint 尚未启用 Router；仍按请求模式执行推理。"
         )
 
     specs = [parse_dataset_spec(s) for s in args.dataset]
@@ -147,10 +143,11 @@ def evaluate_datasets(args: argparse.Namespace) -> None:
                     predictions = model(
                         images,
                         temperature=temperature,
-                        hard_route=True,
-                        router_grad=False,
+                        routing_mode=args.mode,
                     )
-                pred_counts = predictions["logits"].sigmoid().sum(dim=1)
+                pred_counts = predictions["logits"].sigmoid().sum(
+                    dim=1
+                )
 
                 for i in range(len(gt_points)):
                     filename = os.path.basename(
@@ -171,7 +168,13 @@ def evaluate_datasets(args: argparse.Namespace) -> None:
 
         summary = metrics.as_dict()
         summary.update(
-            {"dataset": name, "root": root, "split": split}
+            {
+                "dataset": name,
+                "root": root,
+                "split": split,
+                "mode": args.mode,
+                "count_metric": f"{args.mode}_sum_sigmoid",
+            }
         )
         with open(
             os.path.join(out_ds, "summary.json"),
@@ -212,11 +215,13 @@ def evaluate_datasets(args: argparse.Namespace) -> None:
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="跨数据集分组评估（hard 路由 + Σsigmoid 计数）"
+        description=(
+            "跨数据集分组评估（full3-soft / deterministic Top-2 / Top-1）"
+        )
     )
     parser.add_argument(
         "--checkpoint", type=str, required=True,
-        help="MoE checkpoint 路径（优先使用 best_hard.pt）",
+        help="MoE checkpoint 路径（默认正式使用 best_top2.pt）",
     )
     parser.add_argument(
         "--weights", type=str, default="yolo11m.pt",
@@ -237,12 +242,21 @@ def parse_args():
         "--temperature",
         type=float,
         default=None,
-        help="覆盖 hard inference 温度；默认读取 checkpoint schedule",
+        help="覆盖推理温度；默认读取 checkpoint 保存的温度",
+    )
+    parser.add_argument(
+        "--mode",
+        choices=("full3_soft", "top2", "top1"),
+        default="top2",
+        help="确定性评估模式；默认 D2 主指标 Top-2",
     )
     parser.add_argument("--batch-size", type=int, default=16)
     parser.add_argument("--workers", type=int, default=4)
-    parser.add_argument("--out-dir", type=str,
-                        default="runs/eval_datasets")
+    parser.add_argument(
+        "--out-dir",
+        type=str,
+        default="runs/eval_datasets",
+    )
     return parser.parse_args()
 
 

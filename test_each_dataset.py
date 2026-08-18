@@ -1,14 +1,14 @@
-"""Evaluate YOLO11 + Scale-MoE crowd counting on ShanghaiTech subsets.
+"""Evaluate YOLO11 + D2 MoE crowd counting on ShanghaiTech subsets.
 
-The primary MAE uses the same counting definition as training validation:
-run the model with hard routing, then sum sigmoid foreground probabilities over
-all candidates for each image. Results are reported for Part A, Part B, and the
-whole requested split.
+The primary MAE uses deterministic Soft Top-2 routing, matching training
+validation. ``--mode`` also exposes full3-soft and deterministic Top-1
+diagnostics; all modes sum sigmoid foreground probabilities over candidates.
 
 Example:
     python test_each_dataset.py \
         --data-root datasets/shanghaitech_AB \
-        --checkpoint runs/moe_point/best_hard.pt \
+        --checkpoint runs/moe_point/best_top2.pt \
+        --mode top2 \
         --split val \
         --batch-size 16 \
         --out-dir runs/moe_point/test_eval
@@ -171,35 +171,57 @@ def load_checkpoint_model(
                 "init_temperature",
                 "phase1_temp",
                 "soft_temp_floor",
-                "min_temperature",
                 "temp_floor_epoch",
-                "hard_temp_epochs",
             )
             if name in checkpoint_args
         },
     )
     if not isinstance(temperature_schedule, dict):
         temperature_schedule = {}
-    hard_started = bool(
-        saved_value(
-            "hard_started",
-            checkpoint.get("hard_started", False),
+    checkpoint_temperature = float(
+        saved_config.get(
+            "temperature",
+            checkpoint.get(
+                "temperature",
+                temperature_schedule.get(
+                    "soft_temp_floor",
+                    1.0,
+                ),
+            ),
         )
     )
-    hard_route = bool(
+    router_active = bool(
         saved_value(
-            "hard_route",
-            checkpoint.get("hard_route", hard_started),
+            "router_active",
+            checkpoint.get("router_active", False),
         )
     )
-    router_grad_epoch = int(
+    router_start_epoch = int(
         saved_value(
-            "router_grad_epoch",
-            checkpoint_args.get("router_grad_epoch", 15),
+            "router_start_epoch",
+            checkpoint_args.get("router_start_epoch", 6),
         )
     )
-    expert_uniform_floor = float(
-        saved_value("expert_uniform_floor", 0.0)
+    router_training_mode = str(
+        saved_value(
+            "router_training_mode",
+            checkpoint.get(
+                "router_training_mode",
+                "task_only_drop1_soft_top2",
+            ),
+        )
+    )
+    expert_dropout = str(
+        saved_value(
+            "expert_dropout",
+            checkpoint.get("expert_dropout", "candidate_drop1"),
+        )
+    )
+    active_experts = int(
+        saved_value(
+            "active_experts",
+            checkpoint.get("active_experts", 2),
+        )
     )
     scale_centers = saved_value(
         "scale_centers",
@@ -229,11 +251,13 @@ def load_checkpoint_model(
         "hidden_channels": hidden_channels,
         "num_references": num_references,
         "crop_size": crop_size,
+        "temperature": checkpoint_temperature,
         "temperature_schedule": temperature_schedule,
-        "hard_started": hard_started,
-        "hard_route": hard_route,
-        "router_grad_epoch": router_grad_epoch,
-        "expert_uniform_floor": expert_uniform_floor,
+        "router_active": router_active,
+        "router_start_epoch": router_start_epoch,
+        "router_training_mode": router_training_mode,
+        "expert_dropout": expert_dropout,
+        "active_experts": active_experts,
         "scale_centers": [
             float(center) for center in scale_centers
         ],
@@ -265,18 +289,14 @@ def evaluate(args: argparse.Namespace) -> None:
         args.weights,
         device,
     )
-    temperature_schedule = checkpoint_metadata[
-        "temperature_schedule"
-    ]
-    if args.temperature is None:
-        if isinstance(temperature_schedule, dict):
-            temperature = float(
-                temperature_schedule.get("min_temperature", 0.5)
-            )
-        else:
-            temperature = 0.5
-    else:
-        temperature = args.temperature
+    checkpoint_temperature = float(
+        checkpoint_metadata["temperature"]
+    )
+    temperature = (
+        checkpoint_temperature
+        if args.temperature is None
+        else args.temperature
+    )
 
     crop_size = (
         args.imgsz
@@ -285,8 +305,8 @@ def evaluate(args: argparse.Namespace) -> None:
     )
     logging.info(
         "checkpoint: epoch=%s best_mae=%s metric=%s hidden=%s refs=%s "
-        "crop_size=%s temperature=%s hard_started=%s hard_route=%s "
-        "router_grad_epoch=%s scale_centers=%s",
+        "crop_size=%s temperature=%s mode=%s router_active=%s "
+        "router_start_epoch=%s dropout=%s active_experts=%s",
         checkpoint_metadata["epoch"],
         checkpoint_metadata["best_mae"],
         checkpoint_metadata["selection_metric"],
@@ -294,18 +314,15 @@ def evaluate(args: argparse.Namespace) -> None:
         checkpoint_metadata["num_references"],
         crop_size,
         temperature,
-        checkpoint_metadata["hard_started"],
-        checkpoint_metadata["hard_route"],
-        checkpoint_metadata["router_grad_epoch"],
-        checkpoint_metadata["scale_centers"],
+        args.mode,
+        checkpoint_metadata["router_active"],
+        checkpoint_metadata["router_start_epoch"],
+        checkpoint_metadata["expert_dropout"],
+        checkpoint_metadata["active_experts"],
     )
-    if (
-        not checkpoint_metadata["hard_started"]
-        or not checkpoint_metadata["hard_route"]
-    ):
+    if not checkpoint_metadata["router_active"]:
         logging.warning(
-            "当前 checkpoint 尚未完成 hard phase；测试仍请求 hard inference，"
-            "请优先使用 best_hard.pt。"
+            "当前 checkpoint 尚未启用 Router；仍按请求模式执行推理。"
         )
 
     base_dataset = PointDataset(
@@ -357,7 +374,7 @@ def evaluate(args: argparse.Namespace) -> None:
                 predictions = model(
                     images,
                     temperature=temperature,
-                    hard_route=True,
+                    routing_mode=args.mode,
                 )
                 pred_counts = (
                     predictions["logits"]
@@ -395,8 +412,7 @@ def evaluate(args: argparse.Namespace) -> None:
         raise RuntimeError("没有成功评估任何图像")
 
     summary = {
-        "split": args.split,
-        "count_metric": "hard_route_sum_sigmoid",
+        "count_metric": f"{args.mode}_sum_sigmoid",
         "temperature": temperature,
         "imgsz": crop_size,
         "checkpoint": args.checkpoint,
@@ -414,7 +430,10 @@ def evaluate(args: argparse.Namespace) -> None:
         json.dump(summary, summary_file, indent=2, ensure_ascii=False)
 
     logging.info("=" * 72)
-    logging.info("MoE 测试结果（hard route + sum(sigmoid)，与训练 hard_MAE 一致）")
+    logging.info(
+        "MoE 测试结果（%s + sum(sigmoid)）",
+        args.mode,
+    )
     for subset_name, display_name in (
         ("part_A", "Part A"),
         ("part_B", "Part B"),
@@ -430,7 +449,9 @@ def evaluate(args: argparse.Namespace) -> None:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="MoE 人群计数测试：分别输出 ShanghaiTech Part A/B MAE"
+        description=(
+            "MoE 人群计数测试：full3-soft / deterministic Top-2 / Top-1"
+        )
     )
     parser.add_argument(
         "--data-root",
@@ -447,8 +468,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--checkpoint",
         type=str,
-        default="runs/moe_point/best_hard.pt",
-        help="MoE checkpoint，默认使用 hard phase 的 best_hard.pt",
+        default="runs/moe_point/best_top2.pt",
+        help="MoE checkpoint，默认使用 best_top2.pt",
     )
     parser.add_argument(
         "--weights",
@@ -466,7 +487,13 @@ def parse_args() -> argparse.Namespace:
         "--temperature",
         type=float,
         default=None,
-        help="覆盖 hard inference 温度；默认读取 checkpoint schedule",
+        help="覆盖推理温度；默认读取 checkpoint 保存的温度",
+    )
+    parser.add_argument(
+        "--mode",
+        choices=("full3_soft", "top2", "top1"),
+        default="top2",
+        help="确定性评估模式；默认 D2 主指标 Top-2",
     )
     parser.add_argument(
         "--batch-size",

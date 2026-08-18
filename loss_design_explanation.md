@@ -79,24 +79,27 @@ $$
 
 ## 5. 训练时的路由动态（train_moe.py）
 
-- **Warm-up**：默认前 3 epoch 使用固定均匀 gate，`router_grad=False`；
-  之后 `hard_route=True`、`router_grad=True`，训练 forward 每个候选严格只使用
-  一个 expert。可用 `--router-warmup-epochs 0` 跳过 warm-up。
-- **Gumbel-ST**：训练 hard gate 使用 `F.gumbel_softmax(..., hard=True)`；
-  forward 是 one-hot，backward 经 soft surrogate 回传 Router。温度只控制
-  backward 平滑度，共享 schedule 默认 `2.0 → 1.3 → 1.0`。
-- **软混合只作 diagnostic**：soft forward 仍用于每 epoch 对照，但不参与 H0
-  checkpoint 选择。hard validation 使用 deterministic argmax，无 Gumbel noise。
-- **日志**：记录 loss 分解、hard/soft MAE、gap/ratio、matched probability mean、
-  matched sampled Top-1 usage、train sampled usage、val matched deterministic usage、
-  matched/train/val entropy 与 matched/train/val Router margin。warm-up 期间两个
-  sampled usage 均显示为 `N/A (uniform warmup)`。
+- **D2 warm-up**：默认前 6 epoch 使用 candidate-level Random Drop-1，Router
+  不更新。Epoch 1–3 backbone frozen；Epoch 4–6 backbone trainable；Epoch 7+
+  Router 和 backbone 都 trainable。warm-up 剩余两个 expert 固定 `0.5/0.5`。
+- **Router-active Drop-1**：Router 只决定随机保留下来的两个 expert 之间的
+  相对权重，使用 masked softmax；每个 candidate 始终恰好两个非零 gate。
+  三个 expert 都先执行，第一版不做 sparse dispatch。
+- **双概率**：`route_probabilities` 是未 Drop-1 的完整三专家 softmax，用于
+  matched probability/entropy/margin 诊断；`gates` 是实际混合 gate。
+- **温度**：Router 启用时重新计数，默认 `T=2.0 → 1.5 → 1.0`，对应
+  Router epoch 0/15/30。训练不使用 Gumbel-ST。
+- **验证**：每 epoch 计算 full3-soft、deterministic Top-2 和 diagnostic-only
+  Top-1；`best_top2.pt` 按 Top-2 weighted normalized MAE 选取。
+- **日志**：记录 full3 matched probability mean、entropy、margin、deterministic
+  Top-1 usage、Drop-1 frequency、active exposure、masked gate mean，以及定期
+  的三个 expert-only MAE。
 
 ## 6. 与评估的关系
 
 人数 = `Σσ(logits)`。MoE 分支的计数不经过置信度阈值/NMS，因此 MAE/RMSE 可直接复现；
-`best_hard.pt` 按 hard weighted normalized MAE 选取。评估脚本默认从 checkpoint
-读取 `crop_size`、`num_references` 与其它 H0 训练配置。
+`best_top2.pt` 按 Top-2 weighted normalized MAE 选取。评估脚本默认从 checkpoint
+读取 `crop_size`、`num_references`、保存的温度与 D2 Router 配置。
 
 ## 附录：v4 CrowdPointLoss（旧，对照用）
 

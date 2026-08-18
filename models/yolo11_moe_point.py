@@ -36,16 +36,16 @@ class YOLO11MoEPoint(nn.Module):
         self,
         image: torch.Tensor,
         temperature: float = 1.0,
-        hard_route: bool = False,
+        routing_mode: str = "full3_soft",
         router_grad: bool = True,
-        expert_uniform_floor: float = 0.0,
+        expert_index: int | None = None,
     ) -> dict[str, torch.Tensor]:
         features = self.yolo(image)
 
         return self.point_head(
             features,
             temperature=temperature,
-            hard_route=hard_route,
+            routing_mode=routing_mode,
             router_grad=router_grad,
-            expert_uniform_floor=expert_uniform_floor,
+            expert_index=expert_index,
         )

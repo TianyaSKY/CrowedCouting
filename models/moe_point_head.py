@@ -121,11 +121,22 @@ class MoEPointHead(nn.Module):
     输出：
         logits: [B, Q]          每个候选点的前景 logit
         points: [B, Q, 2]       解码后的人员坐标（像素）
-        gates:  [B, Q, 3]       每个候选点的路由权重
+        gates:  [B, Q, 3]       当前 forward 实际使用的路由权重
         base_points: [B, Q, 2]  未加偏移的参考点坐标（像素）
         route_logits: [B, K, 3, H, W]  原始路由 logits（未归一化）
-        route_probabilities: [B, K, 3, H, W] 温度缩放后的 soft surrogate
+        route_probabilities: [B, K, 3, H, W] 完整三专家 softmax，
+            不受 Drop-1 或验证模式影响
+        dropped_expert: [B, Q] 训练 Drop-1 的候选级被丢弃专家
+        active_expert_mask: [B, Q, 3] 当前 forward 中活跃的专家
+
+    ``routing_mode`` 支持：
+        ``train_drop1``: 训练时每个候选随机丢弃一个专家；
+        ``full3_soft``: 验证用完整三专家 softmax；
+        ``top2``: 验证用确定性 Soft Top-2；
+        ``top1``: 验证诊断用确定性 Top-1；
+        ``expert_only``: 诊断时只启用 ``expert_index``。
     """
+
 
     def __init__(
         self,
@@ -221,17 +232,103 @@ class MoEPointHead(nn.Module):
             persistent=False,
         )
 
+    def _drop_one_expert(
+        self,
+        route_logits: torch.Tensor,
+        temperature: float,
+        router_grad: bool,
+    ) -> tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+    ]:
+        """Return candidate-level random Drop-1 gates and masks."""
+        batch_size, _, _, height, width = route_logits.shape
+        dropped_expert = torch.randint(
+            self.num_experts,
+            (batch_size, self.num_references, height, width),
+            device=route_logits.device,
+        )
+        dropped_mask = F.one_hot(
+            dropped_expert,
+            num_classes=self.num_experts,
+        ).permute(0, 1, 4, 2, 3).to(dtype=torch.bool)
+        if router_grad:
+            masked_logits = route_logits.masked_fill(
+                dropped_mask,
+                float("-inf"),
+            )
+            gate = F.softmax(
+                masked_logits / temperature,
+                dim=2,
+            )
+            active_mask = ~dropped_mask
+            gate = gate.masked_fill(~active_mask, 0.0)
+            gate = gate + (
+                active_mask.to(dtype=gate.dtype)
+                * torch.finfo(gate.dtype).tiny
+            )
+            gate = gate / gate.sum(dim=2, keepdim=True)
+        else:
+            gate = (
+                (~dropped_mask).to(dtype=route_logits.dtype)
+                / float(self.num_experts - 1)
+            )
+        return gate, dropped_expert, dropped_mask
+
+    @staticmethod
+    def _deterministic_top2_gate(
+        soft_gate: torch.Tensor,
+    ) -> torch.Tensor:
+        active_indices = soft_gate.topk(
+            k=2,
+            dim=2,
+        ).indices
+        active_mask = torch.zeros_like(
+            soft_gate,
+            dtype=torch.bool,
+        ).scatter_(
+            2,
+            active_indices,
+            True,
+        )
+        gate = soft_gate.masked_fill(~active_mask, 0.0)
+        gate = gate + (
+            active_mask.to(dtype=gate.dtype)
+            * torch.finfo(gate.dtype).tiny
+        )
+        return gate / gate.sum(dim=2, keepdim=True)
+
     def forward(
         self,
         features: list[torch.Tensor],
         temperature: float = 1.0,
-        hard_route: bool = False,
+        routing_mode: str = "full3_soft",
         router_grad: bool = True,
-        expert_uniform_floor: float = 0.0,
+        expert_index: int | None = None,
     ) -> dict[str, torch.Tensor]:
         p3, p4, p5 = features
-        # 保留旧调用面的参数兼容性；task-only 版本不再使用 floor。
-        _ = expert_uniform_floor
+        if temperature <= 0:
+            raise ValueError("temperature 必须为正数")
+        valid_modes = {
+            "train_drop1",
+            "full3_soft",
+            "top2",
+            "top1",
+            "expert_only",
+        }
+        if routing_mode not in valid_modes:
+            raise ValueError(
+                f"未知 routing_mode={routing_mode!r}；"
+                f"可选值为 {sorted(valid_modes)}"
+            )
+        if routing_mode == "expert_only" and (
+            expert_index is None
+            or not 0 <= expert_index < self.num_experts
+        ):
+            raise ValueError(
+                "routing_mode='expert_only' 时 expert_index 必须为 0、1 或 2"
+            )
 
         f3 = self.proj3(p3)
 
@@ -267,40 +364,69 @@ class MoEPointHead(nn.Module):
             width,
         )
 
-        soft_gate = F.softmax(
+        # 始终保留完整三专家概率，供 task-only 诊断使用。
+        route_probabilities = F.softmax(
             route_logits / temperature,
             dim=2,
         )
 
-        # Epoch 1~warm-up 使用精确均匀 gate；warm-up 之后训练使用
-        # Gumbel-ST hard routing，验证使用确定性 Top-1。
-        if self.training and not router_grad and not hard_route:
-            gate = torch.full_like(
-                soft_gate,
-                1.0 / self.num_experts,
-            )
-        elif hard_route:
-            if self.training:
-                gate = F.gumbel_softmax(
+        dropped_expert = torch.full(
+            (
+                batch_size,
+                self.num_references,
+                height,
+                width,
+            ),
+            -1,
+            dtype=torch.long,
+            device=route_logits.device,
+        )
+        dropped_mask = torch.zeros_like(
+            route_logits,
+            dtype=torch.bool,
+        )
+
+        if routing_mode == "train_drop1":
+            gate, dropped_expert, dropped_mask = (
+                self._drop_one_expert(
                     route_logits,
-                    tau=temperature,
-                    hard=True,
-                    dim=2,
+                    temperature,
+                    router_grad,
                 )
-            else:
-                expert_index = soft_gate.argmax(
-                    dim=2,
-                    keepdim=True,
-                )
-                gate = torch.zeros_like(
-                    soft_gate
-                ).scatter_(
-                    2,
-                    expert_index,
-                    1.0,
-                )
+            )
+        elif routing_mode == "full3_soft":
+            gate = route_probabilities
+        elif routing_mode == "top2":
+            gate = self._deterministic_top2_gate(
+                route_probabilities
+            )
+        elif routing_mode == "top1":
+            expert_index_tensor = route_probabilities.argmax(
+                dim=2,
+                keepdim=True,
+            )
+            gate = torch.zeros_like(route_probabilities).scatter_(
+                2,
+                expert_index_tensor,
+                1.0,
+            )
         else:
-            gate = soft_gate
+            gate = torch.zeros_like(route_probabilities).scatter_(
+                2,
+                torch.full(
+                    (
+                        batch_size,
+                        self.num_references,
+                        1,
+                        height,
+                        width,
+                    ),
+                    expert_index,
+                    dtype=torch.long,
+                    device=route_logits.device,
+                ),
+                1.0,
+            )
 
         expert_scores = torch.stack(
             [score3, score4, score5],
@@ -312,22 +438,18 @@ class MoEPointHead(nn.Module):
             dim=2,
         )
 
-        # warm-up 使用常量 gate；hard 训练的 one-hot gate 由
-        # Gumbel-ST 携带 soft surrogate 的 Router 梯度。
-        mix_gate = gate
-
         # soft diagnostic 在概率空间混合: p = sum(g * sigmoid(z))，再转回 logit，
         # 避免 logits 线性混合时专家置信度相互抵消。
         expert_probabilities = expert_scores.sigmoid()
         mixed_probability = (
-            mix_gate * expert_probabilities
+            gate * expert_probabilities
         ).sum(dim=2).clamp(1e-7, 1.0 - 1e-7)
         final_logits = torch.log(
             mixed_probability
         ) - torch.log1p(-mixed_probability)
 
         final_offsets = (
-            mix_gate.unsqueeze(3) * expert_offsets
+            gate.unsqueeze(3) * expert_offsets
         ).sum(dim=2)
 
         # 展平顺序：H、W、K。
@@ -340,6 +462,20 @@ class MoEPointHead(nn.Module):
         ).reshape(batch_size, -1, 2)
 
         final_gates = gate.permute(
+            0, 3, 4, 1, 2
+        ).reshape(
+            batch_size,
+            -1,
+            self.num_experts,
+        )
+        final_dropped_expert = dropped_expert.permute(
+            0, 2, 3, 1
+        ).reshape(batch_size, -1)
+        final_active_expert_mask = (
+            (~dropped_mask)
+            if routing_mode == "train_drop1"
+            else gate > 0
+        ).permute(
             0, 3, 4, 1, 2
         ).reshape(
             batch_size,
@@ -394,5 +530,7 @@ class MoEPointHead(nn.Module):
                 -1,
             ),
             "route_logits": route_logits,
-            "route_probabilities": soft_gate,
+            "route_probabilities": route_probabilities,
+            "dropped_expert": final_dropped_expert,
+            "active_expert_mask": final_active_expert_mask,
         }

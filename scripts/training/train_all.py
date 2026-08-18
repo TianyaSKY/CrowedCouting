@@ -169,10 +169,10 @@ def mean_gt_count(dataset: PointDataset) -> float:
 
 
 def weighted_normalized_mae(
-    per_dataset: dict[str, tuple[float, float]],
+    per_dataset: dict[str, dict[str, float]],
     val_mean_gt_counts: dict[str, float],
     val_image_counts: dict[str, int],
-    mode_index: int,
+    mode: str,
 ) -> float:
     """Normalize each dataset MAE, then weight by validation image count."""
     total_images = sum(
@@ -182,7 +182,7 @@ def weighted_normalized_mae(
         return float("inf")
     return sum(
         val_image_counts[name]
-        * per_dataset[name][mode_index]
+        * per_dataset[name][mode]
         / val_mean_gt_counts[name]
         for name in per_dataset
     ) / total_images
@@ -191,11 +191,6 @@ def weighted_normalized_mae(
 def train_all(args: argparse.Namespace) -> None:
     if args.router_warmup_epochs < 0:
         raise ValueError("--router-warmup-epochs 不能为负数")
-    if args.force_hard_epoch is not None:
-        logging.warning(
-            "--force-hard-epoch 已废弃；H0 在 Router warm-up 后自动 "
-            "使用 Gumbel hard，参数被忽略"
-        )
 
     # 未显式指定输出目录时自动加时间戳；--resume 沿用原 run 目录。
     if args.save_dir is None:
@@ -262,19 +257,19 @@ def train_all(args: argparse.Namespace) -> None:
                 eval_split,
             )
 
-    # 覆盖保护：从头训练进入已有 save-dir 时备份旧 best_hard。
+    # 覆盖保护：从头训练进入已有 save-dir 时备份旧 best_top2。
     if not args.resume:
         old_best = os.path.join(
-            args.save_dir, "best_hard.pt"
+            args.save_dir, "best_top2.pt"
         )
         if os.path.exists(old_best):
             backup = os.path.join(
-                args.save_dir, "best_hard_prev.pt"
+                args.save_dir, "best_top2_prev.pt"
             )
             if not os.path.exists(backup):
                 shutil.copy2(old_best, backup)
                 logging.info(
-                    f"旧 best_hard.pt 已备份到 {backup}"
+                    f"旧 best_top2.pt 已备份到 {backup}"
                 )
 
     model = YOLO11MoEPoint(
@@ -367,6 +362,9 @@ def train_all(args: argparse.Namespace) -> None:
     start_epoch = 0
     best_selection_score = float("inf")
 
+    for param in model.point_head.router.parameters():
+        param.requires_grad = False
+
     if args.resume and os.path.exists(args.resume):
         logging.info(f"从 {args.resume} 恢复训练")
         checkpoint = torch.load(
@@ -376,12 +374,12 @@ def train_all(args: argparse.Namespace) -> None:
         if (
             not isinstance(saved_config, dict)
             or saved_config.get("router_training_mode")
-            != "task_only_gumbel_hard"
+            != "task_only_drop1_soft_top2"
         ):
             raise ValueError(
-                "H0 只能从 router_training_mode="
-                "'task_only_gumbel_hard' checkpoint 恢复；"
-                "禁止从 Unsup-v0 soft-only checkpoint resume"
+                "D2 只能从 router_training_mode="
+                "'task_only_drop1_soft_top2' checkpoint 恢复；"
+                "禁止从旧 H0 或 soft-only checkpoint resume"
             )
         try:
             model.load_state_dict(checkpoint["model"])
@@ -409,37 +407,35 @@ def train_all(args: argparse.Namespace) -> None:
         )
 
         old_best = os.path.join(
-            args.save_dir, "best_hard.pt"
+            args.save_dir, "best_top2.pt"
         )
         if os.path.exists(old_best):
             backup = os.path.join(
-                args.save_dir, "best_hard_pre_resume.pt"
+                args.save_dir, "best_top2_pre_resume.pt"
             )
             if not os.path.exists(backup):
                 shutil.copy2(old_best, backup)
                 logging.info(
-                    f"旧 best_hard.pt 已备份到 {backup}"
+                    f"旧 best_top2.pt 已备份到 {backup}"
                 )
         if start_epoch >= args.freeze_epochs:
             for param in model.yolo.parameters():
+                param.requires_grad = True
+        if start_epoch >= args.router_warmup_epochs:
+            for param in model.point_head.router.parameters():
                 param.requires_grad = True
 
     for epoch in range(start_epoch, args.epochs):
         router_warmup = (
             epoch < args.router_warmup_epochs
         )
-        if router_warmup:
-            hard_route = False
-            router_grad = False
-            routing_mode = "warmup_uniform"
-        else:
-            hard_route = True
-            router_grad = True
-            routing_mode = "train_gumbel_hard"
+        router_active = not router_warmup
+        router_grad = router_active
+        routing_mode = "train_drop1"
         temperature = tm.temperature_for_epoch(
             epoch,
-            hard_route,
-            None,
+            router_active,
+            args.router_warmup_epochs,
             args,
         )
         if (
@@ -450,6 +446,13 @@ def train_all(args: argparse.Namespace) -> None:
                 param.requires_grad = True
             logging.info(
                 "解冻 YOLO Backbone+Neck（保留优化器状态）"
+            )
+        if epoch == args.router_warmup_epochs:
+            for param in model.point_head.router.parameters():
+                param.requires_grad = True
+            logging.info(
+                "启用 Router task-only Drop-1 soft Top-2 "
+                "（温度从 T_router=2.0 重新开始）"
             )
 
         model.train()
@@ -471,6 +474,17 @@ def train_all(args: argparse.Namespace) -> None:
         train_sampled_usage = torch.zeros(
             3, dtype=torch.int64, device=device
         )
+        train_dropped_experts = torch.zeros(
+            3, dtype=torch.int64, device=device
+        )
+        train_active_exposure = torch.zeros(
+            3, dtype=torch.int64, device=device
+        )
+        train_gate_sum = torch.zeros(
+            3, device=device
+        )
+        train_candidate_count = 0
+
         train_gate_entropy_sum = torch.zeros(
             (), device=device
         )
@@ -494,8 +508,29 @@ def train_all(args: argparse.Namespace) -> None:
             predictions = model(
                 images,
                 temperature=temperature,
-                hard_route=hard_route,
+                routing_mode=routing_mode,
                 router_grad=router_grad,
+            )
+            dropped_expert = predictions[
+                "dropped_expert"
+            ].reshape(-1)
+            train_dropped_experts += torch.bincount(
+                dropped_expert,
+                minlength=3,
+            )
+            active_expert_mask = predictions[
+                "active_expert_mask"
+            ]
+            train_active_exposure += (
+                active_expert_mask.sum(dim=(0, 1))
+                .to(dtype=torch.int64)
+            )
+            train_gate_sum += predictions["gates"].sum(
+                dim=(0, 1)
+            ).detach()
+            train_candidate_count += int(
+                predictions["gates"].shape[0]
+                * predictions["gates"].shape[1]
             )
             (
                 batch_usage,
@@ -551,8 +586,9 @@ def train_all(args: argparse.Namespace) -> None:
             for name in loss_sums
         }
 
-        per_dataset = {}
-        hard_usage_sum = torch.zeros(
+        per_dataset: dict[str, dict[str, float]] = {}
+        expert_only_by_dataset = {}
+        full3_top1_usage_sum = torch.zeros(
             3, dtype=torch.int64, device=device
         )
         confusion_sum = torch.zeros(
@@ -567,21 +603,11 @@ def train_all(args: argparse.Namespace) -> None:
         )
         val_gate_points = 0
         for name, val_loader in val_loaders.items():
-            (
-                soft_mae,
-                hard_mae,
-                hard_usage,
-                route_confusion,
-                matched,
-                dataset_gate_entropy,
-                dataset_gate_margin,
-                dataset_gate_points,
-            ) = tm.evaluate_count_mae(
+            validation = tm.evaluate_count_mae(
                 model,
                 val_loader,
                 device,
-                soft_temperature=temperature,
-                hard_temperature=temperature,
+                temperature=temperature,
                 knn_k=criterion.knn_k,
                 scale_centers=criterion.scale_centers,
                 scale_sigma_octaves=criterion.scale_sigma_octaves,
@@ -589,48 +615,96 @@ def train_all(args: argparse.Namespace) -> None:
                     args.diagnose_scale_routing
                 ),
             )
-            per_dataset[name] = (soft_mae, hard_mae)
-            hard_usage_sum += hard_usage
-            val_gate_entropy_sum += dataset_gate_entropy
-            val_gate_margin_sum += dataset_gate_margin
-            val_gate_points += dataset_gate_points
+            per_dataset[name] = validation["mae"]
+            full3_top1_usage_sum += validation[
+                "full3_top1_usage"
+            ]
+            val_gate_entropy_sum += validation[
+                "full3_gate_entropy_sum"
+            ]
+            val_gate_margin_sum += validation[
+                "full3_gate_margin_sum"
+            ]
+            val_gate_points += validation[
+                "full3_gate_points"
+            ]
+            matched_sum += validation["matched_points"]
             if args.diagnose_scale_routing:
-                confusion_sum += route_confusion
-                matched_sum += matched
+                confusion_sum += validation[
+                    "route_confusion"
+                ]
+            if (
+                args.expert_only_eval_interval > 0
+                and (epoch + 1)
+                % args.expert_only_eval_interval
+                == 0
+            ):
+                expert_only_by_dataset[name] = (
+                    tm.evaluate_expert_only_mae(
+                        model,
+                        val_loader,
+                        device,
+                        temperature=temperature,
+                    )
+                )
 
-        soft_raw_macro = sum(
-            value[0] for value in per_dataset.values()
-        ) / len(per_dataset)
-        hard_raw_macro = sum(
-            value[1] for value in per_dataset.values()
-        ) / len(per_dataset)
-        soft_norm_macro = sum(
-            per_dataset[name][0] / val_mean_gt_counts[name]
+        dataset_count = max(len(per_dataset), 1)
+        full3_raw_macro = sum(
+            value["full3"]
+            for value in per_dataset.values()
+        ) / dataset_count
+        top2_raw_macro = sum(
+            value["top2"]
+            for value in per_dataset.values()
+        ) / dataset_count
+        top1_raw_macro = sum(
+            value["top1"]
+            for value in per_dataset.values()
+        ) / dataset_count
+        full3_norm_macro = sum(
+            per_dataset[name]["full3"]
+            / val_mean_gt_counts[name]
             for name in per_dataset
-        ) / len(per_dataset)
-        hard_norm_macro = sum(
-            per_dataset[name][1] / val_mean_gt_counts[name]
+        ) / dataset_count
+        top2_norm_macro = sum(
+            per_dataset[name]["top2"]
+            / val_mean_gt_counts[name]
             for name in per_dataset
-        ) / len(per_dataset)
-        soft_weighted_norm_mae = weighted_normalized_mae(
+        ) / dataset_count
+        top1_norm_macro = sum(
+            per_dataset[name]["top1"]
+            / val_mean_gt_counts[name]
+            for name in per_dataset
+        ) / dataset_count
+        full3_weighted_norm_mae = weighted_normalized_mae(
             per_dataset,
             val_mean_gt_counts,
             val_image_counts,
-            0,
+            "full3",
         )
-        hard_weighted_norm_mae = weighted_normalized_mae(
+        top2_weighted_norm_mae = weighted_normalized_mae(
             per_dataset,
             val_mean_gt_counts,
             val_image_counts,
-            1,
+            "top2",
         )
-        hard_soft_gap = (
-            hard_weighted_norm_mae
-            - soft_weighted_norm_mae
+        top1_weighted_norm_mae = weighted_normalized_mae(
+            per_dataset,
+            val_mean_gt_counts,
+            val_image_counts,
+            "top1",
         )
-        hard_soft_ratio = (
-            hard_weighted_norm_mae
-            / max(soft_weighted_norm_mae, 1e-12)
+        top2_full3_gap = (
+            top2_weighted_norm_mae
+            - full3_weighted_norm_mae
+        )
+        top1_top2_gap = (
+            top1_weighted_norm_mae
+            - top2_weighted_norm_mae
+        )
+        top2_full3_ratio = (
+            top2_weighted_norm_mae
+            / max(full3_weighted_norm_mae, 1e-12)
         )
 
         matched_probability_mean = (
@@ -653,45 +727,48 @@ def train_all(args: argparse.Namespace) -> None:
             val_gate_margin_sum
             / max(val_gate_points, 1)
         ).item()
-        if router_warmup:
-            train_usage_pct = None
-            train_usage_string = "N/A (uniform warmup)"
-            train_sampled_usage_checkpoint = None
-        else:
-            train_usage_pct = (
-                train_sampled_usage.float()
-                / max(int(train_sampled_usage.sum()), 1)
-                * 100
-            )
-            train_usage_string = (
-                f"E0:{train_usage_pct[0]:.1f}% "
-                f"E1:{train_usage_pct[1]:.1f}% "
-                f"E2:{train_usage_pct[2]:.1f}%"
-            )
-            train_sampled_usage_checkpoint = (
-                train_sampled_usage.detach().cpu()
-            )
         matched_top1_usage = (
             matched_top1_sum
             / max(matched_gate_points, 1)
         )
-        if router_warmup:
-            matched_top1_usage_string = (
-                "N/A (uniform warmup)"
-            )
-            matched_top1_usage_checkpoint = None
-        else:
-            matched_top1_usage_string = (
-                f"E0:{matched_top1_usage[0] * 100:.1f}% "
-                f"E1:{matched_top1_usage[1] * 100:.1f}% "
-                f"E2:{matched_top1_usage[2] * 100:.1f}%"
-            )
-            matched_top1_usage_checkpoint = (
-                matched_top1_usage.detach().cpu()
-            )
-        val_usage_pct = (
-            hard_usage_sum.float()
-            / max(int(hard_usage_sum.sum()), 1)
+        matched_top1_usage_string = (
+            f"E0:{matched_top1_usage[0] * 100:.1f}% "
+            f"E1:{matched_top1_usage[1] * 100:.1f}% "
+            f"E2:{matched_top1_usage[2] * 100:.1f}%"
+        )
+        matched_top1_usage_checkpoint = (
+            matched_top1_usage.detach().cpu()
+        )
+        train_usage_pct = (
+            train_sampled_usage.float()
+            / max(int(train_sampled_usage.sum()), 1)
+            * 100
+        )
+        train_usage_string = (
+            f"E0:{train_usage_pct[0]:.1f}% "
+            f"E1:{train_usage_pct[1]:.1f}% "
+            f"E2:{train_usage_pct[2]:.1f}%"
+        )
+        train_sampled_usage_checkpoint = (
+            train_sampled_usage.detach().cpu()
+        )
+        full3_top1_usage_pct = (
+            full3_top1_usage_sum.float()
+            / max(int(full3_top1_usage_sum.sum()), 1)
+            * 100
+        )
+        train_gate_mean = (
+            train_gate_sum
+            / max(train_candidate_count, 1)
+        )
+        dropped_frequency_pct = (
+            train_dropped_experts.float()
+            / max(int(train_dropped_experts.sum()), 1)
+            * 100
+        )
+        active_exposure_pct = (
+            train_active_exposure.float()
+            / max(train_candidate_count, 1)
             * 100
         )
         router_entropy = (
@@ -704,58 +781,87 @@ def train_all(args: argparse.Namespace) -> None:
         ).item()
 
         per_dataset_str = " | ".join(
-            f"{name}: soft={value[0]:.3f}/"
-            f"{value[0] / val_mean_gt_counts[name]:.4f} "
-            f"hard={value[1]:.3f}/"
-            f"{value[1] / val_mean_gt_counts[name]:.4f}"
+            f"{name}: full3={value['full3']:.3f}/"
+            f"{value['full3'] / val_mean_gt_counts[name]:.4f} "
+            f"top2={value['top2']:.3f}/"
+            f"{value['top2'] / val_mean_gt_counts[name]:.4f} "
+            f"top1={value['top1']:.3f}/"
+            f"{value['top1'] / val_mean_gt_counts[name]:.4f}"
             for name, value in per_dataset.items()
         )
+
         logging.info(
             f"[Epoch {epoch + 1}/{args.epochs}] "
             f"loss={avg_loss:.4f} "
             f"cls={avg_loss_items['cls']:.4f} "
             f"point={avg_loss_items['point']:.4f} "
             f"count={avg_loss_items['count']:.4f} "
-            f"T={temperature:.2f} "
+            f"T_router={temperature:.2f} "
             f"routing={routing_mode} "
-            f"router_warmup={router_warmup} "
-            f"hard_raw_macro={hard_raw_macro:.3f} "
-            f"hard_norm_macro={hard_norm_macro:.6f} "
-            f"hard_weighted_norm_mae="
-            f"{hard_weighted_norm_mae:.6f} "
-            f"soft_raw_macro={soft_raw_macro:.3f} "
-            f"soft_norm_macro={soft_norm_macro:.6f} "
-            f"soft_weighted_norm_mae="
-            f"{soft_weighted_norm_mae:.6f} "
-            f"hard_soft_gap={hard_soft_gap:.6f} "
-            f"hard_soft_ratio={hard_soft_ratio:.4f}"
+            f"router_active={router_active} "
+            f"MAE_full3={full3_raw_macro:.3f}/"
+            f"{full3_weighted_norm_mae:.6f} "
+            f"MAE_top2={top2_raw_macro:.3f}/"
+            f"{top2_weighted_norm_mae:.6f} "
+            f"MAE_top1={top1_raw_macro:.3f}/"
+            f"{top1_weighted_norm_mae:.6f} "
+            f"top2_full3_gap={top2_full3_gap:.6f} "
+            f"top1_top2_gap={top1_top2_gap:.6f}"
         )
         logging.info("  分数据集: %s", per_dataset_str)
         logging.info(
-            "  matched probability mean="
+            "  full3 matched probability mean="
             "E0:%.1f%% E1:%.1f%% E2:%.1f%% "
-            "| matched sampled Top-1=%s "
-            "| train sampled usage=%s "
-            "| val matched deterministic usage="
-            "E0:%.1f%% E1:%.1f%% E2:%.1f%% "
-            "| matched entropy=%.4f matched margin=%.4f "
-            "| train entropy=%.4f val entropy=%.4f "
-            "| train margin=%.4f val margin=%.4f",
+            "| full3 entropy=%.4f margin=%.4f "
+            "| full3 deterministic Top-1="
+            "E0:%.1f%% E1:%.1f%% E2:%.1f%%",
             matched_probability_mean[0] * 100,
             matched_probability_mean[1] * 100,
             matched_probability_mean[2] * 100,
-            matched_top1_usage_string,
-            train_usage_string,
-            val_usage_pct[0],
-            val_usage_pct[1],
-            val_usage_pct[2],
-            router_entropy,
-            matched_router_margin,
-            train_gate_entropy,
             val_gate_entropy,
-            train_gate_margin,
             val_gate_margin,
+            full3_top1_usage_pct[0],
+            full3_top1_usage_pct[1],
+            full3_top1_usage_pct[2],
         )
+        logging.info(
+            "  dropped frequency="
+            "E0:%.1f%% E1:%.1f%% E2:%.1f%% "
+            "| active exposure="
+            "E0:%.1f%% E1:%.1f%% E2:%.1f%% "
+            "| masked gate mean="
+            "E0:%.3f E1:%.3f E2:%.3f",
+            dropped_frequency_pct[0],
+            dropped_frequency_pct[1],
+            dropped_frequency_pct[2],
+            active_exposure_pct[0],
+            active_exposure_pct[1],
+            active_exposure_pct[2],
+            train_gate_mean[0],
+            train_gate_mean[1],
+            train_gate_mean[2],
+        )
+        logging.info(
+            "  train sampled usage=%s "
+            "| train entropy=%.4f margin=%.4f "
+            "| matched train gate Top-1=%s",
+            train_usage_string,
+            train_gate_entropy,
+            train_gate_margin,
+            matched_top1_usage_string,
+        )
+        if expert_only_by_dataset:
+            expert_only_string = " | ".join(
+                f"{name}: E0={values['E0']:.3f} "
+                f"E1={values['E1']:.3f} "
+                f"E2={values['E2']:.3f}"
+                for name, values
+                in expert_only_by_dataset.items()
+            )
+            logging.info(
+                "  expert-only MAE: %s",
+                expert_only_string,
+            )
 
         if args.diagnose_scale_routing and matched_sum > 0:
             confusion_pct = (
@@ -791,73 +897,91 @@ def train_all(args: argparse.Namespace) -> None:
         writer.add_scalar("loss/point", avg_loss_items["point"], epoch)
         writer.add_scalar("loss/count", avg_loss_items["count"], epoch)
 
-        writer.add_scalar("mae/hard_raw_macro", hard_raw_macro, epoch)
-        writer.add_scalar("mae/soft_raw_macro", soft_raw_macro, epoch)
-        writer.add_scalar("mae/hard_norm_macro", hard_norm_macro, epoch)
-        writer.add_scalar("mae/soft_norm_macro", soft_norm_macro, epoch)
+        writer.add_scalar("mae/full3_raw_macro", full3_raw_macro, epoch)
+        writer.add_scalar("mae/top2_raw_macro", top2_raw_macro, epoch)
+        writer.add_scalar("mae/top1_raw_macro", top1_raw_macro, epoch)
         writer.add_scalar(
-            "mae/hard_weighted_norm", hard_weighted_norm_mae, epoch
+            "mae/full3_weighted_norm",
+            full3_weighted_norm_mae,
+            epoch,
         )
         writer.add_scalar(
-            "mae/soft_weighted_norm", soft_weighted_norm_mae, epoch
+            "mae/top2_weighted_norm",
+            top2_weighted_norm_mae,
+            epoch,
         )
-        writer.add_scalar("mae/hard_soft_gap", hard_soft_gap, epoch)
-        writer.add_scalar("mae/hard_soft_ratio", hard_soft_ratio, epoch)
-
-        for name, (ds_soft_mae, ds_hard_mae) in per_dataset.items():
+        writer.add_scalar(
+            "mae/top1_weighted_norm",
+            top1_weighted_norm_mae,
+            epoch,
+        )
+        writer.add_scalar(
+            "mae/top2_full3_gap",
+            top2_full3_gap,
+            epoch,
+        )
+        writer.add_scalar(
+            "mae/top2_full3_ratio",
+            top2_full3_ratio,
+            epoch,
+        )
+        for name, values in per_dataset.items():
             normalizer = val_mean_gt_counts[name]
-            writer.add_scalar(
-                f"mae/{name}/soft_raw", ds_soft_mae, epoch
-            )
-            writer.add_scalar(
-                f"mae/{name}/hard_raw", ds_hard_mae, epoch
-            )
-            writer.add_scalar(
-                f"mae/{name}/soft_norm",
-                ds_soft_mae / normalizer,
-                epoch,
-            )
-            writer.add_scalar(
-                f"mae/{name}/hard_norm",
-                ds_hard_mae / normalizer,
-                epoch,
-            )
+            for mode in ("full3", "top2", "top1"):
+                writer.add_scalar(
+                    f"mae/{name}/{mode}_raw",
+                    values[mode],
+                    epoch,
+                )
+                writer.add_scalar(
+                    f"mae/{name}/{mode}_norm",
+                    values[mode] / normalizer,
+                    epoch,
+                )
 
-        writer.add_scalar("schedule/temperature", temperature, epoch)
-        writer.add_scalar("schedule/hard_route", float(hard_route), epoch)
-
+        writer.add_scalar("schedule/router_temperature", temperature, epoch)
+        writer.add_scalar(
+            "schedule/router_active",
+            float(router_active),
+            epoch,
+        )
         writer.add_scalar("routing/train_entropy", train_gate_entropy, epoch)
         writer.add_scalar("routing/train_margin", train_gate_margin, epoch)
-        writer.add_scalar("routing/val_entropy", val_gate_entropy, epoch)
-        writer.add_scalar("routing/val_margin", val_gate_margin, epoch)
+        writer.add_scalar("routing/full3_entropy", val_gate_entropy, epoch)
+        writer.add_scalar("routing/full3_margin", val_gate_margin, epoch)
         writer.add_scalar("routing/matched_entropy", router_entropy, epoch)
         writer.add_scalar(
             "routing/matched_margin", matched_router_margin, epoch
         )
-
-        val_usage_total = max(int(hard_usage_sum.sum()), 1)
         for expert_index in range(3):
             writer.add_scalar(
-                f"routing/val_usage_E{expert_index}_pct",
-                hard_usage_sum[expert_index].item()
-                / val_usage_total
-                * 100,
+                f"routing/full3_top1_usage_E{expert_index}_pct",
+                float(full3_top1_usage_pct[expert_index]),
                 epoch,
             )
-        if not router_warmup:
-            train_usage_total = max(
-                int(train_sampled_usage.sum()), 1
+            writer.add_scalar(
+                f"routing/drop_frequency_E{expert_index}_pct",
+                float(dropped_frequency_pct[expert_index]),
+                epoch,
             )
+            writer.add_scalar(
+                f"routing/active_exposure_E{expert_index}_pct",
+                float(active_exposure_pct[expert_index]),
+                epoch,
+            )
+            writer.add_scalar(
+                f"routing/train_masked_gate_E{expert_index}",
+                float(train_gate_mean[expert_index]),
+                epoch,
+            )
+        for name, values in expert_only_by_dataset.items():
             for expert_index in range(3):
                 writer.add_scalar(
-                    f"routing/train_usage_E{expert_index}_pct",
-                    train_sampled_usage[expert_index].item()
-                    / train_usage_total
-                    * 100,
+                    f"mae/{name}/expert_only_E{expert_index}",
+                    values[f"E{expert_index}"],
                     epoch,
                 )
-
-        val_score_for_best = hard_weighted_norm_mae
+        val_score_for_best = top2_weighted_norm_mae
         improved = (
             not router_warmup
             and val_score_for_best < best_selection_score
@@ -865,7 +989,7 @@ def train_all(args: argparse.Namespace) -> None:
         if improved:
             best_selection_score = val_score_for_best
             best_path = os.path.join(
-                args.save_dir, "best_hard.pt"
+                args.save_dir, "best_top2.pt"
             )
         else:
             best_path = None
@@ -876,62 +1000,68 @@ def train_all(args: argparse.Namespace) -> None:
             "epoch": epoch,
             "best_mae": best_selection_score,
             "best_selection_score": best_selection_score,
-            "best_hard_selection_score": (
-                best_selection_score
-            ),
             "selection_metric": (
-                "hard weighted normalized MAE"
+                "top2 weighted normalized MAE"
             ),
-            "hard_started": bool(hard_route),
-            "hard_route": bool(hard_route),
-            "training_hard_route": bool(hard_route),
+            "MAE_full3": full3_raw_macro,
+            "MAE_top2": top2_raw_macro,
+            "MAE_top1": top1_raw_macro,
+            "full3_raw_macro": full3_raw_macro,
+            "top2_raw_macro": top2_raw_macro,
+            "top1_raw_macro": top1_raw_macro,
+            "full3_norm_macro": full3_norm_macro,
+            "top2_norm_macro": top2_norm_macro,
+            "top1_norm_macro": top1_norm_macro,
+            "full3_weighted_norm_mae": (
+                full3_weighted_norm_mae
+            ),
+            "top2_weighted_norm_mae": (
+                top2_weighted_norm_mae
+            ),
+            "top1_weighted_norm_mae": (
+                top1_weighted_norm_mae
+            ),
+            "top2_full3_gap": top2_full3_gap,
+            "top1_top2_gap": top1_top2_gap,
+            "top2_full3_ratio": top2_full3_ratio,
             "per_dataset": per_dataset,
+            "expert_only_mae": expert_only_by_dataset,
             "val_image_counts": val_image_counts,
             "val_mean_gt_counts": val_mean_gt_counts,
-            "soft_raw_macro": soft_raw_macro,
-            "soft_norm_macro": soft_norm_macro,
-            "soft_weighted_norm_mae": (
-                soft_weighted_norm_mae
-            ),
-            "hard_raw_macro": hard_raw_macro,
-            "hard_norm_macro": hard_norm_macro,
-            "hard_weighted_norm_mae": (
-                hard_weighted_norm_mae
-            ),
-            "hard_soft_gap": hard_soft_gap,
-            "hard_soft_ratio": hard_soft_ratio,
-            "matched_probability_mean": (
+            "full3_matched_probability_mean": (
                 matched_probability_mean.detach().cpu()
             ),
             "matched_top1_usage": (
                 matched_top1_usage_checkpoint
             ),
-            "gate_entropy": val_gate_entropy,
-            "gate_margin": val_gate_margin,
+            "full3_top1_usage": (
+                full3_top1_usage_sum.detach().cpu()
+            ),
+            "full3_gate_entropy": val_gate_entropy,
+            "full3_gate_margin": val_gate_margin,
             "matched_gate_entropy": router_entropy,
             "matched_gate_margin": matched_router_margin,
             "train_gate_entropy": train_gate_entropy,
             "train_gate_margin": train_gate_margin,
-            "val_gate_entropy": val_gate_entropy,
-            "val_gate_margin": val_gate_margin,
-            "train_gate_distribution": (
-                train_sampled_usage_checkpoint
-            ),
             "train_sampled_usage": (
                 train_sampled_usage_checkpoint
             ),
-            "val_matched_deterministic_usage": (
-                hard_usage_sum.detach().cpu()
+            "train_dropped_expert_frequency": (
+                dropped_frequency_pct.detach().cpu()
             ),
-            "val_deterministic_usage": (
-                hard_usage_sum.detach().cpu()
+            "train_active_exposure": (
+                active_exposure_pct.detach().cpu()
             ),
-            "val_hard_expert_usage": (
-                hard_usage_sum.detach().cpu()
+            "train_masked_gate_mean": (
+                train_gate_mean.detach().cpu()
             ),
             "router_training_mode": (
-                "task_only_gumbel_hard"
+                "task_only_drop1_soft_top2"
             ),
+            "expert_dropout": "candidate_drop1",
+            "active_experts": 2,
+            "router_start_epoch": args.router_warmup_epochs,
+            "router_active": bool(router_active),
             "router_warmup_epochs": (
                 args.router_warmup_epochs
             ),
@@ -949,13 +1079,13 @@ def train_all(args: argparse.Namespace) -> None:
                 args,
                 criterion,
                 temperature=temperature,
-                hard_route=hard_route,
+                router_active=router_active,
             ),
         }
         if improved:
             torch.save(checkpoint_data, best_path)
             logging.info(
-                f"  -> 新的最佳 hard weighted normalized MAE: "
+                f"  -> 新的最佳 top2 weighted normalized MAE: "
                 f"{best_selection_score:.6f} ({best_path})"
             )
 
@@ -973,7 +1103,7 @@ def build_parser():
     parser = tm.build_parser()
     parser.description = (
         "在全部数据集上联合训练（batch 混合 + 逐数据集验证）；"
-        "Router warm-up 后使用 Gumbel-ST hard"
+        "candidate Drop-1 + Soft Top-2"
     )
     parser.add_argument(
         "--dataset", type=str, action="append", default=[],

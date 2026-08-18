@@ -225,7 +225,7 @@ def predict_batch(args):
                 predictions = model(
                     tensor,
                     temperature=0.5,
-                    hard_route=True,
+                    routing_mode="top2",
                 )
 
             scores = predictions["logits"].sigmoid()[0]
@@ -388,8 +388,8 @@ def parse_args():
     )
     parser.add_argument(
         "--checkpoint", type=str,
-        default="runs/moe_point/best_hard.pt",
-        help="训练好的 Hard-Only MoE checkpoint"
+        default="runs/moe_point/best_top2.pt",
+        help="训练好的 D2 best_top2.pt checkpoint"
     )
     parser.add_argument(
         "--imgsz", type=int, default=640,
