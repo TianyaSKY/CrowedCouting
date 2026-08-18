@@ -803,10 +803,10 @@ def train_moe(args):
         model.train()
         total_loss = 0.0
         num_batches = 0
-        matched_gate_sum = torch.zeros(
+        matched_probability_sum = torch.zeros(
             3, device=device
         )
-        matched_gate_top1_sum = torch.zeros(
+        matched_top1_sum = torch.zeros(
             3, device=device
         )
         train_sampled_usage = torch.zeros(
@@ -864,11 +864,11 @@ def train_moe(args):
                 image_size=images.shape[-2:],
             )
 
-            matched_gate_sum += loss_items[
-                "matched_gate_hist"
+            matched_probability_sum += loss_items[
+                "matched_probability_sum"
             ].to(device)
-            matched_gate_top1_sum += loss_items[
-                "matched_gate_top1_hist"
+            matched_top1_sum += loss_items[
+                "matched_top1_hist"
             ].to(device)
             matched_gate_points += int(
                 loss_items["matched_gate_count"].item()
@@ -943,12 +943,12 @@ def train_moe(args):
             / max(soft_weighted_norm_mae, 1e-12)
         )
 
-        gate_mean = (
-            matched_gate_sum
+        matched_probability_mean = (
+            matched_probability_sum
             / max(matched_gate_points, 1)
         )
-        top1_usage = (
-            matched_gate_top1_sum
+        matched_top1_usage = (
+            matched_top1_sum
             / max(matched_gate_points, 1)
         )
         matched_router_margin = (
@@ -975,11 +975,36 @@ def train_moe(args):
             val_gate_margin_sum
             / max(val_gate_points, 1)
         ).item()
-        train_usage_pct = (
-            train_sampled_usage.float()
-            / max(int(train_sampled_usage.sum()), 1)
-            * 100
-        )
+        if router_warmup:
+            train_usage_pct = None
+            train_usage_string = "N/A (uniform warmup)"
+            train_sampled_usage_checkpoint = None
+            matched_top1_usage_string = (
+                "N/A (uniform warmup)"
+            )
+            matched_top1_usage_checkpoint = None
+        else:
+            train_usage_pct = (
+                train_sampled_usage.float()
+                / max(int(train_sampled_usage.sum()), 1)
+                * 100
+            )
+            train_usage_string = (
+                f"E0:{train_usage_pct[0]:.1f}% "
+                f"E1:{train_usage_pct[1]:.1f}% "
+                f"E2:{train_usage_pct[2]:.1f}%"
+            )
+            train_sampled_usage_checkpoint = (
+                train_sampled_usage.detach().cpu()
+            )
+            matched_top1_usage_string = (
+                f"E0:{matched_top1_usage[0] * 100:.1f}% "
+                f"E1:{matched_top1_usage[1] * 100:.1f}% "
+                f"E2:{matched_top1_usage[2] * 100:.1f}%"
+            )
+            matched_top1_usage_checkpoint = (
+                matched_top1_usage.detach().cpu()
+            )
         val_usage_pct = (
             hard_usage.float()
             / max(int(hard_usage.sum()), 1)
@@ -1007,23 +1032,20 @@ def train_moe(args):
             f"hard_soft_ratio={hard_soft_ratio:.4f}"
         )
         logging.info(
-            "  matched gate mean=E0:%.1f%% E1:%.1f%% E2:%.1f%% "
-            "| matched top1=E0:%.1f%% E1:%.1f%% E2:%.1f%% "
-            "| train sampled usage=E0:%.1f%% E1:%.1f%% E2:%.1f%% "
+            "  matched probability mean="
+            "E0:%.1f%% E1:%.1f%% E2:%.1f%% "
+            "| matched sampled Top-1=%s "
+            "| train sampled usage=%s "
             "| val matched deterministic usage="
             "E0:%.1f%% E1:%.1f%% E2:%.1f%% "
             "| matched entropy=%.4f matched margin=%.4f "
             "| train entropy=%.4f val entropy=%.4f "
             "| train margin=%.4f val margin=%.4f",
-            gate_mean[0] * 100,
-            gate_mean[1] * 100,
-            gate_mean[2] * 100,
-            top1_usage[0] * 100,
-            top1_usage[1] * 100,
-            top1_usage[2] * 100,
-            train_usage_pct[0],
-            train_usage_pct[1],
-            train_usage_pct[2],
+            matched_probability_mean[0] * 100,
+            matched_probability_mean[1] * 100,
+            matched_probability_mean[2] * 100,
+            matched_top1_usage_string,
+            train_usage_string,
             val_usage_pct[0],
             val_usage_pct[1],
             val_usage_pct[2],
@@ -1099,8 +1121,12 @@ def train_moe(args):
             ),
             "hard_soft_gap": hard_soft_gap,
             "hard_soft_ratio": hard_soft_ratio,
-            "gate_mean": gate_mean.detach().cpu(),
-            "top1_usage": top1_usage.detach().cpu(),
+            "matched_probability_mean": (
+                matched_probability_mean.detach().cpu()
+            ),
+            "matched_top1_usage": (
+                matched_top1_usage_checkpoint
+            ),
             "gate_entropy": val_gate_entropy,
             "gate_margin": val_gate_margin,
             "matched_gate_entropy": router_entropy,
@@ -1110,7 +1136,7 @@ def train_moe(args):
             "val_gate_entropy": val_gate_entropy,
             "val_gate_margin": val_gate_margin,
             "train_sampled_usage": (
-                train_sampled_usage.detach().cpu()
+                train_sampled_usage_checkpoint
             ),
             "val_matched_deterministic_usage": (
                 hard_usage.detach().cpu()

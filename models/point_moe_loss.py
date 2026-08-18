@@ -140,8 +140,12 @@ class PointMoELoss(nn.Module):
         # 只统计 Hungarian 匹配到的正样本，避免背景候选污染
         # Router 分布和熵诊断。这里不对 route logits 计算独立
         # 监督，也不产生任何 Router 监督项。
-        matched_gate_hist = logits.new_zeros(num_experts)
-        matched_gate_top1_hist = logits.new_zeros(num_experts)
+        matched_probability_sum = logits.new_zeros(
+            num_experts
+        )
+        matched_top1_hist = logits.new_zeros(
+            num_experts
+        )
         matched_gate_entropy = logits.new_zeros(())
         matched_gate_margin = logits.new_zeros(())
         matched_gate_points = 0
@@ -242,8 +246,10 @@ class PointMoELoss(nn.Module):
                 matched_probabilities = route_probabilities[
                     batch_index
                 ][matched_full_indices].detach()
-                matched_gate_hist += matched_gates.sum(dim=0)
-                matched_gate_top1_hist += (
+                matched_probability_sum += (
+                    matched_probabilities.sum(dim=0)
+                )
+                matched_top1_hist += (
                     matched_gates.argmax(dim=-1)
                     .bincount(minlength=num_experts)
                     .to(dtype=logits.dtype)
@@ -297,9 +303,11 @@ class PointMoELoss(nn.Module):
             "cls": cls_loss.detach(),
             "point": point_loss.detach(),
             "count": count_loss.detach(),
-            "matched_gate_hist": matched_gate_hist.detach(),
-            "matched_gate_top1_hist": (
-                matched_gate_top1_hist.detach()
+            "matched_probability_sum": (
+                matched_probability_sum.detach()
+            ),
+            "matched_top1_hist": (
+                matched_top1_hist.detach()
             ),
             "matched_gate_count": logits.new_tensor(
                 matched_gate_points,

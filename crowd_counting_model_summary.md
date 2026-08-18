@@ -89,8 +89,9 @@ $$
 不产生 Router 梯度，也不改变 task-only loss。
 
 `scale_centers = (10, 20, 40) px`，`scale_sigma_octaves = 0.6`；日志另外记录
-matched gate mean、matched Top-1 usage、train sampled usage、val matched
-deterministic usage、matched/train/val gate entropy 和 Router margin。
+matched probability mean、matched sampled Top-1 usage、train sampled usage、
+val matched deterministic usage、matched/train/val gate entropy 和 Router
+margin。warm-up 期间两个 sampled usage 均显示为 `N/A (uniform warmup)`。
 
 ## 4. 训练与评估口径（train_moe.py）
 

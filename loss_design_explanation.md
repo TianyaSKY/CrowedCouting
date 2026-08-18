@@ -87,9 +87,10 @@ $$
   backward 平滑度，共享 schedule 默认 `2.0 → 1.3 → 1.0`。
 - **软混合只作 diagnostic**：soft forward 仍用于每 epoch 对照，但不参与 H0
   checkpoint 选择。hard validation 使用 deterministic argmax，无 Gumbel noise。
-- **日志**：记录 loss 分解、hard/soft MAE、gap/ratio、matched gate statistics、
-  train sampled usage、val matched deterministic usage、matched/train/val entropy
-  与 matched/train/val Router margin。
+- **日志**：记录 loss 分解、hard/soft MAE、gap/ratio、matched probability mean、
+  matched sampled Top-1 usage、train sampled usage、val matched deterministic usage、
+  matched/train/val entropy 与 matched/train/val Router margin。warm-up 期间两个
+  sampled usage 均显示为 `N/A (uniform warmup)`。
 
 ## 6. 与评估的关系
 
