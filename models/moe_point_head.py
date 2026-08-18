@@ -229,6 +229,8 @@ class MoEPointHead(nn.Module):
         expert_uniform_floor: float = 0.0,
     ) -> dict[str, torch.Tensor]:
         p3, p4, p5 = features
+        # 保留旧调用面的参数兼容性；task-only 版本不再使用 floor。
+        _ = expert_uniform_floor
 
         f3 = self.proj3(p3)
 
@@ -247,7 +249,7 @@ class MoEPointHead(nn.Module):
         )
 
         # 每个专家只接收自身尺度的特征（E3 精细 / E4 中层 / E5 大范围），
-        # 横向融合 alpha*F3 初始为 0，防止专家输入同质化
+        # 横向融合 alpha*F3 初始为 0，防止专家输入同质化。
         score3, offset3 = self.expert3(f3)
         score4, offset4 = self.expert4(f4 + self.alpha4 * f3)
         score5, offset5 = self.expert5(f5 + self.alpha5 * f3)
@@ -269,12 +271,19 @@ class MoEPointHead(nn.Module):
             dim=2,
         )
 
-        if hard_route:
+        # Epoch 1~warm-up 使用精确均匀 gate；warm-up 之后直接使用
+        # softmax gate，task loss 的梯度自然回传到 Router。这里不
+        # detach gate，也不叠加 uniform floor。
+        if self.training and not router_grad and not hard_route:
+            gate = torch.full_like(
+                soft_gate,
+                1.0 / self.num_experts,
+            )
+        elif hard_route:
             expert_index = soft_gate.argmax(
                 dim=2,
                 keepdim=True,
             )
-
             hard_gate = torch.zeros_like(
                 soft_gate
             ).scatter_(
@@ -284,7 +293,8 @@ class MoEPointHead(nn.Module):
             )
 
             if self.training:
-                # Straight-through Top-1：前向走硬路由，梯度经软路由回传
+                # Straight-through Top-1 仅保留为显式 hard 前向的
+                # 兼容路径；Unsup-v0 训练循环始终传 hard_route=False。
                 gate = (
                     hard_gate
                     + soft_gate
@@ -305,25 +315,12 @@ class MoEPointHead(nn.Module):
             dim=2,
         )
 
-        # 梯度隔离：router_grad=False 时，混合用的 gate 不携带梯度，
-        # cls/point/count 不会通过 gate 反向传播到 Router（避免
-        # winner-take-all 正反馈）。训练 warm-up 期间保留 uniform floor，
-        # 让每个专家都拿到最低限度的 task gradient；floor 本身不向
-        # Router 回传梯度。评估或 hard route 不使用该 floor。
-        if router_grad:
-            mix_gate = gate
-        elif self.training and not hard_route:
-            floor = min(max(float(expert_uniform_floor), 0.0), 1.0)
-            mix_gate = (
-                (1.0 - floor) * gate.detach()
-                + floor / self.num_experts
-            )
-        else:
-            mix_gate = gate.detach()
+        # soft gate 始终携带 task gradient；warm-up 的常量 gate 不携带
+        # Router 梯度，但仍让三个 expert 得到完全相同的混合权重。
+        mix_gate = gate
 
         # soft 阶段在概率空间混合: p = sum(g * sigmoid(z))，再转回 logit，
-        # 避免 logits 线性混合时专家置信度相互抵消；硬路由 one-hot 时
-        # logit(sigmoid(z_j)) = z_j，退化为原来的单专家 logit
+        # 避免 logits 线性混合时专家置信度相互抵消。
         expert_probabilities = expert_scores.sigmoid()
         mixed_probability = (
             mix_gate * expert_probabilities
@@ -336,7 +333,7 @@ class MoEPointHead(nn.Module):
             mix_gate.unsqueeze(3) * expert_offsets
         ).sum(dim=2)
 
-        # 展平顺序：H、W、K
+        # 展平顺序：H、W、K。
         final_logits = final_logits.permute(
             0, 2, 3, 1
         ).reshape(batch_size, -1)

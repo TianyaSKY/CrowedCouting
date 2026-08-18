@@ -36,30 +36,19 @@ def sigmoid_focal_loss(
 
 
 class PointMoELoss(nn.Module):
-    """点级 Scale-MoE Head 的损失函数。
+    """点级 MoE Head 的 task-only 损失函数。
 
-    总损失：
-        L = L_cls + 5 * L_point + 0.05 * L_count + 0.05 * L_route
+    训练目标只包含分类、定位和计数：
 
-    匹配流程（对 Router 处理后的最终候选点）：
-        网络输出所有最终候选点
-            -> 按置信度取 top-K 作为匹配候选（K = max(match_top_k, n_gt)，
-               避免 n_gt x Q(25600) 的匈牙利指派在密集裁剪上卡死）
-            -> 计算候选点与真实点之间的代价
-            -> 匈牙利一对一匹配
-            -> 匹配候选点为正样本，未匹配候选点为负样本
+        L = L_cls + 5 * L_point + 0.05 * L_count
 
-    L_route 为尺度路由监督：对每个匹配正样本，用 GT 点的最近邻间距
-    （knn_k=1）估计局部尺度，映射为三专家软目标（小间距->精细 E3，
-    大间距->大范围 E5），与 Router logits 做交叉熵。替代原先强制 1/3
-    均匀使用的 balance loss，让 Router 学到数据驱动的尺度语义。
+    ``scale_targets`` 保留给可选的尺度路由诊断，但不参与训练。
     """
 
     def __init__(
         self,
         coordinate_weight: float = 5.0,
         count_weight: float = 0.05,
-        route_weight: float = 0.05,
         knn_k: int = 1,
         scale_centers: tuple[float, float, float] = (
             10.0,
@@ -73,7 +62,6 @@ class PointMoELoss(nn.Module):
 
         self.coordinate_weight = coordinate_weight
         self.count_weight = count_weight
-        self.route_weight = route_weight
         self.knn_k = knn_k
         self.scale_centers = scale_centers
         self.scale_sigma_octaves = scale_sigma_octaves
@@ -86,13 +74,7 @@ class PointMoELoss(nn.Module):
         scale_centers: tuple[float, float, float],
         scale_sigma_octaves: float,
     ) -> torch.Tensor:
-        """GT 像素坐标 -> 三专家软目标。
-
-        用第 knn_k 近邻间距（默认 1，即最近邻间距）估计每个 GT 点的
-        局部尺度，在对数尺度空间做高斯映射：间距小（密集人群）-> E3
-        精细，间距大（稀疏/大目标）-> E5 大范围。返回 [N, 3] 的
-        归一化软目标。
-        """
+        """GT 像素坐标 -> 三专家软目标（仅诊断使用）。"""
         gt_distances = torch.cdist(gt, gt)
 
         kth_distances = gt_distances.sort(
@@ -131,17 +113,10 @@ class PointMoELoss(nn.Module):
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
         logits = predictions["logits"]
         points = predictions["points"]
-        route_logits = predictions["route_logits"]
         gates = predictions["gates"]
         batch_size = logits.shape[0]
         image_height, image_width = image_size
-
-        num_experts = route_logits.shape[2]
-
-        # 展平顺序与 head 中 final_gates 一致: [B, H, W, K, E] -> [B, Q, E]
-        route_logits_flat = route_logits.permute(
-            0, 3, 4, 1, 2
-        ).reshape(batch_size, -1, num_experts)
+        num_experts = gates.shape[2]
 
         scale = points.new_tensor(
             [float(image_width), float(image_height)]
@@ -150,24 +125,15 @@ class PointMoELoss(nn.Module):
         cls_loss = logits.new_zeros(())
         point_loss = logits.new_zeros(())
         count_loss = logits.new_zeros(())
-        # Route CE is accumulated across all matched GT points in this
-        # batch, then macro-averaged by target class.  Averaging inside each
-        # image would give a small image the same Router weight as a dense
-        # image and make the effective class balance depend on image order.
-        route_class_sums = [
-            logits.new_zeros(()) for _ in range(num_experts)
-        ]
-        route_class_counts = [0 for _ in range(num_experts)]
 
-        # 只统计 Hungarian 匹配到的正样本 gate，避免 25,600 个候选
-        # 中的大量背景点污染 Router 分布与熵诊断。
+        # 只统计 Hungarian 匹配到的正样本，避免背景候选污染
+        # Router 分布和熵诊断。这里不读取 route logits，也不产生
+        # 任何独立的 Router 监督。
         matched_gate_hist = logits.new_zeros(num_experts)
+        matched_gate_top1_hist = logits.new_zeros(num_experts)
         matched_gate_entropy = logits.new_zeros(())
         matched_gate_points = 0
 
-        # 诊断：GT 尺度目标的 argmax 分布，与预测 gate 分布对比
-        target_gate_hist = logits.new_zeros(num_experts)
-        target_gate_points = 0
         for batch_index in range(batch_size):
             gt = ground_truth_points[batch_index].to(
                 points.device
@@ -175,27 +141,22 @@ class PointMoELoss(nn.Module):
 
             pred_logits = logits[batch_index]
             pred_points = points[batch_index]
-
             number_of_gt = gt.shape[0]
 
             targets = torch.zeros_like(pred_logits)
 
             if number_of_gt > 0:
                 # 匹配候选：只对置信度最高的 top-K 做匈牙利匹配，
-                # 否则 n_gt x Q(25600) 的线性指派在密集裁剪上会卡死
-                # （实测单张 1407 个 GT 的裁剪可挂住数分钟）。
-                # K = max(match_top_k, n_gt) 保证每个 GT 仍能匹配到一个候选。
+                # 否则 n_gt x Q 的线性指派在密集裁剪上会卡死。
                 match_logits = pred_logits
                 match_points = pred_points
                 match_indices = None
-
                 top_k = max(self.match_top_k, number_of_gt)
 
                 if pred_logits.shape[0] > top_k:
                     match_indices = pred_logits.topk(
                         top_k
                     ).indices
-
                     match_logits = pred_logits[
                         match_indices
                     ]
@@ -216,11 +177,9 @@ class PointMoELoss(nn.Module):
                     normalized_pred,
                     p=1,
                 )
-
                 confidence_cost = (
                     -match_logits.sigmoid().unsqueeze(0)
                 )
-
                 total_cost = (
                     5.0 * coordinate_cost
                     + confidence_cost
@@ -240,7 +199,6 @@ class PointMoELoss(nn.Module):
                     dtype=torch.long,
                     device=points.device,
                 )
-
                 pred_indices = torch.as_tensor(
                     pred_indices,
                     dtype=torch.long,
@@ -261,73 +219,30 @@ class PointMoELoss(nn.Module):
                         normalized_pred[pred_indices],
                         normalized_gt[gt_indices],
                         reduction="sum",
-                        # 归一化坐标下典型定位误差 ~0.005(≈2px/384)，
-                        # 默认 beta=1.0 使所有误差落入二次区，损失被压到
-                        # ~1e-5 量级、定位分支几乎没有梯度；
-                        # beta=0.02(≈8px) 让 2-8px 误差走线性/准线性区
                         beta=0.02,
                     )
                     / number_of_gt
                 )
 
-                # 尺度路由监督：GT 局部最近邻间距 -> 专家软目标 -> Router CE。
-                # 间距小(密集人群) -> 精细 E3，间距大(稀疏/大目标) -> 大范围 E5。
-                # 需要至少 knn_k+1 个点才能计算第 knn_k 近邻。
-                if number_of_gt >= self.knn_k + 1:
-                    target_gate = self.scale_targets(
-                        gt,
-                        self.knn_k,
-                        self.scale_centers,
-                        self.scale_sigma_octaves,
-                    )
-
-                    target_gate_hist += target_gate.argmax(
-                        dim=1
-                    ).bincount(minlength=num_experts).float()
-                    target_gate_points += number_of_gt
-                    matched_gates = gates[batch_index][
-                        matched_full_indices
-                    ].detach()
-                    matched_gate_hist += matched_gates.sum(
-                        dim=0
-                    )
-                    safe_matched_gates = matched_gates.clamp_min(
-                        1e-8
-                    )
-                    matched_gate_entropy += -(
-                        safe_matched_gates
-                        * safe_matched_gates.log()
-                    ).sum()
-                    matched_gate_points += number_of_gt
-
-                    matched_route = route_logits_flat[
-                        batch_index
-                    ][matched_full_indices]
-
-                    # batch-level macro 类别平衡：先收集当前 batch 的
-                    # 所有 matched GT route CE，按 E0/E1/E2 分组求均值，
-                    # 再对 batch 中出现的类别做 macro average。
-                    per_point_route = -(
-                        target_gate[gt_indices]
-                        * F.log_softmax(
-                            matched_route, dim=-1
-                        )
-                    ).sum(dim=-1)
-
-                    hard_target = target_gate[
-                        gt_indices
-                    ].argmax(dim=-1)
-
-                    for expert_id in range(num_experts):
-                        mask = hard_target == expert_id
-                        if mask.any():
-                            route_class_sums[expert_id] = (
-                                route_class_sums[expert_id]
-                                + per_point_route[mask].sum()
-                            )
-                            route_class_counts[expert_id] += int(
-                                mask.sum().item()
-                            )
+                matched_gates = gates[batch_index][
+                    matched_full_indices
+                ].detach()
+                matched_gate_hist += matched_gates.sum(dim=0)
+                matched_gate_top1_hist += (
+                    matched_gates.argmax(dim=-1)
+                    .bincount(minlength=num_experts)
+                    .to(dtype=logits.dtype)
+                )
+                safe_matched_gates = matched_gates.clamp_min(
+                    1e-8
+                )
+                matched_gate_entropy += -(
+                    safe_matched_gates
+                    * safe_matched_gates.log()
+                ).sum()
+                matched_gate_points += int(
+                    matched_full_indices.numel()
+                )
 
             cls_loss = cls_loss + (
                 sigmoid_focal_loss(
@@ -338,7 +253,6 @@ class PointMoELoss(nn.Module):
             )
 
             soft_count = pred_logits.sigmoid().sum()
-
             count_loss = count_loss + (
                 torch.abs(
                     soft_count - float(number_of_gt)
@@ -349,40 +263,24 @@ class PointMoELoss(nn.Module):
         cls_loss = cls_loss / batch_size
         point_loss = point_loss / batch_size
         count_loss = count_loss / batch_size
-        route_terms = [
-            route_class_sums[expert_id]
-            / route_class_counts[expert_id]
-            for expert_id in range(num_experts)
-            if route_class_counts[expert_id] > 0
-        ]
-        route_loss = (
-            torch.stack(route_terms).mean()
-            if route_terms
-            else logits.new_zeros(())
-        )
 
         total_loss = (
             cls_loss
             + self.coordinate_weight * point_loss
             + self.count_weight * count_loss
-            + self.route_weight * route_loss
         )
 
         return total_loss, {
             "cls": cls_loss.detach(),
             "point": point_loss.detach(),
             "count": count_loss.detach(),
-            "route": route_loss.detach(),
-            "gate_target": (
-                target_gate_hist / max(target_gate_points, 1)
-            ).detach(),
-            "gate_target_hist": target_gate_hist.detach(),
-            "gate_target_count": logits.new_tensor(
-                target_gate_points, dtype=logits.dtype
-            ),
             "matched_gate_hist": matched_gate_hist.detach(),
+            "matched_gate_top1_hist": (
+                matched_gate_top1_hist.detach()
+            ),
             "matched_gate_count": logits.new_tensor(
-                matched_gate_points, dtype=logits.dtype
+                matched_gate_points,
+                dtype=logits.dtype,
             ),
             "matched_gate_entropy": matched_gate_entropy.detach(),
         }

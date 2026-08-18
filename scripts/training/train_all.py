@@ -1,10 +1,9 @@
 """在所有数据集上联合训练（batch 混合）+ 逐数据集验证。
 
 训练数据 = 各数据集 train split 的 ConcatDataset（按图片自然采样），
-验证 = 每个数据集各自跑 soft/hard MAE；Router 毕业判定用各数据集
-混淆矩阵之和。best_soft.pt / best_hard.pt 按验证图片数加权的
-normalized MAE 选取，macro normalized MAE 仅作为跨数据集泛化参考。
-官方 test 只允许在训练结束后评估。
+验证 = 每个数据集各自跑 soft/hard MAE；hard 只作为验证指标。
+best_soft.pt 按验证图片数加权的 normalized MAE 选取，macro normalized
+MAE 仅作为跨数据集泛化参考。官方 test 只允许在训练结束后评估。
 
 用法（GPU 机器，从项目根目录）:
 
@@ -189,7 +188,14 @@ def weighted_normalized_mae(
 
 
 def train_all(args: argparse.Namespace) -> None:
-    # 未显式指定输出目录时自动加时间戳；--resume 沿用原 run 目录
+    if args.router_warmup_epochs < 0:
+        raise ValueError("--router-warmup-epochs 不能为负数")
+    if args.force_hard_epoch is not None:
+        logging.warning(
+            "--force-hard-epoch 已废弃；Unsup-v0 全程 soft，参数被忽略"
+        )
+
+    # 未显式指定输出目录时自动加时间戳；--resume 沿用原 run 目录。
     if args.save_dir is None:
         if args.resume:
             args.save_dir = os.path.dirname(
@@ -205,8 +211,7 @@ def train_all(args: argparse.Namespace) -> None:
     logging.info("输出目录: %s", args.save_dir)
     if args.resume:
         logging.warning(
-            "resume 仅用于调试；正式修复实验必须从 yolo11m.pt 新开 run，"
-            "避免继承旧 checkpoint 的 test 泄漏"
+            "resume 仅用于调试；正式 Unsup-v0 实验应从 yolo11m.pt 新开 run"
         )
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -218,18 +223,28 @@ def train_all(args: argparse.Namespace) -> None:
         if args.dataset
         else [parse_dataset_spec(s) for s in DEFAULT_DATASETS]
     )
-    allow_test_as_eval = getattr(args, "allow_test_as_eval", False)
+    allow_test_as_eval = getattr(
+        args, "allow_test_as_eval", False
+    )
     for name, root, train_splits, eval_split in specs:
         reject_test_as_training(train_splits)
-        reject_multiple_outer_fold_train_splits(train_splits)
+        reject_multiple_outer_fold_train_splits(
+            train_splits
+        )
         if not allow_test_as_eval:
             reject_test_as_validation(eval_split)
-        assert_disjoint_splits(root, train_splits, eval_split)
+        assert_disjoint_splits(
+            root, train_splits, eval_split
+        )
 
     logging.info("联合数据集:")
     for name, root, train_splits, eval_split in specs:
         logging.info(
-            "  %s: train=%s (%s) eval=%s", name, train_splits, root, eval_split
+            "  %s: train=%s (%s) eval=%s",
+            name,
+            train_splits,
+            root,
+            eval_split,
         )
         if allow_test_as_eval and "test" in eval_split.lower():
             logging.warning(
@@ -238,25 +253,20 @@ def train_all(args: argparse.Namespace) -> None:
                 eval_split,
             )
 
-    graduate_recalls = tuple(
-        float(v) for v in args.graduate_recalls.split(",")
-    )
-    if len(graduate_recalls) != 3:
-        raise ValueError("--graduate-recalls 需要 3 个值")
-
-    # 覆盖保护：从头训练进入已有 save-dir 时备份旧 phase best。
+    # 覆盖保护：从头训练进入已有 save-dir 时备份旧 best_soft。
     if not args.resume:
-        for best_name in ("best_soft.pt", "best_hard.pt"):
-            old_best = os.path.join(args.save_dir, best_name)
-            if not os.path.exists(old_best):
-                continue
+        old_best = os.path.join(
+            args.save_dir, "best_soft.pt"
+        )
+        if os.path.exists(old_best):
             backup = os.path.join(
-                args.save_dir,
-                best_name.replace(".pt", "_prev.pt"),
+                args.save_dir, "best_soft_prev.pt"
             )
             if not os.path.exists(backup):
                 shutil.copy2(old_best, backup)
-                logging.info(f"旧 {best_name} 已备份到 {backup}")
+                logging.info(
+                    f"旧 best_soft.pt 已备份到 {backup}"
+                )
 
     model = YOLO11MoEPoint(
         weights=args.weights,
@@ -265,11 +275,12 @@ def train_all(args: argparse.Namespace) -> None:
     ).to(device)
 
     criterion = PointMoELoss(
-        route_weight=args.route_weight,
-        scale_centers=tm.parse_scale_centers(args.scale_centers),
+        scale_centers=tm.parse_scale_centers(
+            args.scale_centers
+        ),
         match_top_k=args.match_top_k,
     )
-    # 训练集：各数据集 train split 拼接，DataLoader 默认按图片自然采样。
+
     train_datasets = []
     train_dataset_sizes: dict[str, int] = {}
     for name, root, train_splits, eval_split in specs:
@@ -294,7 +305,7 @@ def train_all(args: argparse.Namespace) -> None:
         collate_fn=point_collate_fn,
         drop_last=True,
     )
-    # 验证集：每数据集一个 loader，逐数据集报告 MAE
+
     val_loaders = {}
     val_mean_gt_counts = {}
     val_image_counts: dict[str, int] = {}
@@ -305,7 +316,9 @@ def train_all(args: argparse.Namespace) -> None:
             crop_size=args.crop_size,
             augment=False,
         )
-        val_mean_gt_counts[name] = mean_gt_count(val_dataset)
+        val_mean_gt_counts[name] = mean_gt_count(
+            val_dataset
+        )
         val_image_counts[name] = len(val_dataset)
         val_loaders[name] = DataLoader(
             val_dataset,
@@ -328,42 +341,53 @@ def train_all(args: argparse.Namespace) -> None:
     logging.info(
         "训练按图片自然采样: %s",
         ", ".join(
-            f"{name}={count} ({count / max(len(train_dataset), 1):.1%})"
+            f"{name}={count} "
+            f"({count / max(len(train_dataset), 1):.1%})"
             for name, count in train_dataset_sizes.items()
         ),
     )
 
-    # 冻结 / 优化器 / 恢复
     if args.freeze_epochs > 0:
-        logging.info(f"前 {args.freeze_epochs} 个 epoch 冻结 YOLO Backbone+Neck")
+        logging.info(
+            f"前 {args.freeze_epochs} 个 epoch 冻结 YOLO Backbone+Neck"
+        )
         for param in model.yolo.parameters():
             param.requires_grad = False
 
     optimizer = tm.build_optimizer(model, args)
-
     start_epoch = 0
     best_selection_score = float("inf")
     best_soft_selection_score = float("inf")
-    best_hard_selection_score = float("inf")
-    hard_started = False
-    grad_streak = 0
-    first_hard_epoch = None
-    last_hard_route = False
 
     if args.resume and os.path.exists(args.resume):
         logging.info(f"从 {args.resume} 恢复训练")
         checkpoint = torch.load(
             args.resume, map_location="cpu", weights_only=False
         )
+        saved_config = checkpoint.get("config", {})
+        if (
+            not isinstance(saved_config, dict)
+            or saved_config.get("router_training_mode")
+            != "task_only"
+        ):
+            raise ValueError(
+                "只能从 router_training_mode=task_only 的 checkpoint "
+                "恢复，避免混用 supervised Router 权重"
+            )
         try:
             model.load_state_dict(checkpoint["model"])
         except RuntimeError as error:
             logging.warning(
-                f"旧版 checkpoint 缺少新参数({error})，缺失部分使用初始化值"
+                f"checkpoint 参数不完全匹配({error})，"
+                "缺失部分使用初始化值"
             )
-            model.load_state_dict(checkpoint["model"], strict=False)
+            model.load_state_dict(
+                checkpoint["model"], strict=False
+            )
         try:
-            optimizer.load_state_dict(checkpoint["optimizer"])
+            optimizer.load_state_dict(
+                checkpoint["optimizer"]
+            )
         except (ValueError, RuntimeError) as error:
             logging.warning(
                 f"优化器状态不兼容({error})，使用全新优化器"
@@ -376,65 +400,41 @@ def train_all(args: argparse.Namespace) -> None:
         )
         best_soft_selection_score = checkpoint.get(
             "best_soft_selection_score",
-            float("inf"),
+            best_selection_score,
         )
-        best_hard_selection_score = checkpoint.get(
-            "best_hard_selection_score",
-            float("inf"),
+
+        old_best = os.path.join(
+            args.save_dir, "best_soft.pt"
         )
-        hard_started = checkpoint.get("hard_started", False)
-        last_hard_route = checkpoint.get(
-            "hard_route",
-            hard_started,
-        )
-        if (
-            best_soft_selection_score == float("inf")
-            and not last_hard_route
-        ):
-            best_soft_selection_score = best_selection_score
-        if (
-            best_hard_selection_score == float("inf")
-            and last_hard_route
-        ):
-            best_hard_selection_score = best_selection_score
-        grad_streak = checkpoint.get("grad_streak", 0)
-        first_hard_epoch = checkpoint.get("first_hard_epoch")
+        if os.path.exists(old_best):
+            backup = os.path.join(
+                args.save_dir, "best_soft_pre_resume.pt"
+            )
+            if not os.path.exists(backup):
+                shutil.copy2(old_best, backup)
+                logging.info(
+                    f"旧 best_soft.pt 已备份到 {backup}"
+                )
         if start_epoch >= args.freeze_epochs:
             for param in model.yolo.parameters():
                 param.requires_grad = True
 
-    was_hard_route = bool(last_hard_route)
-
     for epoch in range(start_epoch, args.epochs):
-        hard_route = hard_started
-        router_grad = epoch >= args.router_grad_epoch
-
-        if (
-            not hard_route
-            and args.force_hard_epoch is not None
-            and epoch >= args.force_hard_epoch
-        ):
-            hard_started = True
-            hard_route = True
-            logging.info(f"强制启用硬路由（epoch={args.force_hard_epoch}）")
-
-        if hard_route and not was_hard_route:
-            was_hard_route = True
-            first_hard_epoch = epoch
-            best_selection_score = float("inf")
-            best_hard_selection_score = float("inf")
-            logging.info(
-                "切换硬路由，best_hard 基准重置为 hard weighted normalized MAE"
-            )
-
+        hard_route = False
+        router_grad = epoch >= args.router_warmup_epochs
         temperature = tm.temperature_for_epoch(
-            epoch, hard_route, first_hard_epoch, args
+            epoch,
+            hard_route,
+            None,
+            args,
         )
 
         if args.freeze_epochs > 0 and epoch == args.freeze_epochs:
             for param in model.yolo.parameters():
                 param.requires_grad = True
-            logging.info("解冻 YOLO Backbone+Neck（保留优化器状态）")
+            logging.info(
+                "解冻 YOLO Backbone+Neck（保留优化器状态）"
+            )
 
         model.train()
         total_loss = 0.0
@@ -442,17 +442,16 @@ def train_all(args: argparse.Namespace) -> None:
         matched_gate_sum = torch.zeros(
             3, device=device
         )
+        matched_gate_top1_sum = torch.zeros(
+            3, device=device
+        )
         matched_gate_points = 0
         matched_gate_entropy_sum = torch.zeros(
             (), device=device
         )
-        target_mean = torch.zeros(
-            3, device=device
-        )
-        target_points = 0
         loss_sums = {
             name: torch.zeros((), device=device)
-            for name in ("cls", "point", "count", "route")
+            for name in ("cls", "point", "count")
         }
 
         for batch in tqdm(
@@ -468,16 +467,18 @@ def train_all(args: argparse.Namespace) -> None:
                 temperature=temperature,
                 hard_route=hard_route,
                 router_grad=router_grad,
-                expert_uniform_floor=args.expert_uniform_floor,
             )
             loss, loss_items = criterion(
-                predictions, gt_points, image_size=images.shape[-2:]
+                predictions,
+                gt_points,
+                image_size=images.shape[-2:],
             )
 
-            # 诊断只统计 Hungarian 匹配到的正样本，避免背景候选
-            # 污染 gate 分布与 Router entropy。
             matched_gate_sum += loss_items[
                 "matched_gate_hist"
+            ].to(device)
+            matched_gate_top1_sum += loss_items[
+                "matched_gate_top1_hist"
             ].to(device)
             matched_gate_points += int(
                 loss_items["matched_gate_count"].item()
@@ -485,12 +486,6 @@ def train_all(args: argparse.Namespace) -> None:
             matched_gate_entropy_sum += loss_items[
                 "matched_gate_entropy"
             ].to(device)
-            target_mean += loss_items["gate_target_hist"].to(
-                device
-            )
-            target_points += int(
-                loss_items["gate_target_count"].item()
-            )
 
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
@@ -501,12 +496,16 @@ def train_all(args: argparse.Namespace) -> None:
 
             total_loss += loss.item()
             for loss_name in loss_sums:
-                loss_sums[loss_name] += loss_items[loss_name].detach()
+                loss_sums[loss_name] += loss_items[
+                    loss_name
+                ].detach()
             num_batches += 1
 
         avg_loss = total_loss / max(num_batches, 1)
         avg_loss_items = {
-            name: (loss_sums[name] / max(num_batches, 1)).item()
+            name: (
+                loss_sums[name] / max(num_batches, 1)
+            ).item()
             for name in loss_sums
         }
 
@@ -514,7 +513,9 @@ def train_all(args: argparse.Namespace) -> None:
         hard_usage_sum = torch.zeros(
             3, dtype=torch.int64, device=device
         )
-        confusion_sum = torch.zeros(3, 3, dtype=torch.int64, device=device)
+        confusion_sum = torch.zeros(
+            3, 3, dtype=torch.int64, device=device
+        )
         matched_sum = 0
         for name, val_loader in val_loaders.items():
             (
@@ -531,11 +532,15 @@ def train_all(args: argparse.Namespace) -> None:
                 knn_k=criterion.knn_k,
                 scale_centers=criterion.scale_centers,
                 scale_sigma_octaves=criterion.scale_sigma_octaves,
+                diagnose_scale_routing=(
+                    args.diagnose_scale_routing
+                ),
             )
             per_dataset[name] = (soft_mae, hard_mae)
             hard_usage_sum += hard_usage
-            confusion_sum += route_confusion
-            matched_sum += matched
+            if args.diagnose_scale_routing:
+                confusion_sum += route_confusion
+                matched_sum += matched
 
         soft_raw_macro = sum(
             value[0] for value in per_dataset.values()
@@ -563,14 +568,22 @@ def train_all(args: argparse.Namespace) -> None:
             val_image_counts,
             1,
         )
+        hard_soft_gap = (
+            hard_weighted_norm_mae
+            - soft_weighted_norm_mae
+        )
+        hard_soft_ratio = (
+            hard_weighted_norm_mae
+            / max(soft_weighted_norm_mae, 1e-12)
+        )
 
-        train_gate_pct = (
+        gate_mean = (
             matched_gate_sum
             / max(matched_gate_points, 1)
-            * 100
         )
-        target_pct = (
-            target_mean / max(target_points, 1) * 100
+        top1_usage = (
+            matched_gate_top1_sum
+            / max(matched_gate_points, 1)
         )
         val_usage_pct = (
             hard_usage_sum.float()
@@ -581,28 +594,13 @@ def train_all(args: argparse.Namespace) -> None:
             matched_gate_entropy_sum
             / max(matched_gate_points, 1)
         ).item()
-        if matched_sum > 0:
-            recalls, macro_recall = tm.router_recalls(
-                confusion_sum
-            )
-            confusion_pct = (
-                100.0
-                * confusion_sum.float()
-                / confusion_sum.sum(
-                    dim=1, keepdim=True
-                ).clamp_min(1)
-            )
-        else:
-            recalls = [0.0, 0.0, 0.0]
-            macro_recall = 0.0
-            confusion_pct = torch.zeros(
-                3, 3, device=device
-            )
 
         per_dataset_str = " | ".join(
-            f"{name}: soft={v[0]:.3f}/{v[0] / val_mean_gt_counts[name]:.4f} "
-            f"hard={v[1]:.3f}/{v[1] / val_mean_gt_counts[name]:.4f}"
-            for name, v in per_dataset.items()
+            f"{name}: soft={value[0]:.3f}/"
+            f"{value[0] / val_mean_gt_counts[name]:.4f} "
+            f"hard={value[1]:.3f}/"
+            f"{value[1] / val_mean_gt_counts[name]:.4f}"
+            for name, value in per_dataset.items()
         )
         logging.info(
             f"[Epoch {epoch + 1}/{args.epochs}] "
@@ -610,168 +608,138 @@ def train_all(args: argparse.Namespace) -> None:
             f"cls={avg_loss_items['cls']:.4f} "
             f"point={avg_loss_items['point']:.4f} "
             f"count={avg_loss_items['count']:.4f} "
-            f"route={avg_loss_items['route']:.4f} "
             f"T={temperature:.2f} "
-            f"hard_route={hard_route} "
-            f"router_grad={router_grad} "
+            f"router_warmup={not router_grad} "
             f"soft_raw_macro={soft_raw_macro:.3f} "
             f"soft_norm_macro={soft_norm_macro:.6f} "
-            f"soft_weighted_norm_mae={soft_weighted_norm_mae:.6f} "
+            f"soft_weighted_norm_mae="
+            f"{soft_weighted_norm_mae:.6f} "
             f"hard_raw_macro={hard_raw_macro:.3f} "
             f"hard_norm_macro={hard_norm_macro:.6f} "
-            f"hard_weighted_norm_mae={hard_weighted_norm_mae:.6f}"
+            f"hard_weighted_norm_mae="
+            f"{hard_weighted_norm_mae:.6f} "
+            f"hard_soft_gap={hard_soft_gap:.6f} "
+            f"hard_soft_ratio={hard_soft_ratio:.4f}"
         )
         logging.info("  分数据集: %s", per_dataset_str)
         logging.info(
-            "  matched train gate=E0:%.1f%% E1:%.1f%% E2:%.1f%% "
-            "| GT target=E0:%.1f%% E1:%.1f%% E2:%.1f%% "
-            "| val hard usage=E0:%.1f%% E1:%.1f%% E2:%.1f%% "
-            "| matched entropy=%.4f",
-            train_gate_pct[0],
-            train_gate_pct[1],
-            train_gate_pct[2],
-            target_pct[0],
-            target_pct[1],
-            target_pct[2],
+            "  matched gate mean=E0:%.1f%% E1:%.1f%% E2:%.1f%% "
+            "| matched top1=E0:%.1f%% E1:%.1f%% E2:%.1f%% "
+            "| val hard top1=E0:%.1f%% E1:%.1f%% E2:%.1f%% "
+            "| gate entropy=%.4f",
+            gate_mean[0] * 100,
+            gate_mean[1] * 100,
+            gate_mean[2] * 100,
+            top1_usage[0] * 100,
+            top1_usage[1] * 100,
+            top1_usage[2] * 100,
             val_usage_pct[0],
             val_usage_pct[1],
             val_usage_pct[2],
             router_entropy,
         )
-        logging.info(
-            "  Router recall=E0:%.3f E1:%.3f E2:%.3f macro=%.3f "
-            "matched=%d",
-            recalls[0],
-            recalls[1],
-            recalls[2],
-            macro_recall,
-            matched_sum,
-        )
-        logging.info(
-            "  路由混淆 (行=GT E0/E1/E2, 列=预测 E0/E1/E2): "
-            "E0=[%.1f, %.1f, %.1f]%% n=%d | "
-            "E1=[%.1f, %.1f, %.1f]%% n=%d | "
-            "E2=[%.1f, %.1f, %.1f]%% n=%d",
-            confusion_pct[0, 0],
-            confusion_pct[0, 1],
-            confusion_pct[0, 2],
-            int(confusion_sum[0].sum()),
-            confusion_pct[1, 0],
-            confusion_pct[1, 1],
-            confusion_pct[1, 2],
-            int(confusion_sum[1].sum()),
-            confusion_pct[2, 0],
-            confusion_pct[2, 1],
-            confusion_pct[2, 2],
-            int(confusion_sum[2].sum()),
-        )
 
-        # Router 毕业（混淆矩阵跨数据集求和）
-        if not hard_started and matched_sum > 0:
-            recalls, macro_recall = tm.router_recalls(confusion_sum)
-            if (
-                recalls[0] >= graduate_recalls[0]
-                and recalls[1] >= graduate_recalls[1]
-                and recalls[2] >= graduate_recalls[2]
-                and macro_recall >= args.graduate_macro_recall
-            ):
-                grad_streak += 1
-                if grad_streak >= args.graduate_stable_epochs:
-                    hard_started = True
-                    first_hard_epoch = epoch + 1
-                    logging.info(
-                        f"Router 毕业（recall=E0:{recalls[0]:.2f} "
-                        f"E1:{recalls[1]:.2f} E2:{recalls[2]:.2f} "
-                        f"macro={macro_recall:.2f}），下一 epoch 进 hard"
-                    )
-                else:
-                    logging.info(
-                        f"Router 达标 streak={grad_streak}/"
-                        f"{args.graduate_stable_epochs}"
-                    )
-            else:
-                grad_streak = 0
-                logging.info(
-                    f"Router 未达标 (recall=E0:{recalls[0]:.2f} "
-                    f"E1:{recalls[1]:.2f} E2:{recalls[2]:.2f} "
-                    f"macro={macro_recall:.2f})"
-                )
+        if args.diagnose_scale_routing and matched_sum > 0:
+            confusion_pct = (
+                100.0
+                * confusion_sum.float()
+                / confusion_sum.sum(
+                    dim=1, keepdim=True
+                ).clamp_min(1)
+            )
+            logging.info(
+                "  scale-routing confusion "
+                "(diagnostic only; GT class -> predicted expert): "
+                "E0=[%.1f, %.1f, %.1f]%% n=%d | "
+                "E1=[%.1f, %.1f, %.1f]%% n=%d | "
+                "E2=[%.1f, %.1f, %.1f]%% n=%d",
+                confusion_pct[0, 0],
+                confusion_pct[0, 1],
+                confusion_pct[0, 2],
+                int(confusion_sum[0].sum()),
+                confusion_pct[1, 0],
+                confusion_pct[1, 1],
+                confusion_pct[1, 2],
+                int(confusion_sum[1].sum()),
+                confusion_pct[2, 0],
+                confusion_pct[2, 1],
+                confusion_pct[2, 2],
+                int(confusion_sum[2].sum()),
+            )
 
-        # best 选择：主指标按验证图片数加权；macro 只保留作参考日志。
-        if hard_route:
-            val_score_for_best = hard_weighted_norm_mae
-            metric_name = "hard weighted normalized MAE"
-            active_best_score = best_hard_selection_score
-        else:
-            val_score_for_best = soft_weighted_norm_mae
-            metric_name = "soft weighted normalized MAE"
-            active_best_score = best_soft_selection_score
-
-        improved = val_score_for_best < active_best_score
+        val_score_for_best = soft_weighted_norm_mae
+        improved = val_score_for_best < best_soft_selection_score
         if improved:
             best_selection_score = val_score_for_best
-            if hard_route:
-                best_hard_selection_score = val_score_for_best
-                best_path = os.path.join(
-                    args.save_dir, "best_hard.pt"
-                )
-            else:
-                best_soft_selection_score = val_score_for_best
-                best_path = os.path.join(
-                    args.save_dir, "best_soft.pt"
-                )
+            best_soft_selection_score = val_score_for_best
+            best_path = os.path.join(
+                args.save_dir, "best_soft.pt"
+            )
         else:
-            best_selection_score = active_best_score
+            best_selection_score = best_soft_selection_score
             best_path = None
 
         checkpoint_data = {
             "model": model.state_dict(),
             "optimizer": optimizer.state_dict(),
             "epoch": epoch,
-            # 兼容旧 loader；表示当前 soft/hard 阶段的 weighted score。
             "best_mae": best_selection_score,
             "best_selection_score": best_selection_score,
-            "best_soft_selection_score": best_soft_selection_score,
-            "best_hard_selection_score": best_hard_selection_score,
-            "selection_metric": metric_name,
-            "hard_started": hard_started,
-            "hard_route": hard_route,
-            "grad_streak": grad_streak,
-            "first_hard_epoch": first_hard_epoch,
+            "best_soft_selection_score": (
+                best_soft_selection_score
+            ),
+            "selection_metric": (
+                "soft weighted normalized MAE"
+            ),
+            "hard_started": False,
+            "hard_route": False,
             "per_dataset": per_dataset,
             "val_image_counts": val_image_counts,
             "val_mean_gt_counts": val_mean_gt_counts,
             "soft_raw_macro": soft_raw_macro,
             "soft_norm_macro": soft_norm_macro,
-            "soft_weighted_norm_mae": soft_weighted_norm_mae,
+            "soft_weighted_norm_mae": (
+                soft_weighted_norm_mae
+            ),
             "hard_raw_macro": hard_raw_macro,
             "hard_norm_macro": hard_norm_macro,
-            "hard_weighted_norm_mae": hard_weighted_norm_mae,
-            # 该字段保持兼容，但现在严格采用 matched-positive 口径。
+            "hard_weighted_norm_mae": (
+                hard_weighted_norm_mae
+            ),
+            "hard_soft_gap": hard_soft_gap,
+            "hard_soft_ratio": hard_soft_ratio,
+            "gate_mean": gate_mean.detach().cpu(),
+            "top1_usage": top1_usage.detach().cpu(),
+            "gate_entropy": router_entropy,
             "train_gate_distribution": (
-                matched_gate_sum / max(matched_gate_points, 1)
-            ).detach().cpu(),
-            "gt_target_distribution": (
-                target_mean / max(target_points, 1)
-            ).detach().cpu(),
-            "val_hard_expert_usage": hard_usage_sum.detach().cpu(),
-            "router_confusion": confusion_sum.detach().cpu(),
-            "router_recalls": recalls,
-            "router_macro_recall": macro_recall,
-            "router_entropy": router_entropy,
+                gate_mean.detach().cpu()
+            ),
+            "val_hard_expert_usage": (
+                hard_usage_sum.detach().cpu()
+            ),
+            "router_training_mode": "task_only",
+            "router_warmup_epochs": (
+                args.router_warmup_epochs
+            ),
+            "diagnose_scale_routing": (
+                args.diagnose_scale_routing
+            ),
+            "router_confusion": (
+                confusion_sum.detach().cpu()
+                if args.diagnose_scale_routing
+                else None
+            ),
             "args": vars(args),
             "config": tm.build_checkpoint_config(
                 args,
                 criterion,
-                hard_started=hard_started,
-                hard_route=hard_route,
                 temperature=temperature,
             ),
         }
         if improved:
             torch.save(checkpoint_data, best_path)
             logging.info(
-                f"  -> 新的最佳 {metric_name}: "
+                f"  -> 新的最佳 soft weighted normalized MAE: "
                 f"{best_selection_score:.6f} ({best_path})"
             )
 
@@ -780,11 +748,6 @@ def train_all(args: argparse.Namespace) -> None:
             os.path.join(args.save_dir, "last.pt"),
         )
 
-    if not hard_started:
-        logging.warning(
-            "Router never graduated to hard routing; "
-            "best_hard.pt was not produced."
-        )
     logging.info("训练结束。")
 
 
