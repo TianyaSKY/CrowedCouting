@@ -175,15 +175,15 @@ python -m scripts.training.train_moe \
   `hard_raw_mae`、`hard_norm_mae`、`hard_weighted_norm_mae`；soft mixture
   的 MAE 只作 diagnostic，并输出 `hard_soft_gap` 与 `hard_soft_ratio`。
   选模依据是按验证图片数加权的 hard normalized MAE。
-- **Router 诊断**：matched positive 上记录 gate mean、Top-1 usage 和
-  entropy；另分开记录 `train sampled usage` 与 `val deterministic usage`，
-  以及 Router margin（最大与次大 soft probability 的差）。这些指标只观察、
-  不优化；尺度中心和混淆矩阵默认关闭，`--diagnose-scale-routing` 开启后
-  仍明确标记为 diagnostic only。
+- **Router 诊断**：matched positive 上记录 gate mean、Top-1 usage、entropy 和
+  margin；另分开记录 `train sampled usage` 与
+  `val matched deterministic usage`。这些指标只观察、不优化；尺度中心和
+  混淆矩阵默认关闭，`--diagnose-scale-routing` 开启后仍明确标记为
+  diagnostic only。
 - **checkpoint**：保存 `best_hard.pt` 与 `last.pt`。checkpoint 记录
   hard/soft MAE、gap/ratio、usage、entropy、margin，以及
   `router_training_mode="task_only_gumbel_hard"`、
-  `router_warmup_epochs=3`、`training_hard_route=True` 和
+  `router_warmup_epochs=3`、当前状态字段 `training_hard_route` 和
   `route_supervision=False`。正式 H0 从 `yolo11m.pt` 新开 run；
 ### 3. 评估与推理
 
@@ -229,10 +229,9 @@ python -m scripts.evaluation.evaluate_datasets \
 
 ### 4. 观察 Router 行为
 
-默认日志记录 matched positive 上的 gate mean、Top-1 usage 和 entropy，
-并分开记录 `train sampled usage` 与 `val deterministic usage`，同时记录
-Router margin（最大与次大 soft probability 的差）。这些是诊断，不是优化目标，
-也不存在“Router 达标/未达标”或毕业 streak。
+默认日志记录 matched positive 上的 gate mean、Top-1 usage、entropy 和 margin，
+并分开记录 `train sampled usage` 与 `val matched deterministic usage`。
+这些是诊断，不是优化目标，也不存在“Router 达标/未达标”或毕业 streak。
 `--diagnose-scale-routing` 开启后才输出 GT 尺度类到预测专家的混淆矩阵，
 并明确标记为 `diagnostic only`。若 Top-1 usage 极度偏斜，先比较三个
 expert 的独立输出与单专家计数结果，再决定是否需要后续正则化。

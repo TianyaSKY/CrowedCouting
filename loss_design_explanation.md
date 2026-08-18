@@ -88,7 +88,8 @@ $$
 - **软混合只作 diagnostic**：soft forward 仍用于每 epoch 对照，但不参与 H0
   checkpoint 选择。hard validation 使用 deterministic argmax，无 Gumbel noise。
 - **日志**：记录 loss 分解、hard/soft MAE、gap/ratio、matched gate statistics、
-  train sampled usage、val deterministic usage、gate entropy 与 Router margin。
+  train sampled usage、val matched deterministic usage、matched/train/val entropy
+  与 matched/train/val Router margin。
 
 ## 6. 与评估的关系
 

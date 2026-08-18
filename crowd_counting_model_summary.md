@@ -89,7 +89,8 @@ $$
 不产生 Router 梯度，也不改变 task-only loss。
 
 `scale_centers = (10, 20, 40) px`，`scale_sigma_octaves = 0.6`；日志另外记录
-matched gate mean、sampled/deterministic usage、gate entropy 和 Router margin。
+matched gate mean、matched Top-1 usage、train sampled usage、val matched
+deterministic usage、matched/train/val gate entropy 和 Router margin。
 
 ## 4. 训练与评估口径（train_moe.py）
 
@@ -102,7 +103,7 @@ matched gate mean、sampled/deterministic usage、gate entropy 和 Router margin
   `logits.sigmoid()` 之和**（无阈值、无去重）。`best_hard.pt` 按 hard weighted
   normalized MAE 选取。
 - checkpoint 记录 `router_training_mode="task_only_gumbel_hard"`、
-  `router_warmup_epochs`、`training_hard_route=True` 和
+  `router_warmup_epochs`、当前状态字段 `training_hard_route` 和
   `route_supervision=False`。正式 H0 从 `yolo11m.pt` 新开 run，不从 soft-only
   Unsup-v0 checkpoint resume。
 - 验证用 letterbox（保持纵横比 + 居中填充 114）而非压成正方形，评估脚本默认读取 checkpoint

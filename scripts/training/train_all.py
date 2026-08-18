@@ -458,6 +458,9 @@ def train_all(args: argparse.Namespace) -> None:
         matched_gate_entropy_sum = torch.zeros(
             (), device=device
         )
+        matched_gate_margin_sum = torch.zeros(
+            (), device=device
+        )
         train_sampled_usage = torch.zeros(
             3, dtype=torch.int64, device=device
         )
@@ -515,6 +518,9 @@ def train_all(args: argparse.Namespace) -> None:
             matched_gate_entropy_sum += loss_items[
                 "matched_gate_entropy"
             ].to(device)
+            matched_gate_margin_sum += loss_items[
+                "matched_gate_margin"
+            ].to(device)
 
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
@@ -568,6 +574,7 @@ def train_all(args: argparse.Namespace) -> None:
                 val_loader,
                 device,
                 soft_temperature=temperature,
+                hard_temperature=temperature,
                 knn_k=criterion.knn_k,
                 scale_centers=criterion.scale_centers,
                 scale_sigma_octaves=criterion.scale_sigma_octaves,
@@ -657,6 +664,10 @@ def train_all(args: argparse.Namespace) -> None:
             matched_gate_entropy_sum
             / max(matched_gate_points, 1)
         ).item()
+        matched_router_margin = (
+            matched_gate_margin_sum
+            / max(matched_gate_points, 1)
+        ).item()
 
         per_dataset_str = " | ".join(
             f"{name}: soft={value[0]:.3f}/"
@@ -690,8 +701,9 @@ def train_all(args: argparse.Namespace) -> None:
             "  matched gate mean=E0:%.1f%% E1:%.1f%% E2:%.1f%% "
             "| matched top1=E0:%.1f%% E1:%.1f%% E2:%.1f%% "
             "| train sampled usage=E0:%.1f%% E1:%.1f%% E2:%.1f%% "
-            "| val deterministic usage=E0:%.1f%% E1:%.1f%% E2:%.1f%% "
-            "| matched entropy=%.4f "
+            "| val matched deterministic usage="
+            "E0:%.1f%% E1:%.1f%% E2:%.1f%% "
+            "| matched entropy=%.4f matched margin=%.4f "
             "| train entropy=%.4f val entropy=%.4f "
             "| train margin=%.4f val margin=%.4f",
             gate_mean[0] * 100,
@@ -707,6 +719,7 @@ def train_all(args: argparse.Namespace) -> None:
             val_usage_pct[1],
             val_usage_pct[2],
             router_entropy,
+            matched_router_margin,
             train_gate_entropy,
             val_gate_entropy,
             train_gate_margin,
@@ -742,7 +755,10 @@ def train_all(args: argparse.Namespace) -> None:
             )
 
         val_score_for_best = hard_weighted_norm_mae
-        improved = val_score_for_best < best_selection_score
+        improved = (
+            not router_warmup
+            and val_score_for_best < best_selection_score
+        )
         if improved:
             best_selection_score = val_score_for_best
             best_path = os.path.join(
@@ -763,9 +779,9 @@ def train_all(args: argparse.Namespace) -> None:
             "selection_metric": (
                 "hard weighted normalized MAE"
             ),
-            "hard_started": True,
-            "hard_route": True,
-            "training_hard_route": True,
+            "hard_started": bool(hard_route),
+            "hard_route": bool(hard_route),
+            "training_hard_route": bool(hard_route),
             "per_dataset": per_dataset,
             "val_image_counts": val_image_counts,
             "val_mean_gt_counts": val_mean_gt_counts,
@@ -786,6 +802,7 @@ def train_all(args: argparse.Namespace) -> None:
             "gate_entropy": val_gate_entropy,
             "gate_margin": val_gate_margin,
             "matched_gate_entropy": router_entropy,
+            "matched_gate_margin": matched_router_margin,
             "train_gate_entropy": train_gate_entropy,
             "train_gate_margin": train_gate_margin,
             "val_gate_entropy": val_gate_entropy,
@@ -795,6 +812,9 @@ def train_all(args: argparse.Namespace) -> None:
             ),
             "train_sampled_usage": (
                 train_sampled_usage.detach().cpu()
+            ),
+            "val_matched_deterministic_usage": (
+                hard_usage_sum.detach().cpu()
             ),
             "val_deterministic_usage": (
                 hard_usage_sum.detach().cpu()
@@ -822,6 +842,7 @@ def train_all(args: argparse.Namespace) -> None:
                 args,
                 criterion,
                 temperature=temperature,
+                hard_route=hard_route,
             ),
         }
         if improved:

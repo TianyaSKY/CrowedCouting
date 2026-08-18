@@ -114,6 +114,17 @@ class PointMoELoss(nn.Module):
         logits = predictions["logits"]
         points = predictions["points"]
         gates = predictions["gates"]
+        route_probabilities = predictions.get(
+            "route_probabilities"
+        )
+        if route_probabilities is None:
+            route_probabilities = F.softmax(
+                predictions["route_logits"],
+                dim=2,
+            )
+        route_probabilities = route_probabilities.permute(
+            0, 3, 4, 1, 2
+        ).reshape_as(gates)
         batch_size = logits.shape[0]
         image_height, image_width = image_size
         num_experts = gates.shape[2]
@@ -127,11 +138,12 @@ class PointMoELoss(nn.Module):
         count_loss = logits.new_zeros(())
 
         # 只统计 Hungarian 匹配到的正样本，避免背景候选污染
-        # Router 分布和熵诊断。这里不读取 route logits，也不产生
-        # 任何独立的 Router 监督。
+        # Router 分布和熵诊断。这里不对 route logits 计算独立
+        # 监督，也不产生任何 Router 监督项。
         matched_gate_hist = logits.new_zeros(num_experts)
         matched_gate_top1_hist = logits.new_zeros(num_experts)
         matched_gate_entropy = logits.new_zeros(())
+        matched_gate_margin = logits.new_zeros(())
         matched_gate_points = 0
 
         for batch_index in range(batch_size):
@@ -227,18 +239,29 @@ class PointMoELoss(nn.Module):
                 matched_gates = gates[batch_index][
                     matched_full_indices
                 ].detach()
+                matched_probabilities = route_probabilities[
+                    batch_index
+                ][matched_full_indices].detach()
                 matched_gate_hist += matched_gates.sum(dim=0)
                 matched_gate_top1_hist += (
                     matched_gates.argmax(dim=-1)
                     .bincount(minlength=num_experts)
                     .to(dtype=logits.dtype)
                 )
-                safe_matched_gates = matched_gates.clamp_min(
-                    1e-8
+                safe_matched_probabilities = (
+                    matched_probabilities.clamp_min(1e-8)
                 )
                 matched_gate_entropy += -(
-                    safe_matched_gates
-                    * safe_matched_gates.log()
+                    safe_matched_probabilities
+                    * safe_matched_probabilities.log()
+                ).sum()
+                margin_values = matched_probabilities.topk(
+                    k=2,
+                    dim=-1,
+                ).values
+                matched_gate_margin += (
+                    margin_values[:, 0]
+                    - margin_values[:, 1]
                 ).sum()
                 matched_gate_points += int(
                     matched_full_indices.numel()
@@ -282,5 +305,10 @@ class PointMoELoss(nn.Module):
                 matched_gate_points,
                 dtype=logits.dtype,
             ),
-            "matched_gate_entropy": matched_gate_entropy.detach(),
+            "matched_gate_entropy": (
+                matched_gate_entropy.detach()
+            ),
+            "matched_gate_margin": (
+                matched_gate_margin.detach()
+            ),
         }

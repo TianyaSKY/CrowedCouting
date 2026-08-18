@@ -90,6 +90,7 @@ def build_checkpoint_config(
     criterion: PointMoELoss,
     *,
     temperature: float,
+    hard_route: bool,
 ) -> dict[str, object]:
     """Build the canonical Hard-Only Task-Driven MoE settings."""
     temperature_schedule = {
@@ -108,9 +109,9 @@ def build_checkpoint_config(
         "num_references": int(args.num_references),
         "temperature_schedule": temperature_schedule,
         "temperature": float(temperature),
-        "hard_started": True,
-        "hard_route": True,
-        "training_hard_route": True,
+        "hard_started": bool(hard_route),
+        "hard_route": bool(hard_route),
+        "training_hard_route": bool(hard_route),
         "router_training_mode": "task_only_gumbel_hard",
         "router_warmup_epochs": int(
             args.router_warmup_epochs
@@ -168,23 +169,38 @@ def _routing_confusion(
         40.0,
     ),
     scale_sigma_octaves: float = 0.6,
-) -> tuple[torch.Tensor, int]:
-    """单个 batch 的可选尺度路由诊断混淆矩阵。
+    diagnose_scale_routing: bool = False,
+) -> tuple[
+    torch.Tensor,
+    int,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    int,
+]:
+    """Match validation positives and collect routing diagnostics.
 
-    匹配口径与 PointMoELoss 完全一致：置信度 top-K
-    （K=max(match_top_k, n_gt)）候选上做匈牙利指派，
-    代价 = 5*归一化 L1 坐标距离 - 置信度。
-    行是 GT 最近邻间距映射的诊断尺度类（E0/E1/E2），
-    列是匹配候选在 hard gate 上的 argmax 专家。
-
-    该矩阵只用于观察 Router 是否自然形成尺度相关分工，
-    不参与训练、评价选模或 soft/hard 切换。
+    Matching uses the same top-K Hungarian cost as ``PointMoELoss``.
+    Deterministic hard usage uses ``gates``; entropy and margin use
+    ``route_probabilities`` at the caller-selected temperature. The
+    optional scale confusion matrix remains diagnostic-only.
     """
     from models.point_moe_loss import PointMoELoss
 
     logits = predictions["logits"]
     points = predictions["points"]
     gates = predictions["gates"]
+    route_probabilities = predictions.get(
+        "route_probabilities"
+    )
+    if route_probabilities is None:
+        route_probabilities = torch.softmax(
+            predictions["route_logits"],
+            dim=2,
+        )
+    route_probabilities = route_probabilities.permute(
+        0, 3, 4, 1, 2
+    ).reshape_as(gates)
 
     batch_size = logits.shape[0]
     image_height, image_width = image_size
@@ -195,14 +211,18 @@ def _routing_confusion(
     confusion = torch.zeros(
         3, 3, dtype=torch.int64, device=device
     )
-    matched_points = 0
+    confusion_matched_points = 0
+    matched_usage = torch.zeros(
+        3, dtype=torch.int64, device=device
+    )
+    matched_entropy = points.new_zeros(())
+    matched_margin = points.new_zeros(())
+    matched_route_points = 0
 
     for batch_index in range(batch_size):
         gt = gt_points[batch_index].to(device)
         number_of_gt = gt.shape[0]
-
-        # 至少 knn_k+1 个点才能计算第 knn_k 近邻间距。
-        if number_of_gt < knn_k + 1:
+        if number_of_gt == 0:
             continue
 
         pred_logits = logits[batch_index]
@@ -211,13 +231,18 @@ def _routing_confusion(
 
         top_k = max(match_top_k, number_of_gt)
         if pred_logits.shape[0] > top_k:
-            match_indices = pred_logits.topk(top_k).indices
+            match_indices = pred_logits.topk(
+                top_k
+            ).indices
             match_logits = pred_logits[match_indices]
             match_points = pred_points[match_indices]
         else:
             match_indices = None
             match_logits = pred_logits
             match_points = pred_points
+
+        if match_points.shape[0] < number_of_gt:
+            raise RuntimeError("候选点数量小于真实点数量")
 
         normalized_gt = gt / scale
         normalized_pred = match_points / scale
@@ -250,6 +275,39 @@ def _routing_confusion(
         else:
             matched_full_indices = pred_indices
 
+        matched_hard_gates = pred_gates[
+            matched_full_indices
+        ]
+        matched_usage += matched_hard_gates.argmax(
+            dim=-1
+        ).bincount(minlength=3)
+        matched_probabilities = route_probabilities[
+            batch_index
+        ][matched_full_indices]
+        safe_probabilities = matched_probabilities.clamp_min(
+            1e-8
+        )
+        matched_entropy += -(
+            safe_probabilities * safe_probabilities.log()
+        ).sum()
+        margin_values = matched_probabilities.topk(
+            k=2,
+            dim=-1,
+        ).values
+        matched_margin += (
+            margin_values[:, 0] - margin_values[:, 1]
+        ).sum()
+        matched_route_points += int(
+            matched_full_indices.numel()
+        )
+
+        # Scale labels are optional and remain diagnostic-only.
+        if (
+            not diagnose_scale_routing
+            or number_of_gt < knn_k + 1
+        ):
+            continue
+
         target_gate = PointMoELoss.scale_targets(
             gt,
             knn_k=knn_k,
@@ -257,9 +315,7 @@ def _routing_confusion(
             scale_sigma_octaves=scale_sigma_octaves,
         )
         target_class = target_gate.argmax(dim=1)
-        pred_class = pred_gates[
-            matched_full_indices
-        ].argmax(dim=1)
+        pred_class = matched_hard_gates.argmax(dim=-1)
 
         confusion.index_add_(
             0,
@@ -269,9 +325,18 @@ def _routing_confusion(
                 num_classes=3,
             ).to(device),
         )
-        matched_points += number_of_gt
+        confusion_matched_points += int(
+            matched_full_indices.numel()
+        )
 
-    return confusion, matched_points
+    return (
+        confusion,
+        confusion_matched_points,
+        matched_usage,
+        matched_entropy.detach(),
+        matched_margin.detach(),
+        matched_route_points,
+    )
 
 def routing_statistics(
     predictions: dict[str, torch.Tensor],
@@ -416,39 +481,33 @@ def evaluate_count_mae(
                     )
 
                 if hard_route:
-                    # 仅统计置信度 > 0.5 的前景候选，避免背景污染
-                    # deterministic hard top-1 使用率与 Router 诊断。
-                    fg_mask = scores > 0.5
                     (
+                        batch_confusion,
+                        batch_matched,
                         batch_usage,
                         batch_entropy,
                         batch_margin,
                         batch_points,
-                    ) = routing_statistics(
+                    ) = _routing_confusion(
                         predictions,
-                        mask=fg_mask,
+                        gt_points,
+                        images.shape[-2:],
+                        device,
+                        match_top_k=match_top_k,
+                        knn_k=knn_k,
+                        scale_centers=scale_centers,
+                        scale_sigma_octaves=(
+                            scale_sigma_octaves
+                        ),
+                        diagnose_scale_routing=(
+                            diagnose_scale_routing
+                        ),
                     )
                     hard_usage += batch_usage
                     hard_gate_entropy_sum += batch_entropy
                     hard_gate_margin_sum += batch_margin
                     hard_gate_points += batch_points
-
                     if diagnose_scale_routing:
-                        (
-                            batch_confusion,
-                            batch_matched,
-                        ) = _routing_confusion(
-                            predictions,
-                            gt_points,
-                            images.shape[-2:],
-                            device,
-                            match_top_k=match_top_k,
-                            knn_k=knn_k,
-                            scale_centers=scale_centers,
-                            scale_sigma_octaves=(
-                                scale_sigma_octaves
-                            ),
-                        )
                         route_confusion += batch_confusion
                         matched_points += batch_matched
 
@@ -764,6 +823,9 @@ def train_moe(args):
         matched_gate_entropy_sum = torch.zeros(
             (), device=device
         )
+        matched_gate_margin_sum = torch.zeros(
+            (), device=device
+        )
         loss_sums = {
             name: torch.zeros((), device=device)
             for name in ("cls", "point", "count")
@@ -814,6 +876,9 @@ def train_moe(args):
             matched_gate_entropy_sum += loss_items[
                 "matched_gate_entropy"
             ].to(device)
+            matched_gate_margin_sum += loss_items[
+                "matched_gate_margin"
+            ].to(device)
 
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
@@ -855,6 +920,7 @@ def train_moe(args):
             device,
             args.match_top_k,
             soft_temperature=temperature,
+            hard_temperature=temperature,
             knn_k=criterion.knn_k,
             scale_centers=criterion.scale_centers,
             scale_sigma_octaves=criterion.scale_sigma_octaves,
@@ -885,6 +951,10 @@ def train_moe(args):
             matched_gate_top1_sum
             / max(matched_gate_points, 1)
         )
+        matched_router_margin = (
+            matched_gate_margin_sum
+            / max(matched_gate_points, 1)
+        ).item()
         router_entropy = (
             matched_gate_entropy_sum
             / max(matched_gate_points, 1)
@@ -940,8 +1010,9 @@ def train_moe(args):
             "  matched gate mean=E0:%.1f%% E1:%.1f%% E2:%.1f%% "
             "| matched top1=E0:%.1f%% E1:%.1f%% E2:%.1f%% "
             "| train sampled usage=E0:%.1f%% E1:%.1f%% E2:%.1f%% "
-            "| val deterministic usage=E0:%.1f%% E1:%.1f%% E2:%.1f%% "
-            "| matched entropy=%.4f "
+            "| val matched deterministic usage="
+            "E0:%.1f%% E1:%.1f%% E2:%.1f%% "
+            "| matched entropy=%.4f matched margin=%.4f "
             "| train entropy=%.4f val entropy=%.4f "
             "| train margin=%.4f val margin=%.4f",
             gate_mean[0] * 100,
@@ -957,6 +1028,7 @@ def train_moe(args):
             val_usage_pct[1],
             val_usage_pct[2],
             router_entropy,
+            matched_router_margin,
             train_gate_entropy,
             val_gate_entropy,
             train_gate_margin,
@@ -986,7 +1058,10 @@ def train_moe(args):
                 )
 
         val_score_for_best = hard_weighted_norm_mae
-        improved = val_score_for_best < best_selection_score
+        improved = (
+            not router_warmup
+            and val_score_for_best < best_selection_score
+        )
         if improved:
             best_selection_score = val_score_for_best
             best_path = os.path.join(
@@ -1007,9 +1082,9 @@ def train_moe(args):
             "selection_metric": (
                 "hard weighted normalized MAE"
             ),
-            "hard_started": True,
-            "hard_route": True,
-            "training_hard_route": True,
+            "hard_started": bool(hard_route),
+            "hard_route": bool(hard_route),
+            "training_hard_route": bool(hard_route),
             "soft_MAE": soft_mae,
             "hard_MAE": hard_mae,
             "soft_raw_mae": soft_mae,
@@ -1029,12 +1104,16 @@ def train_moe(args):
             "gate_entropy": val_gate_entropy,
             "gate_margin": val_gate_margin,
             "matched_gate_entropy": router_entropy,
+            "matched_gate_margin": matched_router_margin,
             "train_gate_entropy": train_gate_entropy,
             "train_gate_margin": train_gate_margin,
             "val_gate_entropy": val_gate_entropy,
             "val_gate_margin": val_gate_margin,
             "train_sampled_usage": (
                 train_sampled_usage.detach().cpu()
+            ),
+            "val_matched_deterministic_usage": (
+                hard_usage.detach().cpu()
             ),
             "val_deterministic_usage": (
                 hard_usage.detach().cpu()
@@ -1060,6 +1139,7 @@ def train_moe(args):
                 args,
                 criterion,
                 temperature=temperature,
+                hard_route=hard_route,
             ),
         }
         if improved:
