@@ -16,6 +16,7 @@ import torch
 import torch.nn as nn
 from scipy.optimize import linear_sum_assignment
 from torch.utils.data import DataLoader
+from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 
 from models.yolo11_moe_point import YOLO11MoEPoint
@@ -628,6 +629,11 @@ def train_moe(args):
     setup_logging(os.path.join(args.save_dir, "train.log"))
     logging.info("输出目录: %s", args.save_dir)
 
+    # TensorBoard
+    tb_dir = os.path.join(args.save_dir, "tensorboard")
+    writer = SummaryWriter(log_dir=tb_dir)
+    logging.info("TensorBoard 日志目录: %s", tb_dir)
+
     device = (
         "cuda" if torch.cuda.is_available() else "cpu"
     )
@@ -1079,6 +1085,57 @@ def train_moe(args):
                     f"(n={int(row_counts[expert_index])})"
                 )
 
+        # ---- TensorBoard 写入 ----
+        writer.add_scalar("loss/total", avg_loss, epoch)
+        writer.add_scalar("loss/cls", avg_loss_items["cls"], epoch)
+        writer.add_scalar("loss/point", avg_loss_items["point"], epoch)
+        writer.add_scalar("loss/count", avg_loss_items["count"], epoch)
+
+        writer.add_scalar("mae/hard_raw", hard_mae, epoch)
+        writer.add_scalar("mae/soft_raw", soft_mae, epoch)
+        writer.add_scalar("mae/hard_norm", hard_norm_mae, epoch)
+        writer.add_scalar("mae/soft_norm", soft_norm_mae, epoch)
+        writer.add_scalar(
+            "mae/hard_weighted_norm", hard_weighted_norm_mae, epoch
+        )
+        writer.add_scalar(
+            "mae/soft_weighted_norm", soft_weighted_norm_mae, epoch
+        )
+        writer.add_scalar("mae/hard_soft_gap", hard_soft_gap, epoch)
+        writer.add_scalar("mae/hard_soft_ratio", hard_soft_ratio, epoch)
+
+        writer.add_scalar("schedule/temperature", temperature, epoch)
+        writer.add_scalar("schedule/hard_route", float(hard_route), epoch)
+
+        writer.add_scalar("routing/train_entropy", train_gate_entropy, epoch)
+        writer.add_scalar("routing/train_margin", train_gate_margin, epoch)
+        writer.add_scalar("routing/val_entropy", val_gate_entropy, epoch)
+        writer.add_scalar("routing/val_margin", val_gate_margin, epoch)
+        writer.add_scalar("routing/matched_entropy", router_entropy, epoch)
+        writer.add_scalar(
+            "routing/matched_margin", matched_router_margin, epoch
+        )
+
+        val_usage_total = max(int(hard_usage.sum()), 1)
+        for expert_index in range(3):
+            writer.add_scalar(
+                f"routing/val_usage_E{expert_index}_pct",
+                hard_usage[expert_index].item() / val_usage_total * 100,
+                epoch,
+            )
+        if not router_warmup:
+            train_usage_total = max(
+                int(train_sampled_usage.sum()), 1
+            )
+            for expert_index in range(3):
+                writer.add_scalar(
+                    f"routing/train_usage_E{expert_index}_pct",
+                    train_sampled_usage[expert_index].item()
+                    / train_usage_total
+                    * 100,
+                    epoch,
+                )
+
         val_score_for_best = hard_weighted_norm_mae
         improved = (
             not router_warmup
@@ -1180,6 +1237,7 @@ def train_moe(args):
             os.path.join(args.save_dir, "last.pt"),
         )
 
+    writer.close()
     logging.info("训练结束。")
 
 
