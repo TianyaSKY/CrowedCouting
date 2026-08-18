@@ -120,8 +120,7 @@ python -m scripts.data.prepare_all
 python -m scripts.training.train_all \
     --weights yolo11m.pt \
     --crop-size 640 \
-    --batch-size 32 \
-    --save-dir runs/moe_point_all
+    --batch-size 8 \
 
 # 跨数据集分组评估（默认从 checkpoint 读取 crop_size）
 python -m scripts.evaluation.evaluate_datasets \
@@ -144,19 +143,19 @@ python -m scripts.training.train_moe \
 
 常用参数（默认值见 `python -m scripts.training.train_moe --help`）：
 
-| 参数                              | 默认        | 说明                                                          |
-| --------------------------------- | ----------- | ------------------------------------------------------------- |
-| `--crop-size`                   | 640         | 训练/验证裁剪尺寸                                             |
-| `--batch-size`                  | 8           |                                                               |
-| `--epochs`                      | 100         |                                                               |
-| `--backbone-lr` / `--head-lr` | 1e-4 / 1e-3 | YOLO 主干 / MoE Head 两组 AdamW 学习率                        |
-| `--num-references`              | 4           | 每网格参考点数 K（1/4/9）                                     |
-| `--freeze-epochs`               | 3           | 前 N 个 epoch 冻结 YOLO 主干                                  |
-| `--router-warmup-epochs`        | 3           | 前 N 个 epoch 固定 `g=[1/3,1/3,1/3]`；之后 Gumbel-ST hard |
-| `--match-top-k`                 | 2000        | 匈牙利匹配候选点上限（K=max(K, n_gt)）                        |
-| `--diagnose-scale-routing`     | off         | 可选输出尺度路由混淆矩阵；只作 diagnostic                      |
-| `--force-hard-epoch`            | None        | deprecated，忽略；warm-up 后自动进入 Gumbel-ST hard           |
-| `--resume`                      | None        | 仅从 `router_training_mode=task_only_gumbel_hard` checkpoint 恢复 |
+| 参数                              | 默认        | 说明                                                               |
+| --------------------------------- | ----------- | ------------------------------------------------------------------ |
+| `--crop-size`                   | 640         | 训练/验证裁剪尺寸                                                  |
+| `--batch-size`                  | 8           |                                                                    |
+| `--epochs`                      | 100         |                                                                    |
+| `--backbone-lr` / `--head-lr` | 1e-4 / 1e-3 | YOLO 主干 / MoE Head 两组 AdamW 学习率                             |
+| `--num-references`              | 4           | 每网格参考点数 K（1/4/9）                                          |
+| `--freeze-epochs`               | 3           | 前 N 个 epoch 冻结 YOLO 主干                                       |
+| `--router-warmup-epochs`        | 3           | 前 N 个 epoch 固定`g=[1/3,1/3,1/3]`；之后 Gumbel-ST hard         |
+| `--match-top-k`                 | 2000        | 匈牙利匹配候选点上限（K=max(K, n_gt)）                             |
+| `--diagnose-scale-routing`      | off         | 可选输出尺度路由混淆矩阵；只作 diagnostic                          |
+| `--force-hard-epoch`            | None        | deprecated，忽略；warm-up 后自动进入 Gumbel-ST hard                |
+| `--resume`                      | None        | 仅从`router_training_mode=task_only_gumbel_hard` checkpoint 恢复 |
 
 训练要点：
 
@@ -187,6 +186,7 @@ python -m scripts.training.train_moe \
   `router_training_mode="task_only_gumbel_hard"`、
   `router_warmup_epochs=3`、当前状态字段 `training_hard_route` 和
   `route_supervision=False`。正式 H0 从 `yolo11m.pt` 新开 run；
+
 ### 3. 评估与推理
 
 ```bash
