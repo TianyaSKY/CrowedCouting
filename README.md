@@ -179,9 +179,8 @@ python -m scripts.training.train_moe \
 - **双概率记录**：`route_probabilities` 始终是未 Drop-1 的完整三专家
   softmax，用于 matched probability、entropy、margin 和潜在 collapse 诊断；
   `gates` 是实际 Drop-1 / validation gate，二者不混用。
-- **Drop-1 诊断**：记录 dropped E0/E1/E2 frequency、active E0/E1/E2
-  exposure、training masked gate mean，以及 full3 deterministic Top-1 usage。
-  正常频率约为 `33/33/33`，active exposure 约为 `66/66/66`。
+- **Drop-1 诊断**：记录 full3 deterministic Top-1 usage（三个专家在验证集
+  上被 argmax 选中的占比），观察路由是否 collapse。
 - **Expert-only 诊断**：默认每 5 epoch 记录 E0-only、E1-only、E2-only MAE，
   判断 expert starvation 是否已经解决。
 - **checkpoint**：保存 `best_top2.pt` 与 `last.pt`，并记录
@@ -235,8 +234,7 @@ python -m scripts.evaluation.evaluate_datasets \
 ### 4. 观察 Router 行为
 
 默认日志记录完整三专家 `route_probabilities` 的 matched probability mean、
-entropy、margin 和 deterministic Top-1 usage；训练阶段另外记录 Drop-1
-frequency、active exposure、masked gate mean。`--diagnose-scale-routing` 开启后
+entropy、margin 和 deterministic Top-1 usage。`--diagnose-scale-routing` 开启后
 才输出 GT 尺度类到预测专家的混淆矩阵，并明确标记为 `diagnostic only`。
 默认每 5 epoch 比较三个 expert-only MAE；若 Top-1 usage 偏斜，先比较这些
 独立 expert 输出，再判断是否需要后续架构改动。

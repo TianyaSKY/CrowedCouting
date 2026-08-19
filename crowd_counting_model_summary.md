@@ -93,8 +93,7 @@ $$
 
 `scale_centers = (10, 20, 40) px`，`scale_sigma_octaves = 0.6`；日志记录完整
 `route_probabilities` 的 matched probability mean、entropy、margin、deterministic
-Top-1 usage，以及训练阶段 Drop-1 frequency、active exposure、masked gate mean。
-每 5 epoch 可额外运行三个 expert-only MAE。
+Top-1 usage。每 5 epoch 可额外运行三个 expert-only MAE。
 
 ## 4. 训练与评估口径（train_moe.py）
 

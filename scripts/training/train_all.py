@@ -465,33 +465,9 @@ def train_all(args: argparse.Namespace) -> None:
             3, device=device
         )
         matched_gate_points = 0
-        matched_gate_entropy_sum = torch.zeros(
-            (), device=device
-        )
-        matched_gate_margin_sum = torch.zeros(
-            (), device=device
-        )
         train_sampled_usage = torch.zeros(
             3, dtype=torch.int64, device=device
         )
-        train_dropped_experts = torch.zeros(
-            3, dtype=torch.int64, device=device
-        )
-        train_active_exposure = torch.zeros(
-            3, dtype=torch.int64, device=device
-        )
-        train_gate_sum = torch.zeros(
-            3, device=device
-        )
-        train_candidate_count = 0
-
-        train_gate_entropy_sum = torch.zeros(
-            (), device=device
-        )
-        train_gate_margin_sum = torch.zeros(
-            (), device=device
-        )
-        train_gate_points = 0
         loss_sums = {
             name: torch.zeros((), device=device)
             for name in ("cls", "point", "count")
@@ -511,37 +487,10 @@ def train_all(args: argparse.Namespace) -> None:
                 routing_mode=routing_mode,
                 router_grad=router_grad,
             )
-            dropped_expert = predictions[
-                "dropped_expert"
-            ].reshape(-1)
-            train_dropped_experts += torch.bincount(
-                dropped_expert,
-                minlength=3,
+            batch_usage, _, _, _ = tm.routing_statistics(
+                predictions
             )
-            active_expert_mask = predictions[
-                "active_expert_mask"
-            ]
-            train_active_exposure += (
-                active_expert_mask.sum(dim=(0, 1))
-                .to(dtype=torch.int64)
-            )
-            train_gate_sum += predictions["gates"].sum(
-                dim=(0, 1)
-            ).detach()
-            train_candidate_count += int(
-                predictions["gates"].shape[0]
-                * predictions["gates"].shape[1]
-            )
-            (
-                batch_usage,
-                batch_entropy,
-                batch_margin,
-                batch_points,
-            ) = tm.routing_statistics(predictions)
             train_sampled_usage += batch_usage
-            train_gate_entropy_sum += batch_entropy
-            train_gate_margin_sum += batch_margin
-            train_gate_points += batch_points
             loss, loss_items = criterion(
                 predictions,
                 gt_points,
@@ -557,12 +506,6 @@ def train_all(args: argparse.Namespace) -> None:
             matched_gate_points += int(
                 loss_items["matched_gate_count"].item()
             )
-            matched_gate_entropy_sum += loss_items[
-                "matched_gate_entropy"
-            ].to(device)
-            matched_gate_margin_sum += loss_items[
-                "matched_gate_margin"
-            ].to(device)
 
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
@@ -649,18 +592,6 @@ def train_all(args: argparse.Namespace) -> None:
                 )
 
         dataset_count = max(len(per_dataset), 1)
-        full3_raw_macro = sum(
-            value["full3"]
-            for value in per_dataset.values()
-        ) / dataset_count
-        top2_raw_macro = sum(
-            value["top2"]
-            for value in per_dataset.values()
-        ) / dataset_count
-        top1_raw_macro = sum(
-            value["top1"]
-            for value in per_dataset.values()
-        ) / dataset_count
         full3_norm_macro = sum(
             per_dataset[name]["full3"]
             / val_mean_gt_counts[name]
@@ -702,23 +633,10 @@ def train_all(args: argparse.Namespace) -> None:
             top1_weighted_norm_mae
             - top2_weighted_norm_mae
         )
-        top2_full3_ratio = (
-            top2_weighted_norm_mae
-            / max(full3_weighted_norm_mae, 1e-12)
-        )
-
         matched_probability_mean = (
             matched_probability_sum
             / max(matched_gate_points, 1)
         )
-        train_gate_entropy = (
-            train_gate_entropy_sum
-            / max(train_gate_points, 1)
-        ).item()
-        train_gate_margin = (
-            train_gate_margin_sum
-            / max(train_gate_points, 1)
-        ).item()
         val_gate_entropy = (
             val_gate_entropy_sum
             / max(val_gate_points, 1)
@@ -757,36 +675,12 @@ def train_all(args: argparse.Namespace) -> None:
             / max(int(full3_top1_usage_sum.sum()), 1)
             * 100
         )
-        train_gate_mean = (
-            train_gate_sum
-            / max(train_candidate_count, 1)
-        )
-        dropped_frequency_pct = (
-            train_dropped_experts.float()
-            / max(int(train_dropped_experts.sum()), 1)
-            * 100
-        )
-        active_exposure_pct = (
-            train_active_exposure.float()
-            / max(train_candidate_count, 1)
-            * 100
-        )
-        router_entropy = (
-            matched_gate_entropy_sum
-            / max(matched_gate_points, 1)
-        ).item()
-        matched_router_margin = (
-            matched_gate_margin_sum
-            / max(matched_gate_points, 1)
-        ).item()
-
         per_dataset_str = " | ".join(
             f"{name}: full3={value['full3']:.3f}/"
             f"{value['full3'] / val_mean_gt_counts[name]:.4f} "
             f"top2={value['top2']:.3f}/"
             f"{value['top2'] / val_mean_gt_counts[name]:.4f} "
-            f"top1={value['top1']:.3f}/"
-            f"{value['top1'] / val_mean_gt_counts[name]:.4f}"
+            f"top1={value['top1'] / val_mean_gt_counts[name]:.4f}"
             for name, value in per_dataset.items()
         )
 
@@ -799,12 +693,9 @@ def train_all(args: argparse.Namespace) -> None:
             f"T_router={temperature:.2f} "
             f"routing={routing_mode} "
             f"router_active={router_active} "
-            f"MAE_full3={full3_raw_macro:.3f}/"
-            f"{full3_weighted_norm_mae:.6f} "
-            f"MAE_top2={top2_raw_macro:.3f}/"
-            f"{top2_weighted_norm_mae:.6f} "
-            f"MAE_top1={top1_raw_macro:.3f}/"
-            f"{top1_weighted_norm_mae:.6f} "
+            f"MAE_full3={full3_weighted_norm_mae:.6f} "
+            f"MAE_top2={top2_weighted_norm_mae:.6f} "
+            f"MAE_top1={top1_weighted_norm_mae:.6f} "
             f"top2_full3_gap={top2_full3_gap:.6f} "
             f"top1_top2_gap={top1_top2_gap:.6f}"
         )
@@ -825,29 +716,9 @@ def train_all(args: argparse.Namespace) -> None:
             full3_top1_usage_pct[2],
         )
         logging.info(
-            "  dropped frequency="
-            "E0:%.1f%% E1:%.1f%% E2:%.1f%% "
-            "| active exposure="
-            "E0:%.1f%% E1:%.1f%% E2:%.1f%% "
-            "| masked gate mean="
-            "E0:%.3f E1:%.3f E2:%.3f",
-            dropped_frequency_pct[0],
-            dropped_frequency_pct[1],
-            dropped_frequency_pct[2],
-            active_exposure_pct[0],
-            active_exposure_pct[1],
-            active_exposure_pct[2],
-            train_gate_mean[0],
-            train_gate_mean[1],
-            train_gate_mean[2],
-        )
-        logging.info(
             "  train sampled usage=%s "
-            "| train entropy=%.4f margin=%.4f "
             "| matched train gate Top-1=%s",
             train_usage_string,
-            train_gate_entropy,
-            train_gate_margin,
             matched_top1_usage_string,
         )
         if expert_only_by_dataset:
@@ -897,9 +768,6 @@ def train_all(args: argparse.Namespace) -> None:
         writer.add_scalar("loss/point", avg_loss_items["point"], epoch)
         writer.add_scalar("loss/count", avg_loss_items["count"], epoch)
 
-        writer.add_scalar("mae/full3_raw_macro", full3_raw_macro, epoch)
-        writer.add_scalar("mae/top2_raw_macro", top2_raw_macro, epoch)
-        writer.add_scalar("mae/top1_raw_macro", top1_raw_macro, epoch)
         writer.add_scalar(
             "mae/full3_weighted_norm",
             full3_weighted_norm_mae,
@@ -915,19 +783,9 @@ def train_all(args: argparse.Namespace) -> None:
             top1_weighted_norm_mae,
             epoch,
         )
-        writer.add_scalar(
-            "mae/top2_full3_gap",
-            top2_full3_gap,
-            epoch,
-        )
-        writer.add_scalar(
-            "mae/top2_full3_ratio",
-            top2_full3_ratio,
-            epoch,
-        )
         for name, values in per_dataset.items():
             normalizer = val_mean_gt_counts[name]
-            for mode in ("full3", "top2", "top1"):
+            for mode in ("full3", "top2"):
                 writer.add_scalar(
                     f"mae/{name}/{mode}_raw",
                     values[mode],
@@ -938,40 +796,19 @@ def train_all(args: argparse.Namespace) -> None:
                     values[mode] / normalizer,
                     epoch,
                 )
+            writer.add_scalar(
+                f"mae/{name}/top1_norm",
+                values["top1"] / normalizer,
+                epoch,
+            )
 
         writer.add_scalar("schedule/router_temperature", temperature, epoch)
-        writer.add_scalar(
-            "schedule/router_active",
-            float(router_active),
-            epoch,
-        )
-        writer.add_scalar("routing/train_entropy", train_gate_entropy, epoch)
-        writer.add_scalar("routing/train_margin", train_gate_margin, epoch)
         writer.add_scalar("routing/full3_entropy", val_gate_entropy, epoch)
         writer.add_scalar("routing/full3_margin", val_gate_margin, epoch)
-        writer.add_scalar("routing/matched_entropy", router_entropy, epoch)
-        writer.add_scalar(
-            "routing/matched_margin", matched_router_margin, epoch
-        )
         for expert_index in range(3):
             writer.add_scalar(
                 f"routing/full3_top1_usage_E{expert_index}_pct",
                 float(full3_top1_usage_pct[expert_index]),
-                epoch,
-            )
-            writer.add_scalar(
-                f"routing/drop_frequency_E{expert_index}_pct",
-                float(dropped_frequency_pct[expert_index]),
-                epoch,
-            )
-            writer.add_scalar(
-                f"routing/active_exposure_E{expert_index}_pct",
-                float(active_exposure_pct[expert_index]),
-                epoch,
-            )
-            writer.add_scalar(
-                f"routing/train_masked_gate_E{expert_index}",
-                float(train_gate_mean[expert_index]),
                 epoch,
             )
         for name, values in expert_only_by_dataset.items():
@@ -1003,12 +840,6 @@ def train_all(args: argparse.Namespace) -> None:
             "selection_metric": (
                 "top2 weighted normalized MAE"
             ),
-            "MAE_full3": full3_raw_macro,
-            "MAE_top2": top2_raw_macro,
-            "MAE_top1": top1_raw_macro,
-            "full3_raw_macro": full3_raw_macro,
-            "top2_raw_macro": top2_raw_macro,
-            "top1_raw_macro": top1_raw_macro,
             "full3_norm_macro": full3_norm_macro,
             "top2_norm_macro": top2_norm_macro,
             "top1_norm_macro": top1_norm_macro,
@@ -1023,7 +854,6 @@ def train_all(args: argparse.Namespace) -> None:
             ),
             "top2_full3_gap": top2_full3_gap,
             "top1_top2_gap": top1_top2_gap,
-            "top2_full3_ratio": top2_full3_ratio,
             "per_dataset": per_dataset,
             "expert_only_mae": expert_only_by_dataset,
             "val_image_counts": val_image_counts,
@@ -1039,21 +869,8 @@ def train_all(args: argparse.Namespace) -> None:
             ),
             "full3_gate_entropy": val_gate_entropy,
             "full3_gate_margin": val_gate_margin,
-            "matched_gate_entropy": router_entropy,
-            "matched_gate_margin": matched_router_margin,
-            "train_gate_entropy": train_gate_entropy,
-            "train_gate_margin": train_gate_margin,
             "train_sampled_usage": (
                 train_sampled_usage_checkpoint
-            ),
-            "train_dropped_expert_frequency": (
-                dropped_frequency_pct.detach().cpu()
-            ),
-            "train_active_exposure": (
-                active_exposure_pct.detach().cpu()
-            ),
-            "train_masked_gate_mean": (
-                train_gate_mean.detach().cpu()
             ),
             "router_training_mode": (
                 "task_only_drop1_soft_top2"

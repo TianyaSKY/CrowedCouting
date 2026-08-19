@@ -92,8 +92,7 @@ $$
 - **验证**：每 epoch 计算 full3-soft、deterministic Top-2 和 diagnostic-only
   Top-1；`best_top2.pt` 按 Top-2 weighted normalized MAE 选取。
 - **日志**：记录 full3 matched probability mean、entropy、margin、deterministic
-  Top-1 usage、Drop-1 frequency、active exposure、masked gate mean，以及定期
-  的三个 expert-only MAE。
+  Top-1 usage，以及定期的三个 expert-only MAE。
 
 ## 6. 与评估的关系
 
