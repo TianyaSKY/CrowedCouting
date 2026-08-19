@@ -29,7 +29,7 @@ def augment_dataset(dest_dir):
     3. 随机旋转 (Random Rotation) 并重新计算点相对坐标。
 
     每个增强样本同时写出 labels/（YOLO 5 列虚拟框）与 points/（2 列点），
-    Scale-MoE 训练直接读取 points/；v4 分支读取 labels/。
+    Scale-MoE 训练直接读取 points/；labels/ 仅作为标准数据集布局保留。
     原图点标签若缺失（尚未运行 prepare_point_labels），需先运行
     `python -m scripts.data.prepare_point_labels` 补齐。
     """

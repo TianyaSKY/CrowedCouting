@@ -1,7 +1,6 @@
 # 人群计数模型整理报告
 
-本文以当前代码为准。主分支为**点级 Scale-MoE Head**（`models/yolo11_moe_point.py`），
-旧 v4 PointDetect 分支（`models/crowd_model.py`）见文末附录，仅作对照参考。
+本文以当前代码为准。主分支为**点级 Scale-MoE Head**（`models/yolo11_moe_point.py`）。
 
 ## 1. 系统概览
 
@@ -16,7 +15,7 @@ graph TD
     B -->|prepare_point_labels.py| C[points/: nx ny 纯点标签]
     C --> D[YOLO11Pyramid: Backbone+Neck -> P3/P4/P5]
     D --> E[MoEPointHead: 三专家 + Router]
-    E --> F[PointMoELoss: 匹配 + cls/point/count/route]
+    E --> F[PointMoELoss: 匹配 + cls/point/count]
     E --> G[点数 = Σ sigmoid(logits) 直接计数]
     G --> H[soft_MAE / hard_MAE 评估]
 ```
@@ -113,37 +112,4 @@ Top-1 usage。每 5 epoch 可额外运行三个 expert-only MAE。
 - 验证用 letterbox（保持纵横比 + 居中填充 114）而非压成正方形，评估脚本默认读取
   checkpoint 记录的 `crop_size`、`num_references`、temperature 和 Router 配置。
 
-## 5. 附录：v4 PointDetect 分支（旧，对照用）
 
-### 5.1 网络（`models/crowd_model.py` + `models/yolo11-crowd.yaml`）
-
-- YAML 为 YOLO11n 风格 Backbone（0–10 层）+ Neck，原生 `Detect` 头（P2/4、P3/8、P4/16、
-  P5/32）在 `CrowdCountingModel.__init__` 中被替换为 `PointDetect`。
-- 训练器（`train_custom_v3/v4.py`）会尝试从本地 `yolo26n.pt` 载入 Backbone 0–10 层
-  形状一致的参数（`load_from_pretrained`）。
-- `PointDetect`（`models/modules.py`）：每尺度每网格输出 1 个分类 logit + 2 个未约束偏移
-  `(dx, dy)`；推理坐标 `P = (A + (dx,dy)) × s`（A 为带 0.5 偏移的网格中心）。为兼容
-  ultralytics 后处理，点被包装成 1×1 px 虚拟框。
-
-### 5.2 CrowdPointLoss（`models/loss.py`）
-
-$$
-L = 1.0L_{cls} + 5.0L_{off}
-$$
-
-- 匹配：每 GT 点取欧氏距离最近的 Top-K 锚点（K=3），阈值 `1.5 × stride`（P2 6px、P3 12px、
-  P4 24px、P5 48px）内的为正样本；同一锚点被多个 GT 匹配时各配对分别参与偏移损失
-  （不取平均），但一个锚点仍只能输出一个点——极近人头的结构性限制。
-- `L_cls`：BCE + Focal（γ=2.0、α=0.25），按正样本数归一化 ×20。
-- `L_off`：正锚点上预测与目标偏移的逐元素 L1 均值 ×5。第三槽位恒 0（兼容训练器）。
-- 已移除全局计数损失：早期全图概率求和梯度过大且不区分正负样本，干扰分类学习。
-
-### 5.3 v4 数据规模与评估边界
-
-- `train_custom_v4.py` 固定 `imgsz=1024`，四层锚点共 87,040：P2 65,536 + P3 16,384 +
-  P4 4,096 + P5 1,024（640 输入/34,000 锚点的旧配置不适用）。
-- v4 评估以**点级指标**为准：MAE/RMSE（`count.py`，扫 conf 阈值）、给定像素容忍距离下的
-  一对一匹配 P/R/F1（`localization.py`，默认 conf=0.22、容忍 15 px）、逐图明细
-  （`detailed.py`）。训练日志的标准 YOLO `Box(P/R/mAP)` 因虚拟框尺寸（1×1 px vs 标签
-  宽高 1%）IoU 恒不达标，不能作为结论；置信度阈值、容忍距离、去重规则与 `max_det`
-  必须固定并记录后才可比较。

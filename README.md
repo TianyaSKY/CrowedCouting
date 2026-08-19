@@ -4,15 +4,13 @@
 
 2026 Aug 17 remark:To boost training effeicney,I remove data which larger than 1000.
 
-两个分支：
-
-1. **D2 Task-Only MoE / Random Drop-1 + Soft Top-2（当前推荐）**：保留
-   YOLO11 Backbone+Neck、删除原始 Detect Head，替换为统一候选点网格（P3
-   网格 × K 参考点）上的三专家 MoE 点检测头。训练阶段每个 candidate 随机
-   Drop-1，Router 启用后在剩余两个 expert 间做 masked softmax；由
-   `scripts/training/train_moe.py` 训练，支持 JHU-Crowd++ 等多数据集。
-2. **v4 PointDetect 分支（旧实现）**：在 YOLO11 各尺度（P2–P5）上添加逐尺度点检测头，
-   走 ultralytics 训练管线。保留用于对照实验，不再推荐新训练。
+当前实现为 **D2 Task-Only MoE / Random Drop-1 + Soft Top-2**：保留
+YOLO11 Backbone+Neck、删除原始 Detect Head，替换为统一候选点网格（P3
+网格 × K 参考点）上的三专家 MoE 点检测头。训练阶段每个 candidate 随机
+Drop-1，Router 启用后在剩余两个 expert 间做 masked softmax；由
+`scripts/training/train_moe.py`（单数据集）与 `scripts/training/train_all.py`
+（多数据集联合训练）执行，支持 ShanghaiTech / JHU-Crowd++ / UCF-QNRF /
+UCF-CC-50。
 
 ## 环境
 
@@ -23,8 +21,7 @@ pip install -r requirements.txt
 ```
 
 运行约定：**始终从项目根目录以模块方式执行**（`python -m scripts.xxx`），避免相对导入
-与工作目录问题。除标注 argparse 的脚本外，其余脚本的路径/参数写在 `__main__` 硬编码配置里，
-切换数据集或权重时直接改对应脚本底部即可。
+与工作目录问题。所有训练/评估/可视化脚本均通过 argparse 接收参数。
 
 ## 目录
 
@@ -35,14 +32,11 @@ pip install -r requirements.txt
   - `yolo11_moe_point.py`：`YOLO11MoEPoint`，Backbone+Neck + MoE Point Head 组合网络。
   - `point_moe_loss.py`：`PointMoELoss`，匈牙利匹配 + Focal 分类 + Smooth L1 定位 + 计数；
     Router 不接收独立监督损失。
-  - `crowd_model.py` / `modules.py` / `loss.py` / `yolo11-crowd.yaml`：v4 分支（`CrowdCountingModel`
-    + `PointDetect` + `CrowdPointLoss`）。
-- `scripts/data/`：数据集下载（6 个公开数据集）、ShanghaiTech 转换、离线增强与点标注转换。
-- `scripts/training/`：`train_moe.py`（D2 Task-Only Drop-1 / Soft Top-2 MoE，argparse）
-  与 v4/标准模型训练脚本。
-- `scripts/evaluation/`：人数（MAE/RMSE）、点定位（P/R/F1）与模型对比评估。
-- `scripts/visualization/`：单图/批量预测、GT-Pred 对比与样本绘制。
-- `scripts/diagnostics/`：不修改数据的匹配逻辑检查工具。
+- `scripts/data/`：数据集下载（4 个公开数据集）、ShanghaiTech 转换、离线增强与点标注转换。
+- `scripts/training/`：`train_moe.py`（单数据集，argparse）与 `train_all.py`
+  （多数据集联合训练 + 逐数据集验证）。
+- `scripts/evaluation/`：`evaluate_datasets.py` 跨数据集分组评估（MAE/RMSE）。
+- `scripts/visualization/`：`predict_moe.py` 单图 / `predict_moe_batch.py` 批量预测。
 - `test_each_dataset.py`（根目录）：Scale-MoE 模型按 Part A/B 分组的评估脚本。
 - `runs/`：训练、评估与可视化输出（运行生成）。
 
@@ -144,21 +138,34 @@ python -m scripts.training.train_moe \
 
 常用参数（默认值见 `python -m scripts.training.train_moe --help`）：
 
-| 参数                              | 默认        | 说明                                                               |
-| --------------------------------- | ----------- | ------------------------------------------------------------------ |
-| `--crop-size`                   | 640         | 训练/验证裁剪尺寸                                                  |
-| `--batch-size`                  | 8           |                                                                    |
-| `--epochs`                      | 100         |                                                                    |
-| `--backbone-lr` / `--head-lr` | 1e-4 / 1e-3 | YOLO 主干 / MoE Head 两组 AdamW 学习率                             |
-| `--num-references`              | 4           | 每网格参考点数 K（1/4/9）                                          |
-| `--freeze-epochs`               | 3           | Epoch 1–3 冻结 YOLO 主干；Epoch 4 起解冻                          |
-| `--router-warmup-epochs`        | 6           | Epoch 1–6 Router 冻结，训练使用 candidate-level Drop-1             |
-| `--phase1-temp`                 | 1.5         | Router epoch 15 的温度；默认 `2.0 → 1.5 → 1.0`                    |
-| `--temp-floor-epoch`             | 30          | Router epoch 30 到达温度下限 1.0                                  |
-| `--expert-only-eval-interval`   | 5           | 每 N epoch 跑 E0/E1/E2-only 诊断；0 表示关闭                      |
-| `--match-top-k`                 | 2000        | 匈牙利匹配候选点上限（K=max(K, n_gt)）                             |
-| `--diagnose-scale-routing`      | off         | 可选输出尺度路由混淆矩阵；只作 diagnostic                          |
-| `--resume`                      | None        | 仅从 `router_training_mode=task_only_drop1_soft_top2` 恢复         |
+| 参数                              | 默认            | 说明                                                          |
+| --------------------------------- | --------------- | ------------------------------------------------------------- |
+| `--weights`                     | `yolo11m.pt`  | YOLO11 预训练权重                                             |
+| `--data-root`                   | `datasets/shanghaitech_AB` | 单数据集入口（train_all 用 `--dataset`）      |
+| `--crop-size`                   | 640             | 训练/验证裁剪尺寸                                             |
+| `--batch-size`                  | 8               |                                                               |
+| `--epochs`                      | 100             |                                                               |
+| `--hidden-channels`             | 256             | MoE head 隐层宽度                                             |
+| `--num-references`              | 4               | 每网格参考点数 K（1/4/9）                                     |
+| `--scale-centers`               | `10,20,40`    | 三专家尺度中心（像素）                                        |
+| `--backbone-lr` / `--head-lr`   | 1e-4 / 1e-3     | YOLO 主干 / MoE Head 两组 AdamW 学习率                        |
+| `--weight-decay`                | 1e-4            |                                                               |
+| `--grad-clip`                   | 10.0            | 梯度裁剪范数上限                                              |
+| `--freeze-epochs`               | 3               | Epoch 1–3 冻结 YOLO 主干；Epoch 4 起解冻                     |
+| `--init-temperature`            | 2.0             | Router 启用时 T_router 起始温度                               |
+| `--phase1-temp`                 | 1.5             | Router epoch 15 的温度；默认 `2.0 → 1.5 → 1.0`               |
+| `--soft-temp-floor`             | 1.0             | T_router 下限                                                |
+| `--temp-floor-epoch`            | 30              | Router epoch 30 到达温度下限 1.0                             |
+| `--router-warmup-epochs`        | 6               | Epoch 1–6 Router 冻结，训练使用 candidate-level Drop-1        |
+| `--expert-only-eval-interval`   | 5               | 每 N epoch 跑 E0/E1/E2-only 诊断；0 表示关闭                 |
+| `--match-top-k`                 | 2000            | 匈牙利匹配候选点上限（K=max(K, n_gt)）                        |
+| `--diagnose-scale-routing`      | off             | 可选输出尺度路由混淆矩阵；只作 diagnostic                     |
+| `--workers`                     | 4               | DataLoader 进程数                                            |
+| `--save-dir`                    | 时间戳目录      | 权重保存目录；`--resume` 时沿用原 run                         |
+| `--resume`                      | None            | 仅从 `router_training_mode=task_only_drop1_soft_top2` 恢复    |
+
+train_all 额外参数：`--dataset NAME=ROOT:TRAIN[:TRAIN2...]:EVAL`（可重复，默认 4 数据集）、
+`--allow-test-as-eval`（默认禁止 test 参与训练期选模）。
 
 训练要点：
 
@@ -177,8 +184,8 @@ python -m scripts.training.train_moe \
   diagnostic-only `Top-1` 的 `MAE`。主验证模式是 Top-2，按验证图片数加权的
   normalized MAE 选择 `best_top2.pt`；full3/Top-1 只作诊断。
 - **双概率记录**：`route_probabilities` 始终是未 Drop-1 的完整三专家
-  softmax，用于 matched probability、entropy、margin 和潜在 collapse 诊断；
-  `gates` 是实际 Drop-1 / validation gate，二者不混用。
+  softmax，用于 matched probability mean、full3 entropy/margin 与 collapse
+  诊断（TB `routing/` 组）；`gates` 是实际 Drop-1 / validation gate，二者不混用。
 - **Drop-1 诊断**：记录 full3 deterministic Top-1 usage（三个专家在验证集
   上被 argmax 选中的占比），观察路由是否 collapse。
 - **Expert-only 诊断**：默认每 5 epoch 记录 E0-only、E1-only、E2-only MAE，
@@ -233,39 +240,15 @@ python -m scripts.evaluation.evaluate_datasets \
 
 ### 4. 观察 Router 行为
 
-默认日志记录完整三专家 `route_probabilities` 的 matched probability mean、
-entropy、margin 和 deterministic Top-1 usage。`--diagnose-scale-routing` 开启后
-才输出 GT 尺度类到预测专家的混淆矩阵，并明确标记为 `diagnostic only`。
-默认每 5 epoch 比较三个 expert-only MAE；若 Top-1 usage 偏斜，先比较这些
-独立 expert 输出，再判断是否需要后续架构改动。
-
-## v4 PointDetect 分支（旧）
-
-ultralytics 管线，硬编码配置，运行后修改脚本底部即可：
-
-```bash
-# 训练（imgsz=1024、epochs=200、加载本地 yolo26n.pt 的 Backbone 0–10 层）
-python scripts/training/train_custom_v4.py
-# 对照：标准 YOLO11n 微调 baseline（imgsz=640）
-python scripts/training/train_standard.py
-
-# 评估：人数（MAE/RMSE，扫置信度阈值）/ 点定位（P/R/F1，容忍距离 15px）/ 逐图明细
-python scripts/evaluation/count.py
-python scripts/evaluation/localization.py
-python scripts/evaluation/detailed.py
-python scripts/evaluation/compare_localization.py
-
-# 可视化
-python scripts/visualization/predict.py
-python scripts/visualization/compare_custom.py
-```
-
-注意：v4 用检测框数做计数、用框中心做点匹配，训练日志里的标准 YOLO `Box(P/R/mAP)` 因
-虚拟框（1×1 px）与标签框（宽高 1%）IoU 近乎恒为 0，**不能**用于评价该模型；请使用点级
-MAE/RMSE 与 P/R/F1，并固定置信度阈值、匹配容忍距离和 `max_det` 后再比较。
+每 epoch 文本日志输出 matched probability mean、full3 entropy/margin、
+deterministic Top-1 usage 与训练 sampled usage；TensorBoard `routing/` 组记录
+`full3_entropy`、`full3_margin`、`full3_top1_usage_E{0,1,2}_pct`。
+`--diagnose-scale-routing` 开启后额外输出 GT 尺度类到预测专家的混淆矩阵
+（`diagnostic only`）。默认每 5 epoch 比较三个 expert-only MAE；若 Top-1 usage
+偏斜，先比较这些独立 expert 输出，再判断是否需要后续架构改动。
 
 模型与损失的设计细节见：
 
-- [`crowd_counting_model_summary.md`](./crowd_counting_model_summary.md)（当前 Scale-MoE + v4 附录）
-- [`loss_design_explanation.md`](./loss_design_explanation.md)（`PointMoELoss` 详解 + v4 附录）
+- [`crowd_counting_model_summary.md`](./crowd_counting_model_summary.md)（当前 Scale-MoE 模型结构）
+- [`loss_design_explanation.md`](./loss_design_explanation.md)（`PointMoELoss` 损失设计详解）
 - [`docs/datasets.md`](./docs/datasets.md)（数据集下载/转换/训练接入/跨数据集评估指南）

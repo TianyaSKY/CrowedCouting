@@ -146,8 +146,7 @@ MoE 点检测头的三专家（E0 局部 / E1 中层 / E2 大范围感受野）�
 ## 4. 仓库结构速览
 
 ```
-models/            YOLO11Pyramid + MoEPointHead + PointMoELoss（主分支）；
-                   crowd_model.py + loss.py（v4 旧分支，仅对照）
+models/            YOLO11Pyramid + MoEPointHead + PointMoELoss
 scripts/data/      下载 / 转换 / 增强 / prepare_all
 scripts/training/  train_moe.py（D2 主训练）/ train_all.py（联合训练）
 scripts/evaluation/ 跨数据集评估 evaluate_datasets.py
