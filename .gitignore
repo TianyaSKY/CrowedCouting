@@ -1,8 +1,25 @@
 /datasets
 /data
-.idea/
-__pycache__/
-*.pyc
-.venv/
-.DS_Store
 runs/
+
+# Python / bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+env/
+
+# Jupyter & IPython
+.ipynb_checkpoints/
+.jupyter/
+.jupyter-data/
+.ipython/
+
+# IDE / OS
+.idea/
+.DS_Store
+*.swp
+*.swo
+*~
+
