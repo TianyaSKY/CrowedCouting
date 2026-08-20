@@ -515,9 +515,6 @@ def train_moe(args):
             3, dtype=torch.int64, device=device
         )
         train_positive_sum = torch.zeros(3, device=device)
-        train_distance_sum = torch.zeros(3, device=device)
-        train_confidence_sum = torch.zeros(3, device=device)
-        train_matched_count = 0
 
         for batch in tqdm(
             train_loader,
@@ -539,11 +536,6 @@ def train_moe(args):
                 dtype=torch.int64,
             )
             train_positive_sum += loss_items["positive_count"].to(device)
-            train_distance_sum += loss_items["matched_distance_sum"].to(device)
-            train_confidence_sum += loss_items[
-                "matched_confidence_sum"
-            ].to(device)
-            train_matched_count += int(loss_items["matched_count"].item())
 
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
@@ -583,8 +575,6 @@ def train_moe(args):
         val_positive_count = validation["positive_count"]
         val_distance_mean = validation["matched_distance_sum"] / val_positive_count.clamp_min(1)
         val_confidence_mean = validation["matched_confidence_sum"] / val_positive_count.clamp_min(1)
-        train_distance_mean = train_distance_sum / train_positive_sum.clamp_min(1)
-        train_confidence_mean = train_confidence_sum / train_positive_sum.clamp_min(1)
         val_winner_pct = val_winner_hist.float() / max(int(val_winner_hist.sum()), 1) * 100
         train_winner_pct = train_winner_sum.float() / max(int(train_winner_sum.sum()), 1) * 100
 
@@ -653,17 +643,12 @@ def train_moe(args):
         writer.add_scalar("mae/native_weighted_norm", native_norm_mae, epoch)
         writer.add_scalar("val/rmse_native", native_rmse, epoch)
         writer.add_scalar("val/count_bias_native", native_bias, epoch)
-        writer.add_scalar("native/matched_count", validation["matched_count"], epoch)
         writer.add_scalar("schedule/native_warmup", float(matching_mode == "independent"), epoch)
         for expert_index in range(3):
             writer.add_scalar(f"native/winner_E{expert_index}_pct", float(val_winner_pct[expert_index]), epoch)
             writer.add_scalar(f"native/train_winner_E{expert_index}_pct", float(train_winner_pct[expert_index]), epoch)
             writer.add_scalar(f"native/matched_distance_E{expert_index}", float(val_distance_mean[expert_index]), epoch)
             writer.add_scalar(f"native/matched_confidence_E{expert_index}", float(val_confidence_mean[expert_index]), epoch)
-            writer.add_scalar(f"native/positive_count_E{expert_index}", float(val_positive_count[expert_index]), epoch)
-            writer.add_scalar(f"native/train_positive_count_E{expert_index}", float(train_positive_sum[expert_index]), epoch)
-            writer.add_scalar(f"native/train_matched_distance_E{expert_index}", float(train_distance_mean[expert_index]), epoch)
-            writer.add_scalar(f"native/train_matched_confidence_E{expert_index}", float(train_confidence_mean[expert_index]), epoch)
 
         if collect_visuals and validation["validation_samples"]:
             log_validation_images(

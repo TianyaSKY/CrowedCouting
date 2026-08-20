@@ -369,8 +369,6 @@ def train_all(args: argparse.Namespace) -> None:
             3, dtype=torch.int64, device=device
         )
         train_positive_sum = torch.zeros(3, device=device)
-        train_distance_sum = torch.zeros(3, device=device)
-        train_confidence_sum = torch.zeros(3, device=device)
 
         for batch in tqdm(
             train_loader,
@@ -391,10 +389,6 @@ def train_all(args: argparse.Namespace) -> None:
                 dtype=torch.int64,
             )
             train_positive_sum += loss_items["positive_count"].to(device)
-            train_distance_sum += loss_items["matched_distance_sum"].to(device)
-            train_confidence_sum += loss_items[
-                "matched_confidence_sum"
-            ].to(device)
 
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
@@ -489,8 +483,6 @@ def train_all(args: argparse.Namespace) -> None:
         }
         val_distance_mean = val_distance_sum / val_positive_count.clamp_min(1)
         val_confidence_mean = val_confidence_sum / val_positive_count.clamp_min(1)
-        train_distance_mean = train_distance_sum / train_positive_sum.clamp_min(1)
-        train_confidence_mean = train_confidence_sum / train_positive_sum.clamp_min(1)
         val_winner_pct = val_winner_hist.float() / max(int(val_winner_hist.sum()), 1) * 100
         train_winner_pct = train_winner_sum.float() / max(int(train_winner_sum.sum()), 1) * 100
 
@@ -571,29 +563,12 @@ def train_all(args: argparse.Namespace) -> None:
         writer.add_scalar("mae/native_macro_norm", native_macro_norm, epoch)
         writer.add_scalar("val/rmse_native", native_rmse, epoch)
         writer.add_scalar("val/count_bias_native", native_bias, epoch)
-        writer.add_scalar("native/matched_count", val_matched_count, epoch)
         writer.add_scalar("schedule/native_warmup", float(matching_mode == "independent"), epoch)
         for expert_index in range(3):
             writer.add_scalar(f"native/winner_E{expert_index}_pct", float(val_winner_pct[expert_index]), epoch)
             writer.add_scalar(f"native/train_winner_E{expert_index}_pct", float(train_winner_pct[expert_index]), epoch)
             writer.add_scalar(f"native/matched_distance_E{expert_index}", float(val_distance_mean[expert_index]), epoch)
             writer.add_scalar(f"native/matched_confidence_E{expert_index}", float(val_confidence_mean[expert_index]), epoch)
-            writer.add_scalar(f"native/positive_count_E{expert_index}", float(val_positive_count[expert_index]), epoch)
-            writer.add_scalar(f"native/train_positive_count_E{expert_index}", float(train_positive_sum[expert_index]), epoch)
-            writer.add_scalar(f"native/train_matched_distance_E{expert_index}", float(train_distance_mean[expert_index]), epoch)
-            writer.add_scalar(f"native/train_matched_confidence_E{expert_index}", float(train_confidence_mean[expert_index]), epoch)
-        for name, validation in validation_by_dataset.items():
-            dataset_positive = validation["positive_count"]
-            dataset_winner = validation["winner_hist"]
-            dataset_distance = validation["matched_distance_sum"].to(device) / dataset_positive.to(device).clamp_min(1)
-            dataset_confidence = validation["matched_confidence_sum"].to(device) / dataset_positive.to(device).clamp_min(1)
-            dataset_winner_pct = dataset_winner.float() / max(int(dataset_winner.sum()), 1) * 100
-            for expert_index in range(3):
-                writer.add_scalar(f"native/{name}/winner_E{expert_index}_pct", float(dataset_winner_pct[expert_index]), epoch)
-                writer.add_scalar(f"native/{name}/matched_distance_E{expert_index}", float(dataset_distance[expert_index]), epoch)
-                writer.add_scalar(f"native/{name}/matched_confidence_E{expert_index}", float(dataset_confidence[expert_index]), epoch)
-                writer.add_scalar(f"native/{name}/positive_count_E{expert_index}", float(dataset_positive[expert_index]), epoch)
-
         improved = (
             matching_mode == "competitive"
             and native_weighted_norm < best_selection_score

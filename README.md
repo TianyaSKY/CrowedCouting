@@ -103,11 +103,9 @@ competition 的候选预筛选按 Expert 平衡：`match_top_k` 名额由 E0/E1/
 
 每个 epoch 记录：
 
-- E0/E1/E2 GT winner 比例
-- matched mean distance
-- matched confidence
-- positive count
-- 每个数据集的上述统计
+- E0/E1/E2 GT winner 比例（训练与验证，看专家分工与塌缩）
+- 各专家胜出时的 matched mean distance（验证，定位精度）
+- 各专家胜出时的 matched confidence（验证）
 
 checkpoint：
 
