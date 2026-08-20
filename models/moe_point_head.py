@@ -290,6 +290,31 @@ class MoEPointHead(nn.Module):
             )
         projections = (self.proj3, self.proj4, self.proj5)
         experts = (self.expert3, self.expert4, self.expert5)
+
+        if routing_mode == "expert_only":
+            # 只计算被选中的专家，跳过其余两个投影/专家头。
+            output = self._forward_level(
+                features[expert_index],
+                projections[expert_index],
+                experts[expert_index],
+                expert_index,
+            )
+            logits, points, base_points, expert_indices = output
+            return {
+                "architecture": self.architecture,
+                "logits": logits,
+                "points": points,
+                "base_points": base_points,
+                "expert_indices": expert_indices,
+                "source_expert": expert_indices,
+                "expert_logits": (logits,),
+                "expert_points": (points,),
+                "expert_base_points": (base_points,),
+                "references_per_expert": self.references_per_expert,
+                "output_strides": self.output_strides,
+                "effective_strides": self.effective_strides,
+            }
+
         level_outputs = tuple(
             self._forward_level(
                 feature,

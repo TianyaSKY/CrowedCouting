@@ -80,6 +80,9 @@ def parse_native_references(value: str) -> tuple[int, int, int]:
 
 
 def native_matching_mode(epoch: int, args) -> str:
+    if getattr(args, "expert_index", None) is not None:
+        # 单专家消融：直接用该专家的全局 Hungarian，不走三专家独立循环。
+        return "competitive"
     return (
         "independent"
         if epoch < args.native_warmup_epochs
@@ -88,6 +91,8 @@ def native_matching_mode(epoch: int, args) -> str:
 
 
 def native_matching_stage(epoch: int, args) -> str:
+    if getattr(args, "expert_index", None) is not None:
+        return "competitive_global"
     return (
         "warmup_independent"
         if epoch < args.native_warmup_epochs
@@ -139,6 +144,13 @@ def build_checkpoint_config(
             criterion.match_confidence_weight
         ),
         "candidate_preselection": "expert_balanced_top_k",
+        "routing_mode": (
+            "expert_only"
+            if getattr(args, "expert_index", None) is not None
+            else "native"
+        ),
+        "expert_index": getattr(args, "expert_index", None),
+        "seed": getattr(args, "seed", None),
     }
 
 
@@ -221,6 +233,8 @@ def evaluate_native_count_mae(
     device,
     criterion: PointMoELoss | None = None,
     max_visual_samples: int = 0,
+    routing_mode: str = "native",
+    expert_index: int | None = None,
 ):
     if max_visual_samples < 0:
         raise ValueError("max_visual_samples must not be negative")
@@ -251,7 +265,11 @@ def evaluate_native_count_mae(
         for batch in tqdm(val_loader, desc="Native 验证中", leave=False):
             images = batch["img"].to(device)
             gt_points = [p.to(device) for p in batch["points"]]
-            predictions = model(images)
+            predictions = model(
+                images,
+                routing_mode=routing_mode,
+                expert_index=expert_index,
+            )
             pred_counts = predictions["logits"].sigmoid().sum(dim=1)
 
             for image_index, gt in enumerate(gt_points):
@@ -339,17 +357,37 @@ def evaluate_native_count_mae(
 def train_moe(args):
     if args.native_warmup_epochs < 0:
         raise ValueError("--native-warmup-epochs 不能为负数")
+    if args.expert_index is not None and not 0 <= args.expert_index <= 2:
+        raise ValueError("--expert-index 必须是 0、1 或 2")
     native_references = parse_native_references(args.native_references)
 
     if args.save_dir is None:
         if args.resume:
             args.save_dir = os.path.dirname(os.path.abspath(args.resume))
+        elif args.expert_index is not None:
+            args.save_dir = timestamped_save_dir(
+                f"runs/ablation_E{args.expert_index}"
+            )
         else:
             args.save_dir = timestamped_save_dir("runs/native_multiscale")
 
     os.makedirs(args.save_dir, exist_ok=True)
     setup_logging(os.path.join(args.save_dir, "train.log"))
     logging.info("输出目录: %s", args.save_dir)
+    if args.seed is not None:
+        import random
+
+        random.seed(args.seed)
+        np.random.seed(args.seed)
+        torch.manual_seed(args.seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(args.seed)
+        logging.info("固定随机种子: %d", args.seed)
+    if args.expert_index is not None:
+        logging.info(
+            "expert-only 消融：仅训练/预测 E%d (routing_mode=expert_only)",
+            args.expert_index,
+        )
 
     writer = SummaryWriter(
         log_dir=os.path.join(args.save_dir, "tensorboard")
@@ -497,6 +535,11 @@ def train_moe(args):
         epoch_started_at = time.perf_counter()
         matching_mode = native_matching_mode(epoch, args)
         matching_stage = native_matching_stage(epoch, args)
+        routing_mode = (
+            "expert_only"
+            if args.expert_index is not None
+            else "native"
+        )
         if args.freeze_epochs > 0 and epoch == args.freeze_epochs:
             for param in model.yolo.parameters():
                 param.requires_grad = True
@@ -523,7 +566,11 @@ def train_moe(args):
         ):
             images = batch["img"].to(device)
             gt_points = [p.to(device) for p in batch["points"]]
-            predictions = model(images)
+            predictions = model(
+                images,
+                routing_mode=routing_mode,
+                expert_index=args.expert_index,
+            )
             loss, loss_items = criterion(
                 predictions,
                 gt_points,
@@ -565,6 +612,8 @@ def train_moe(args):
             device,
             criterion=criterion,
             max_visual_samples=val_image_count if collect_visuals else 0,
+            routing_mode=routing_mode,
+            expert_index=args.expert_index,
         )
 
         native_mae = validation["mae"]
@@ -770,7 +819,20 @@ def build_parser():
         help="Hungarian cost 的 confidence 权重",
     )
     parser.add_argument("--freeze-epochs", type=int, default=3)
+    parser.add_argument(
+        "--expert-index",
+        type=int,
+        default=None,
+        help="单专家消融：只训练/预测 E0/E1/E2 (0/1/2)，"
+        "模型走 expert_only 路由，matching 全程 competitive",
+    )
     parser.add_argument("--grad-clip", type=float, default=10.0)
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=None,
+        help="固定 torch/numpy/random 种子，保证不同 run 数据增广序列一致",
+    )
     parser.add_argument("--workers", type=int, default=4)
     parser.add_argument("--save-dir", type=str, default=None)
     parser.add_argument(

@@ -101,6 +101,9 @@ class PointMoELoss(nn.Module):
         if pred_logits.shape[0] > top_k:
             if expert_indices is None:
                 match_indices = pred_logits.topk(top_k).indices
+            elif expert_indices.unique().numel() == 1:
+                # 单专家消融（expert_only）：整个 top_k 预算归该专家
+                match_indices = pred_logits.topk(top_k).indices
             else:
                 quotas = [
                     top_k // 3
