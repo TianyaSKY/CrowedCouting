@@ -39,6 +39,17 @@ from models.yolo11_moe_point import YOLO11MoEPoint
 from scripts.data.point_dataset import PointDataset, point_collate_fn
 
 
+from dataclasses import dataclass
+
+from scripts.visualization.plot_utils import (
+    create_moe_comparison_figure,
+    generate_markdown_report,
+    plot_benchmark_bar_chart,
+    plot_count_scatter,
+    save_figure,
+)
+
+
 @dataclass
 class CountMetrics:
     """Streaming count-error accumulator for one dataset subset."""
@@ -46,6 +57,7 @@ class CountMetrics:
     num_images: int = 0
     abs_error_sum: float = 0.0
     squared_error_sum: float = 0.0
+    nae_sum: float = 0.0
     gt_total: int = 0
     pred_total: float = 0.0
 
@@ -54,6 +66,7 @@ class CountMetrics:
         self.num_images += 1
         self.abs_error_sum += abs(error)
         self.squared_error_sum += error * error
+        self.nae_sum += abs(error) / max(float(gt_count), 1.0)
         self.gt_total += gt_count
         self.pred_total += pred_count
 
@@ -63,6 +76,7 @@ class CountMetrics:
                 "num_images": 0,
                 "mae": 0.0,
                 "rmse": 0.0,
+                "nae": 0.0,
                 "gt_total": 0,
                 "pred_total": 0.0,
             }
@@ -71,6 +85,7 @@ class CountMetrics:
             "num_images": self.num_images,
             "mae": self.abs_error_sum / self.num_images,
             "rmse": (self.squared_error_sum / self.num_images) ** 0.5,
+            "nae": self.nae_sum / self.num_images,
             "gt_total": self.gt_total,
             "pred_total": self.pred_total,
         }
@@ -272,6 +287,7 @@ def format_metrics(name: str, metrics: CountMetrics) -> str:
         f"{name:<8} n={values['num_images']:>3} "
         f"MAE={values['mae']:.3f} "
         f"RMSE={values['rmse']:.3f} "
+        f"NAE={values['nae']:.4f} "
         f"GT={values['gt_total']} "
         f"Pred={values['pred_total']:.1f}"
     )
@@ -349,6 +365,9 @@ def evaluate(args: argparse.Namespace) -> None:
     }
 
     csv_path = os.path.join(args.out_dir, "predictions.csv")
+    detailed_records: list[dict[str, object]] = []
+    processed_count = 0
+
     with open(csv_path, "w", newline="", encoding="utf-8") as csv_file:
         writer = csv.writer(csv_file)
         writer.writerow(
@@ -385,11 +404,8 @@ def evaluate(args: argparse.Namespace) -> None:
                     .tolist()
                 )
 
-                for filename, subset, points, pred_count in zip(
-                    filenames,
-                    subsets,
-                    gt_points,
-                    pred_counts,
+                for i, (filename, subset, points, pred_count) in enumerate(
+                    zip(filenames, subsets, gt_points, pred_counts)
                 ):
                     gt_count = int(points.shape[0])
                     pred_count = float(pred_count)
@@ -397,6 +413,17 @@ def evaluate(args: argparse.Namespace) -> None:
 
                     metrics["overall"].update(gt_count, pred_count)
                     metrics[str(subset)].update(gt_count, pred_count)
+
+                    detailed_records.append(
+                        {
+                            "dataset_index": processed_count + i,
+                            "filename": filename,
+                            "subset": str(subset),
+                            "gt_count": gt_count,
+                            "pred_count": pred_count,
+                            "abs_error": abs_error,
+                        }
+                    )
 
                     writer.writerow(
                         [
@@ -407,6 +434,8 @@ def evaluate(args: argparse.Namespace) -> None:
                             f"{abs_error:.6f}",
                         ]
                     )
+
+                processed_count += len(gt_points)
 
     if metrics["overall"].num_images == 0:
         raise RuntimeError("没有成功评估任何图像")
@@ -428,6 +457,146 @@ def evaluate(args: argparse.Namespace) -> None:
     summary_path = os.path.join(args.out_dir, "summary.json")
     with open(summary_path, "w", encoding="utf-8") as summary_file:
         json.dump(summary, summary_file, indent=2, ensure_ascii=False)
+
+    # 1. 生成并保存 GT vs Pred 回归散点图
+    if args.save_scatter and detailed_records:
+        overall_scatter = plot_count_scatter(
+            [float(r["gt_count"]) for r in detailed_records],
+            [float(r["pred_count"]) for r in detailed_records],
+            metrics=metrics["overall"].as_dict(),
+            title=f"ShanghaiTech ({args.split}): GT vs. Predicted Count",
+        )
+        save_figure(overall_scatter, os.path.join(args.out_dir, "overall_scatter.png"))
+        logging.info(f"总览散点图已保存: {os.path.join(args.out_dir, 'overall_scatter.png')}")
+
+        for subset_name in ("part_A", "part_B"):
+            sub_records = [r for r in detailed_records if r["subset"] == subset_name]
+            if sub_records:
+                sub_scatter = plot_count_scatter(
+                    [float(r["gt_count"]) for r in sub_records],
+                    [float(r["pred_count"]) for r in sub_records],
+                    metrics=metrics[subset_name].as_dict(),
+                    title=f"ShanghaiTech {subset_name.replace('_', ' ').title()} ({args.split}): GT vs. Predicted",
+                )
+                save_figure(sub_scatter, os.path.join(args.out_dir, f"{subset_name}_scatter.png"))
+                logging.info(f"{subset_name} 散点图已保存: {os.path.join(args.out_dir, f'{subset_name}_scatter.png')}")
+
+    # 2. 生成定性样本对比图（难例 Worst-N 与优秀样本 Best-N）
+    if args.num_vis > 0 and detailed_records:
+        vis_dir = os.path.join(args.out_dir, "eval_vis")
+        os.makedirs(vis_dir, exist_ok=True)
+        sorted_records = sorted(
+            detailed_records, key=lambda r: float(r["abs_error"]), reverse=True
+        )
+        half = max(1, args.num_vis // 2)
+        selected: list[tuple[str, dict[str, object]]] = []
+        for rank, r in enumerate(sorted_records[:half]):
+            selected.append((f"worst_{rank + 1:02d}", r))
+        for rank, r in enumerate(sorted_records[-half:]):
+            selected.append((f"best_{rank + 1:02d}", r))
+
+        with torch.inference_mode():
+            for tag, record in selected:
+                idx = int(record["dataset_index"])
+                raw_sample = base_dataset[idx]
+                sample_img = raw_sample["img"].unsqueeze(0).to(device)  # [1, 3, H, W]
+                sample_gt = raw_sample["points"]
+                sample_pred = model(
+                    sample_img,
+                    temperature=temperature,
+                    routing_mode=args.mode,
+                )
+                p_scores = sample_pred["logits"][0].sigmoid().cpu()
+                p_points = sample_pred["points"][0].cpu()
+                p_routes = sample_pred["gates"][0].argmax(dim=-1).cpu()
+
+                clean_id = str(record["filename"]).replace(".jpg", "")
+                gt_c = float(record["gt_count"])
+                pred_c = float(record["pred_count"])
+                err_c = float(record["abs_error"])
+
+                fig = create_moe_comparison_figure(
+                    image=sample_img[0],
+                    gt_points=sample_gt,
+                    pred_points=p_points,
+                    pred_routes=p_routes,
+                    pred_scores=p_scores,
+                    gt_count=gt_c,
+                    pred_count=pred_c,
+                    title=f"[{tag.upper()}] {clean_id} | GT: {gt_c:.0f} | Pred: {pred_c:.1f} (Err: {err_c:.1f})",
+                )
+                vis_path = os.path.join(
+                    vis_dir, f"{tag}_{clean_id}_gt{gt_c:.0f}_pred{pred_c:.0f}.jpg"
+                )
+                save_figure(fig, vis_path)
+
+        logging.info(f"定性对比图已保存 ({len(selected)} 张): {vis_dir}")
+
+    # 3. 生成 Markdown 总结报告与 Benchmark 对比柱状图
+    if args.report:
+        bar_data = {
+            name: metrics[name].as_dict()
+            for name in ("part_A", "part_B")
+            if metrics[name].num_images > 0
+        }
+        if bar_data:
+            bar_chart_path = os.path.join(args.out_dir, "benchmark_comparison.png")
+            plot_benchmark_bar_chart(
+                bar_data,
+                bar_chart_path,
+                title=f"ShanghaiTech ({args.split}) Performance by Subset",
+            )
+            logging.info(f"子集对比柱状图已保存: {bar_chart_path}")
+
+        headers = ["Subset", "Images (N)", "MAE", "RMSE", "NAE", "GT Total", "Pred Total"]
+        rows = []
+        details = []
+        for s_name in ("part_A", "part_B", "overall"):
+            if metrics[s_name].num_images > 0:
+                m = metrics[s_name].as_dict()
+                display = "Part A" if s_name == "part_A" else ("Part B" if s_name == "part_B" else "Overall")
+                rows.append([
+                    display,
+                    str(m["num_images"]),
+                    f"{m['mae']:.3f}",
+                    f"{m['rmse']:.3f}",
+                    f"{m['nae']:.4f}",
+                    str(int(m["gt_total"])),
+                    f"{float(m['pred_total']):.1f}",
+                ])
+                scatter_f = f"{s_name}_scatter.png"
+                arts = {
+                    "Predictions CSV": "predictions.csv",
+                    "Scatter Plot": scatter_f if os.path.exists(os.path.join(args.out_dir, scatter_f)) else "",
+                }
+                details.append({
+                    "name": f"ShanghaiTech {display}",
+                    "samples": f"{m['num_images']} images",
+                    "mae": m["mae"],
+                    "rmse": m["rmse"],
+                    "nae": m["nae"],
+                    "gt_total": int(m["gt_total"]),
+                    "pred_total": float(m["pred_total"]),
+                    "artifacts": {k: v for k, v in arts.items() if v},
+                })
+
+        report_path = os.path.join(args.out_dir, "summary_report.md")
+        generate_markdown_report(
+            title="YOLO11-MoE 人群计数评测报告 (ShanghaiTech Evaluation Report)",
+            meta={
+                "Checkpoint": args.checkpoint,
+                "Split": args.split,
+                "Routing Mode": args.mode,
+                "Crop Size": crop_size,
+                "Temperature": temperature,
+                "Device": device,
+            },
+            headers=headers,
+            rows=rows,
+            dataset_details=details,
+            output_path=report_path,
+        )
+        logging.info(f"基准总结报告已生成: {report_path}")
 
     logging.info("=" * 72)
     logging.info(
@@ -510,8 +679,39 @@ def parse_args() -> argparse.Namespace:
         type=str,
         default="runs/moe_point/test_eval",
     )
+    parser.add_argument(
+        "--save-scatter",
+        action="store_true",
+        default=True,
+        help="保存 GT vs Pred 回归散点图（默认开启）",
+    )
+    parser.add_argument(
+        "--no-scatter",
+        dest="save_scatter",
+        action="store_false",
+        help="禁用散点图生成",
+    )
+    parser.add_argument(
+        "--num-vis",
+        type=int,
+        default=6,
+        help="保存定性样本对比图数量（默认 6，兼顾最大误差与最小误差样本）",
+    )
+    parser.add_argument(
+        "--report",
+        action="store_true",
+        default=True,
+        help="生成 summary_report.md 总结报告与对比柱状图（默认开启）",
+    )
+    parser.add_argument(
+        "--no-report",
+        dest="report",
+        action="store_false",
+        help="禁用 Markdown 报告生成",
+    )
     return parser.parse_args()
 
 
 if __name__ == "__main__":
     evaluate(parse_args())
+

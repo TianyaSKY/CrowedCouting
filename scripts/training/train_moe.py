@@ -1,5 +1,6 @@
 import argparse
 import logging
+import math
 import os
 import shutil
 import time
@@ -13,7 +14,6 @@ os.environ.setdefault(
 
 import numpy as np
 import torch
-import torch.nn as nn
 from scipy.optimize import linear_sum_assignment
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
@@ -24,6 +24,9 @@ from models.point_moe_loss import PointMoELoss
 from scripts.data.point_dataset import (
     PointDataset,
     point_collate_fn,
+)
+from scripts.visualization.validation_visualizer import (
+    log_validation_images,
 )
 
 
@@ -424,8 +427,20 @@ def evaluate_count_mae(
     ),
     scale_sigma_octaves: float = 0.6,
     diagnose_scale_routing: bool = False,
+    criterion: PointMoELoss | None = None,
+    max_visual_samples: int = 0,
 ):
-    """Validate full3-soft, deterministic Top-2, and diagnostic Top-1."""
+    """Validate full3-soft, deterministic Top-2, and diagnostic Top-1.
+
+    When ``criterion`` is supplied, Top-2 validation loss is computed from
+    the already-produced deterministic Top-2 predictions. When
+    ``max_visual_samples`` is positive, the same Top-2 predictions are
+    detached and returned for TensorBoard rendering; no extra forward pass
+    is performed.
+    """
+    if max_visual_samples < 0:
+        raise ValueError("max_visual_samples must not be negative")
+
     was_training = model.training
     model.eval()
 
@@ -437,7 +452,22 @@ def evaluate_count_mae(
     total_abs_error = {
         mode: 0.0 for mode in mode_specs
     }
+    total_squared_error = {
+        mode: 0.0 for mode in mode_specs
+    }
+    total_bias = {
+        mode: 0.0 for mode in mode_specs
+    }
     total_images = 0
+    num_batches = 0
+    top2_loss_sums = (
+        {
+            name: torch.zeros((), device=device)
+            for name in ("total", "cls", "point", "count")
+        }
+        if criterion is not None
+        else None
+    )
     full3_top1_usage = torch.zeros(
         3, dtype=torch.int64, device=device
     )
@@ -452,6 +482,7 @@ def evaluate_count_mae(
         (), device=device
     )
     full3_gate_points = 0
+    validation_samples: list[dict[str, object]] = []
 
     with torch.no_grad():
         for batch in tqdm(
@@ -474,10 +505,71 @@ def evaluate_count_mae(
                 scores = predictions["logits"].sigmoid()
                 pred_counts = scores.sum(dim=1)
 
-                for i, gt_count in enumerate(gt_counts):
-                    total_abs_error[mode] += abs(
-                        float(pred_counts[i]) - gt_count
+                for image_index, gt_count in enumerate(gt_counts):
+                    error = (
+                        float(pred_counts[image_index].item())
+                        - gt_count
                     )
+                    total_abs_error[mode] += abs(error)
+                    total_squared_error[mode] += error * error
+                    total_bias[mode] += error
+
+                if mode == "top2":
+                    if criterion is not None:
+                        top2_loss, loss_items = criterion(
+                            predictions,
+                            gt_points,
+                            image_size=images.shape[-2:],
+                        )
+                        top2_loss_sums["total"] += (
+                            top2_loss.detach()
+                        )
+                        for loss_name in ("cls", "point", "count"):
+                            top2_loss_sums[loss_name] += (
+                                loss_items[loss_name].detach()
+                            )
+
+                    if (
+                        len(validation_samples)
+                        < max_visual_samples
+                    ):
+                        image_paths = batch.get(
+                            "image_paths", []
+                        )
+                        for image_index in range(
+                            len(gt_counts)
+                        ):
+                            if (
+                                len(validation_samples)
+                                >= max_visual_samples
+                            ):
+                                break
+                            image_path = None
+                            if isinstance(image_paths, list):
+                                image_path = image_paths[
+                                    image_index
+                                ]
+                            validation_samples.append(
+                                {
+                                    "image": images[
+                                        image_index
+                                    ].detach().cpu(),
+                                    "gt_points": gt_points[
+                                        image_index
+                                    ].detach().cpu(),
+                                    "predictions": {
+                                        name: predictions[name][
+                                            image_index
+                                        ].detach().cpu()
+                                        for name in (
+                                            "logits",
+                                            "points",
+                                            "gates",
+                                        )
+                                    },
+                                    "image_path": image_path,
+                                }
+                            )
 
                 if mode != "full3":
                     continue
@@ -511,13 +603,26 @@ def evaluate_count_mae(
                     route_confusion += batch_confusion
 
             total_images += len(gt_counts)
+            num_batches += 1
 
     if was_training:
         model.train()
 
-    return {
+    result = {
         "mae": {
             mode: total_abs_error[mode]
+            / max(total_images, 1)
+            for mode in mode_specs
+        },
+        "rmse": {
+            mode: (
+                total_squared_error[mode]
+                / max(total_images, 1)
+            ) ** 0.5
+            for mode in mode_specs
+        },
+        "bias": {
+            mode: total_bias[mode]
             / max(total_images, 1)
             for mode in mode_specs
         },
@@ -527,7 +632,16 @@ def evaluate_count_mae(
         "full3_gate_entropy_sum": full3_gate_entropy_sum,
         "full3_gate_margin_sum": full3_gate_margin_sum,
         "full3_gate_points": full3_gate_points,
+        "validation_samples": validation_samples,
     }
+    if top2_loss_sums is None:
+        result["top2_loss"] = None
+    else:
+        result["top2_loss"] = {
+            name: (value / max(num_batches, 1)).item()
+            for name, value in top2_loss_sums.items()
+        }
+    return result
 
 
 def evaluate_expert_only_mae(
@@ -648,6 +762,72 @@ def dataset_mean_gt_count(dataset) -> float:
     return total_points / max(len(dataset), 1)
 
 
+def validation_image_options(args) -> tuple[int, int, float]:
+    interval = int(getattr(args, "val_image_interval", 1))
+    count = int(getattr(args, "val_image_count", 4))
+    conf_threshold = float(
+        getattr(args, "val_image_conf", 0.5)
+    )
+    if interval < 0:
+        raise ValueError("--val-image-interval 不能为负数")
+    if count < 0:
+        raise ValueError("--val-image-count 不能为负数")
+    if not 0.0 <= conf_threshold <= 1.0:
+        raise ValueError("--val-image-conf 必须在 0 到 1 之间")
+    return interval, count, conf_threshold
+
+
+def dataset_tag_from_root(data_root: str) -> str:
+    tag = os.path.basename(os.path.normpath(data_root))
+    return tag or "dataset"
+
+
+def log_system_metrics(
+    writer: SummaryWriter,
+    optimizer,
+    epoch: int,
+    epoch_seconds: float,
+    device: str,
+) -> None:
+    writer.add_scalar(
+        "system/epoch_seconds",
+        epoch_seconds,
+        epoch,
+    )
+    if str(device).startswith("cuda") and torch.cuda.is_available():
+        allocated_mb = (
+            torch.cuda.memory_allocated() / (1024 ** 2)
+        )
+        reserved_mb = (
+            torch.cuda.memory_reserved() / (1024 ** 2)
+        )
+    else:
+        allocated_mb = 0.0
+        reserved_mb = 0.0
+    writer.add_scalar(
+        "system/gpu_memory_allocated_mb",
+        allocated_mb,
+        epoch,
+    )
+    writer.add_scalar(
+        "system/gpu_memory_reserved_mb",
+        reserved_mb,
+        epoch,
+    )
+    if optimizer.param_groups:
+        writer.add_scalar(
+            "train/lr_head",
+            float(optimizer.param_groups[0]["lr"]),
+            epoch,
+        )
+    if len(optimizer.param_groups) > 1:
+        writer.add_scalar(
+            "train/lr_backbone",
+            float(optimizer.param_groups[1]["lr"]),
+            epoch,
+        )
+
+
 def train_moe(args):
     if args.router_warmup_epochs < 0:
         raise ValueError("--router-warmup-epochs 不能为负数")
@@ -717,6 +897,11 @@ def train_moe(args):
         augment=False,
     )
     val_mean_gt_count = dataset_mean_gt_count(val_dataset)
+    val_image_interval, val_image_count, val_image_conf = (
+        validation_image_options(args)
+    )
+    dataset_tag = dataset_tag_from_root(args.data_root)
+
 
     gt_counts = train_dataset.sample_gt_counts(
         num_samples=100
@@ -826,6 +1011,7 @@ def train_moe(args):
 
 
     for epoch in range(start_epoch, args.epochs):
+        epoch_started_at = time.perf_counter()
         router_warmup = (
             epoch < args.router_warmup_epochs
         )
@@ -935,6 +1121,10 @@ def train_moe(args):
             for loss_name in loss_sums
         }
 
+        collect_visuals = (
+            val_image_interval > 0
+            and (epoch + 1) % val_image_interval == 0
+        )
         validation = evaluate_count_mae(
             model,
             val_loader,
@@ -947,11 +1137,22 @@ def train_moe(args):
             diagnose_scale_routing=(
                 args.diagnose_scale_routing
             ),
+            criterion=criterion,
+            max_visual_samples=(
+                val_image_count if collect_visuals else 0
+            ),
         )
 
         full3_mae = validation["mae"]["full3"]
         top2_mae = validation["mae"]["top2"]
         top1_mae = validation["mae"]["top1"]
+        full3_rmse = validation["rmse"]["full3"]
+        top2_rmse = validation["rmse"]["top2"]
+        top1_rmse = validation["rmse"]["top1"]
+        full3_bias = validation["bias"]["full3"]
+        top2_bias = validation["bias"]["top2"]
+        top1_bias = validation["bias"]["top1"]
+        top2_loss = validation["top2_loss"]
         normalizer = max(val_mean_gt_count, 1e-12)
         full3_norm_mae = full3_mae / normalizer
         top2_norm_mae = top2_mae / normalizer
@@ -1098,10 +1299,30 @@ def train_moe(args):
                 )
 
         # ---- TensorBoard 写入 ----
+        # Preserve the historical tags for existing event files.
         writer.add_scalar("loss/total", avg_loss, epoch)
         writer.add_scalar("loss/cls", avg_loss_items["cls"], epoch)
         writer.add_scalar("loss/point", avg_loss_items["point"], epoch)
         writer.add_scalar("loss/count", avg_loss_items["count"], epoch)
+
+        writer.add_scalar("train/loss_total", avg_loss, epoch)
+        writer.add_scalar(
+            "train/loss_cls", avg_loss_items["cls"], epoch
+        )
+        writer.add_scalar(
+            "train/loss_point", avg_loss_items["point"], epoch
+        )
+        writer.add_scalar(
+            "train/loss_count", avg_loss_items["count"], epoch
+        )
+
+        if top2_loss is not None:
+            for loss_name in ("total", "cls", "point", "count"):
+                writer.add_scalar(
+                    f"val/loss_top2_{loss_name}",
+                    top2_loss[loss_name],
+                    epoch,
+                )
 
         writer.add_scalar("mae/full3_raw", full3_mae, epoch)
         writer.add_scalar("mae/top2_raw", top2_mae, epoch)
@@ -1120,14 +1341,68 @@ def train_moe(args):
             top1_weighted_norm_mae,
             epoch,
         )
-        writer.add_scalar("schedule/router_temperature", temperature, epoch)
+        writer.add_scalar(
+            "val/mae_full3_raw", full3_mae, epoch
+        )
+        writer.add_scalar(
+            "val/mae_top2_raw", top2_mae, epoch
+        )
+        writer.add_scalar(
+            "val/mae_top1_raw", top1_mae, epoch
+        )
+        writer.add_scalar(
+            "val/mae_full3_weighted_norm",
+            full3_weighted_norm_mae,
+            epoch,
+        )
+        writer.add_scalar(
+            "val/mae_top2_weighted_norm",
+            top2_weighted_norm_mae,
+            epoch,
+        )
+        writer.add_scalar(
+            "val/mae_top1_weighted_norm",
+            top1_weighted_norm_mae,
+            epoch,
+        )
+        for mode, rmse, bias in (
+            ("full3", full3_rmse, full3_bias),
+            ("top2", top2_rmse, top2_bias),
+            ("top1", top1_rmse, top1_bias),
+        ):
+            writer.add_scalar(
+                f"val/rmse_{mode}", rmse, epoch
+            )
+            writer.add_scalar(
+                f"val/count_bias_{mode}", bias, epoch
+            )
+        writer.add_scalar(
+            "val/rmse_top2", top2_rmse, epoch
+        )
+        writer.add_scalar(
+            "val/count_bias", top2_bias, epoch
+        )
+        writer.add_scalar(
+            "schedule/router_temperature", temperature, epoch
+        )
 
         writer.add_scalar("routing/full3_entropy", val_gate_entropy, epoch)
         writer.add_scalar("routing/full3_margin", val_gate_margin, epoch)
+        writer.add_scalar(
+            "val/routing_entropy", val_gate_entropy, epoch
+        )
+        writer.add_scalar(
+            "val/routing_margin", val_gate_margin, epoch
+        )
         for expert_index in range(3):
             writer.add_scalar(
                 f"routing/full3_top1_usage_E{expert_index}_pct",
                 float(full3_top1_usage_pct[expert_index]),
+                epoch,
+            )
+            writer.add_scalar(
+                f"val/expert_usage_E{expert_index}",
+                float(full3_top1_usage_pct[expert_index]) / 100.0,
                 epoch,
             )
         if expert_only_mae is not None:
@@ -1137,6 +1412,15 @@ def train_moe(args):
                     expert_only_mae[f"E{expert_index}"],
                     epoch,
                 )
+
+        if collect_visuals and validation["validation_samples"]:
+            log_validation_images(
+                writer,
+                f"val_images/{dataset_tag}",
+                validation["validation_samples"],
+                epoch,
+                conf_threshold=val_image_conf,
+            )
 
         val_score_for_best = top2_weighted_norm_mae
         improved = (
@@ -1150,6 +1434,13 @@ def train_moe(args):
             )
         else:
             best_path = None
+        if math.isfinite(best_selection_score):
+            writer.add_scalar(
+                "val/best_score",
+                best_selection_score,
+                epoch,
+            )
+
 
         checkpoint_data = {
             "model": model.state_dict(),
@@ -1178,6 +1469,13 @@ def train_moe(args):
             ),
             "top2_full3_gap": top2_full3_gap,
             "top1_top2_gap": top1_top2_gap,
+            "top2_loss": top2_loss,
+            "full3_rmse": full3_rmse,
+            "top2_rmse": top2_rmse,
+            "top1_rmse": top1_rmse,
+            "full3_count_bias": full3_bias,
+            "top2_count_bias": top2_bias,
+            "top1_count_bias": top1_bias,
             "full3_matched_probability_mean": (
                 matched_probability_mean.detach().cpu()
             ),
@@ -1231,6 +1529,17 @@ def train_moe(args):
             checkpoint_data,
             os.path.join(args.save_dir, "last.pt"),
         )
+        epoch_seconds = (
+            time.perf_counter() - epoch_started_at
+        )
+        log_system_metrics(
+            writer,
+            optimizer,
+            epoch,
+            epoch_seconds,
+            device,
+        )
+        writer.flush()
 
     writer.close()
     logging.info("训练结束。")
@@ -1307,6 +1616,24 @@ def build_parser():
     parser.add_argument(
         "--expert-only-eval-interval", type=int, default=5,
         help="每 N 个 epoch 运行一次 E0/E1/E2-only 诊断；0 表示关闭"
+    )
+    parser.add_argument(
+        "--val-image-interval",
+        type=int,
+        default=1,
+        help="每 N 个 epoch 写入固定验证图；0 表示关闭",
+    )
+    parser.add_argument(
+        "--val-image-count",
+        type=int,
+        default=4,
+        help="每次写入的验证图数量",
+    )
+    parser.add_argument(
+        "--val-image-conf",
+        type=float,
+        default=0.5,
+        help="验证图可视化的可见点阈值；Metric count 仍使用 sigmoid 求和",
     )
     parser.add_argument(
         "--diagnose-scale-routing",

@@ -30,8 +30,10 @@ evaluate_datasets / test_each_dataset。先转换数据:
 
 import argparse
 import glob
+import math
 import os
 import shutil
+import time
 
 os.environ.setdefault(
     "PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True"
@@ -337,6 +339,9 @@ def train_all(args: argparse.Namespace) -> None:
             val_image_counts[name],
             val_mean_gt_counts[name],
         )
+    val_image_interval, val_image_count, val_image_conf = (
+        tm.validation_image_options(args)
+    )
     logging.info(
         "训练样本总数: %d（%d 个数据集 split 拼接）",
         len(train_dataset),
@@ -426,6 +431,7 @@ def train_all(args: argparse.Namespace) -> None:
                 param.requires_grad = True
 
     for epoch in range(start_epoch, args.epochs):
+        epoch_started_at = time.perf_counter()
         router_warmup = (
             epoch < args.router_warmup_epochs
         )
@@ -530,6 +536,11 @@ def train_all(args: argparse.Namespace) -> None:
         }
 
         per_dataset: dict[str, dict[str, float]] = {}
+        validation_by_dataset: dict[str, dict[str, object]] = {}
+        collect_visuals = (
+            val_image_interval > 0
+            and (epoch + 1) % val_image_interval == 0
+        )
         expert_only_by_dataset = {}
         full3_top1_usage_sum = torch.zeros(
             3, dtype=torch.int64, device=device
@@ -557,8 +568,21 @@ def train_all(args: argparse.Namespace) -> None:
                 diagnose_scale_routing=(
                     args.diagnose_scale_routing
                 ),
+                criterion=criterion,
+                max_visual_samples=(
+                    val_image_count if collect_visuals else 0
+                ),
             )
+            validation_by_dataset[name] = validation
             per_dataset[name] = validation["mae"]
+            if collect_visuals and validation["validation_samples"]:
+                tm.log_validation_images(
+                    writer,
+                    f"val_images/{name}",
+                    validation["validation_samples"],
+                    epoch,
+                    conf_threshold=val_image_conf,
+                )
             full3_top1_usage_sum += validation[
                 "full3_top1_usage"
             ]
@@ -625,6 +649,38 @@ def train_all(args: argparse.Namespace) -> None:
             val_image_counts,
             "top1",
         )
+        total_val_images = max(
+            sum(val_image_counts.values()),
+            1,
+        )
+        top2_loss = {
+            loss_name: sum(
+                val_image_counts[name]
+                * validation_by_dataset[name]["top2_loss"][
+                    loss_name
+                ]
+                for name in validation_by_dataset
+            ) / total_val_images
+            for loss_name in ("total", "cls", "point", "count")
+        }
+        rmse_by_mode = {
+            mode: (
+                sum(
+                    val_image_counts[name]
+                    * validation_by_dataset[name]["rmse"][mode] ** 2
+                    for name in validation_by_dataset
+                ) / total_val_images
+            ) ** 0.5
+            for mode in ("full3", "top2", "top1")
+        }
+        bias_by_mode = {
+            mode: sum(
+                val_image_counts[name]
+                * validation_by_dataset[name]["bias"][mode]
+                for name in validation_by_dataset
+            ) / total_val_images
+            for mode in ("full3", "top2", "top1")
+        }
         top2_full3_gap = (
             top2_weighted_norm_mae
             - full3_weighted_norm_mae
@@ -763,10 +819,28 @@ def train_all(args: argparse.Namespace) -> None:
             )
 
         # ---- TensorBoard 写入 ----
+        # Preserve the historical tags for existing event files.
         writer.add_scalar("loss/total", avg_loss, epoch)
         writer.add_scalar("loss/cls", avg_loss_items["cls"], epoch)
         writer.add_scalar("loss/point", avg_loss_items["point"], epoch)
         writer.add_scalar("loss/count", avg_loss_items["count"], epoch)
+
+        writer.add_scalar("train/loss_total", avg_loss, epoch)
+        writer.add_scalar(
+            "train/loss_cls", avg_loss_items["cls"], epoch
+        )
+        writer.add_scalar(
+            "train/loss_point", avg_loss_items["point"], epoch
+        )
+        writer.add_scalar(
+            "train/loss_count", avg_loss_items["count"], epoch
+        )
+        for loss_name in ("total", "cls", "point", "count"):
+            writer.add_scalar(
+                f"val/loss_top2_{loss_name}",
+                top2_loss[loss_name],
+                epoch,
+            )
 
         writer.add_scalar(
             "mae/full3_weighted_norm",
@@ -783,9 +857,58 @@ def train_all(args: argparse.Namespace) -> None:
             top1_weighted_norm_mae,
             epoch,
         )
+        for mode, value in (
+            ("full3", full3_weighted_norm_mae),
+            ("top2", top2_weighted_norm_mae),
+            ("top1", top1_weighted_norm_mae),
+        ):
+            writer.add_scalar(
+                f"val/mae_{mode}_weighted_norm",
+                value,
+                epoch,
+            )
+            writer.add_scalar(
+                f"val/mae_{mode}_macro_norm",
+                {
+                    "full3": full3_norm_macro,
+                    "top2": top2_norm_macro,
+                    "top1": top1_norm_macro,
+                }[mode],
+                epoch,
+            )
+            writer.add_scalar(
+                f"val/rmse_{mode}",
+                rmse_by_mode[mode],
+                epoch,
+            )
+            writer.add_scalar(
+                f"val/count_bias_{mode}",
+                bias_by_mode[mode],
+                epoch,
+            )
+        writer.add_scalar(
+            "val/mae_top2_raw",
+            sum(
+                val_image_counts[name] * per_dataset[name]["top2"]
+                for name in per_dataset
+            ) / total_val_images,
+            epoch,
+        )
+        writer.add_scalar(
+            "val/rmse_top2",
+            rmse_by_mode["top2"],
+            epoch,
+        )
+        writer.add_scalar(
+            "val/count_bias",
+            bias_by_mode["top2"],
+            epoch,
+        )
+
         for name, values in per_dataset.items():
             normalizer = val_mean_gt_counts[name]
-            for mode in ("full3", "top2"):
+            validation = validation_by_dataset[name]
+            for mode in ("full3", "top2", "top1"):
                 writer.add_scalar(
                     f"mae/{name}/{mode}_raw",
                     values[mode],
@@ -796,19 +919,75 @@ def train_all(args: argparse.Namespace) -> None:
                     values[mode] / normalizer,
                     epoch,
                 )
+                writer.add_scalar(
+                    f"val/{name}/mae_{mode}_raw",
+                    values[mode],
+                    epoch,
+                )
+                writer.add_scalar(
+                    f"val/{name}/mae_{mode}_norm",
+                    values[mode] / normalizer,
+                    epoch,
+                )
+                writer.add_scalar(
+                    f"val/{name}/rmse_{mode}",
+                    validation["rmse"][mode],
+                    epoch,
+                )
+                writer.add_scalar(
+                    f"val/{name}/count_bias_{mode}",
+                    validation["bias"][mode],
+                    epoch,
+                )
+            for loss_name in ("total", "cls", "point", "count"):
+                writer.add_scalar(
+                    f"val/{name}/loss_top2_{loss_name}",
+                    validation["top2_loss"][loss_name],
+                    epoch,
+                )
+            usage = validation["full3_top1_usage"]
+            usage_total = max(int(usage.sum()), 1)
             writer.add_scalar(
-                f"mae/{name}/top1_norm",
-                values["top1"] / normalizer,
+                f"val/{name}/router/entropy",
+                (
+                    validation["full3_gate_entropy_sum"]
+                    / max(validation["full3_gate_points"], 1)
+                ).item(),
                 epoch,
             )
+            writer.add_scalar(
+                f"val/{name}/router/margin",
+                (
+                    validation["full3_gate_margin_sum"]
+                    / max(validation["full3_gate_points"], 1)
+                ).item(),
+                epoch,
+            )
+            for expert_index in range(3):
+                writer.add_scalar(
+                    f"val/{name}/router/E{expert_index}_usage",
+                    float(usage[expert_index]) / usage_total,
+                    epoch,
+                )
 
         writer.add_scalar("schedule/router_temperature", temperature, epoch)
         writer.add_scalar("routing/full3_entropy", val_gate_entropy, epoch)
         writer.add_scalar("routing/full3_margin", val_gate_margin, epoch)
+        writer.add_scalar(
+            "val/routing_entropy", val_gate_entropy, epoch
+        )
+        writer.add_scalar(
+            "val/routing_margin", val_gate_margin, epoch
+        )
         for expert_index in range(3):
             writer.add_scalar(
                 f"routing/full3_top1_usage_E{expert_index}_pct",
                 float(full3_top1_usage_pct[expert_index]),
+                epoch,
+            )
+            writer.add_scalar(
+                f"val/expert_usage_E{expert_index}",
+                float(full3_top1_usage_pct[expert_index]) / 100.0,
                 epoch,
             )
         for name, values in expert_only_by_dataset.items():
@@ -830,6 +1009,13 @@ def train_all(args: argparse.Namespace) -> None:
             )
         else:
             best_path = None
+        if math.isfinite(best_selection_score):
+            writer.add_scalar(
+                "val/best_score",
+                best_selection_score,
+                epoch,
+            )
+
 
         checkpoint_data = {
             "model": model.state_dict(),
@@ -854,6 +1040,9 @@ def train_all(args: argparse.Namespace) -> None:
             ),
             "top2_full3_gap": top2_full3_gap,
             "top1_top2_gap": top1_top2_gap,
+            "top2_loss": top2_loss,
+            "rmse": rmse_by_mode,
+            "count_bias": bias_by_mode,
             "per_dataset": per_dataset,
             "expert_only_mae": expert_only_by_dataset,
             "val_image_counts": val_image_counts,
@@ -910,6 +1099,17 @@ def train_all(args: argparse.Namespace) -> None:
             checkpoint_data,
             os.path.join(args.save_dir, "last.pt"),
         )
+        epoch_seconds = (
+            time.perf_counter() - epoch_started_at
+        )
+        tm.log_system_metrics(
+            writer,
+            optimizer,
+            epoch,
+            epoch_seconds,
+            device,
+        )
+        writer.flush()
 
     writer.close()
     logging.info("训练结束。")

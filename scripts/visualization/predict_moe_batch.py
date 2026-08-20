@@ -33,10 +33,11 @@ import numpy as np
 import torch
 from tqdm import tqdm
 
-from models.yolo11_moe_point import YOLO11MoEPoint
+from scripts.data.point_dataset import letterbox_image
 from scripts.visualization.predict_moe import (
     EXPERT_COLORS,
     load_model,
+    resolve_inference_settings,
 )
 
 
@@ -58,46 +59,6 @@ def setup_logging(log_path: str) -> None:
 
 # GT 点: 黄色空心圆
 GT_COLOR = (0, 255, 255)
-
-
-def letterbox(
-    image_bgr: np.ndarray,
-    crop_size: int,
-) -> tuple[np.ndarray, float, int, int]:
-    """与 scripts/data/point_dataset._letterbox 保持一致的预处理。
-
-    返回 (填充后的图像, 缩放系数, pad_x, pad_y)，用于把预测点
-    从 crop 坐标映射回原图坐标。
-    """
-    height, width = image_bgr.shape[:2]
-
-    scale = min(
-        crop_size / max(width, 1),
-        crop_size / max(height, 1),
-    )
-    new_width = max(1, int(round(width * scale)))
-    new_height = max(1, int(round(height * scale)))
-
-    resized = cv2.resize(
-        image_bgr,
-        (new_width, new_height),
-        interpolation=cv2.INTER_LINEAR,
-    )
-
-    pad_x = (crop_size - new_width) // 2
-    pad_y = (crop_size - new_height) // 2
-
-    padded = cv2.copyMakeBorder(
-        resized,
-        pad_y,
-        crop_size - new_height - pad_y,
-        pad_x,
-        crop_size - new_width - pad_x,
-        cv2.BORDER_CONSTANT,
-        value=(114, 114, 114),
-    )
-
-    return padded, scale, pad_x, pad_y
 
 
 def load_gt_points(
@@ -143,16 +104,20 @@ def draw_result(
             result, (x, y), radius=3, color=color, thickness=-1
         )
 
+    # 在图像上方增加独立标题横条，不遮挡图像内容
+    header_height = 42
+    header = np.full((header_height, result.shape[1], 3), (24, 24, 24), dtype=np.uint8)
     cv2.putText(
-        result,
-        f"GT: {len(gt_points)}  Pred: {len(pred_points)}",
-        (20, 40),
+        header,
+        f"GT Count: {len(gt_points)} | Visible Pred: {len(pred_points)}",
+        (15, 28),
         cv2.FONT_HERSHEY_SIMPLEX,
-        1.0,
-        (0, 0, 255),
+        0.75,
+        (245, 245, 245),
         2,
+        cv2.LINE_AA,
     )
-    return result
+    return np.vstack([header, result])
 
 
 def predict_batch(args):
@@ -163,6 +128,16 @@ def predict_batch(args):
     logging.info(f"使用设备: {device}")
 
     model = load_model(args.weights, args.checkpoint, device)
+    imgsz, temperature = resolve_inference_settings(
+        args.checkpoint,
+        imgsz=args.imgsz,
+        temperature=args.temperature,
+    )
+    logging.info(
+        "推理设置: imgsz=%d temperature=%.4f",
+        imgsz,
+        temperature,
+    )
 
     image_dir = os.path.join(args.data_root, "images", args.split)
     points_dir = os.path.join(args.data_root, "points", args.split)
@@ -207,8 +182,8 @@ def predict_batch(args):
 
             height, width = image_bgr.shape[:2]
 
-            padded, scale, pad_x, pad_y = letterbox(
-                image_bgr, args.imgsz
+            padded, scale, pad_x, pad_y = letterbox_image(
+                image_bgr, imgsz
             )
 
             image_rgb = cv2.cvtColor(padded, cv2.COLOR_BGR2RGB)
@@ -224,7 +199,7 @@ def predict_batch(args):
             with torch.no_grad():
                 predictions = model(
                     tensor,
-                    temperature=0.5,
+                    temperature=temperature,
                     routing_mode="top2",
                 )
 
@@ -243,7 +218,7 @@ def predict_batch(args):
 
             if args.heatmap:
                 # 概率场 -> 密度热力图：每网格单元取 K 个参考点的最大置信度
-                side = args.imgsz // model.point_head.output_stride
+                side = imgsz // model.point_head.output_stride
                 num_refs = model.point_head.num_references
                 cell_conf = (
                     scores.view(side, side, num_refs)
@@ -254,7 +229,7 @@ def predict_batch(args):
                 )
                 heat = cv2.resize(
                     cell_conf,
-                    (args.imgsz, args.imgsz),
+                    (imgsz, imgsz),
                     interpolation=cv2.INTER_LINEAR,
                 )
                 # 去掉 letterbox padding，映射回原图分辨率
@@ -345,7 +320,8 @@ def predict_batch(args):
         "conf": args.conf,
         "count_mode": args.count_mode,
         "heatmap": args.heatmap,
-        "imgsz": args.imgsz,
+        "imgsz": imgsz,
+        "temperature": temperature,
         "checkpoint": args.checkpoint,
         "expert_usage": {
             f"expert{i}": int(expert_counts[i])
@@ -392,12 +368,17 @@ def parse_args():
         help="训练好的 D2 best_top2.pt checkpoint"
     )
     parser.add_argument(
-        "--imgsz", type=int, default=640,
-        help="推理输入尺寸（默认与训练 crop_size=640 一致）"
+        "--imgsz", type=int, default=None,
+        help="推理输入尺寸（默认读取 checkpoint 的 crop_size）"
+    )
+    parser.add_argument(
+        "--temperature", type=float, default=None,
+        help="Router 推理温度（默认读取 checkpoint 的 config/temperature；"
+        "可通过本参数覆盖）"
     )
     parser.add_argument(
         "--conf", type=float, default=0.5,
-        help="置信度阈值（thresh 计数与可视化点筛选）"
+        help="置信度阈值（thresh 计数与可视化点筛选；soft 计数不受影响）"
     )
     parser.add_argument(
         "--count-mode", type=str,
