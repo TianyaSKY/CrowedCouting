@@ -49,27 +49,28 @@ def _prediction_tensors(
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     logits = predictions["logits"]
     points = predictions["points"]
-    gates = predictions["gates"]
+    if "expert_indices" not in predictions:
+        raise KeyError("native prediction 缺少 expert_indices")
+    source = predictions["expert_indices"]
     if isinstance(logits, torch.Tensor):
         logits = logits.detach().cpu()
     if isinstance(points, torch.Tensor):
         points = points.detach().cpu()
-    if isinstance(gates, torch.Tensor):
-        gates = gates.detach().cpu()
-
+    if isinstance(source, torch.Tensor):
+        source = source.detach().cpu()
     logits_array = np.asarray(logits, dtype=np.float32)
     points_array = np.asarray(points, dtype=np.float32)
-    gates_array = np.asarray(gates, dtype=np.float32)
+    source_array = np.asarray(source, dtype=np.int64)
     if logits_array.ndim == 2:
         logits_array = logits_array[0]
     if points_array.ndim == 3:
         points_array = points_array[0]
-    if gates_array.ndim == 3:
-        gates_array = gates_array[0]
+    if source_array.ndim == 2:
+        source_array = source_array[0]
     return (
         1.0 / (1.0 + np.exp(-logits_array)),
         points_array.reshape(-1, 2),
-        gates_array.reshape(-1, gates_array.shape[-1]),
+        source_array.reshape(-1),
     )
 
 
@@ -144,21 +145,22 @@ def render_validation_sample(
     image_path: str | None = None,
     conf_threshold: float = 0.5,
 ) -> np.ndarray:
-    """Render one existing Top-2 validation prediction as an RGB panel.
+    """Render one native_multiscale validation prediction as an RGB panel.
 
-    The left panel draws all GT points. The right panel only draws points above
-    ``conf_threshold`` for readability, while its metric count is the exact
-    validation count ``sum(sigmoid(logits))``.
+    The right panel uses the source expert recorded in ``expert_indices``.
+    Metric count remains the exact validation count ``sum(sigmoid(logits))``.
     """
     if not 0.0 <= conf_threshold <= 1.0:
         raise ValueError("conf_threshold must be between 0 and 1")
 
     base_bgr = _image_to_bgr(image)
     gt_array = _points_to_numpy(gt_points)
-    scores, pred_points, gates = _prediction_tensors(predictions)
+    scores, pred_points, expert_sources = _prediction_tensors(
+        predictions
+    )
     visible = scores > conf_threshold
     visible_points = pred_points[visible]
-    visible_routes = gates[visible].argmax(axis=-1)
+    visible_routes = expert_sources[visible]
 
     gt_panel = base_bgr.copy()
     _draw_points(
@@ -193,7 +195,7 @@ def render_validation_sample(
     prediction_panel = _add_header_banner(
         prediction_panel,
         (
-            "Prediction - deterministic Top-2",
+            "Prediction - native_multiscale",
             f"Metric count: {metric_count:.1f} | Visible points: {visible_count}",
             f"Abs error: {abs_error:.1f} | conf > {conf_threshold:.2f}",
         ),
