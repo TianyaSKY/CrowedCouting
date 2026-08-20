@@ -795,7 +795,7 @@ def build_parser():
             "warmup 独立 matching，之后全局 Hungarian competition"
         )
     )
-    parser.add_argument("--weights", type=str, default="yolo11m.pt")
+    parser.add_argument("--weights", type=str, default="yolo11n.pt")
     parser.add_argument(
         "--data-root",
         type=str,

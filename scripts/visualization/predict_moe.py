@@ -228,7 +228,7 @@ def parse_args():
     parser.add_argument(
         "--weights",
         type=str,
-        default="yolo11m.pt",
+        default="yolo11n.pt",
         help="checkpoint 未记录 backbone 权重时的 fallback",
     )
     parser.add_argument(

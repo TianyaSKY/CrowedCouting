@@ -321,7 +321,7 @@ def parse_args():
         description="评估 native_multiscale P3/P4/P5 合并候选池"
     )
     parser.add_argument("--checkpoint", type=str, required=True)
-    parser.add_argument("--weights", type=str, default="yolo11m.pt")
+    parser.add_argument("--weights", type=str, default="yolo11n.pt")
     parser.add_argument(
         "--dataset",
         type=str,

@@ -444,7 +444,7 @@ def parse_args() -> argparse.Namespace:
         type=str,
         default="runs/native_multiscale/best_native.pt",
     )
-    parser.add_argument("--weights", type=str, default="yolo11m.pt")
+    parser.add_argument("--weights", type=str, default="yolo11n.pt")
     parser.add_argument("--imgsz", type=int, default=None)
     parser.add_argument("--batch-size", type=int, default=16)
     parser.add_argument("--workers", type=int, default=4)

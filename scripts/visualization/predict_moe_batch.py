@@ -254,7 +254,7 @@ def parse_args():
     )
     parser.add_argument("--data-root", type=str, required=True)
     parser.add_argument("--split", type=str, default="val")
-    parser.add_argument("--weights", type=str, default="yolo11m.pt")
+    parser.add_argument("--weights", type=str, default="yolo11n.pt")
     parser.add_argument("--checkpoint", type=str, required=True)
     parser.add_argument("--imgsz", type=int, default=None)
     parser.add_argument("--conf", type=float, default=0.5)

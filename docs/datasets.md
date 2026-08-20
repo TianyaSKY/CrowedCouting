@@ -7,13 +7,13 @@ UCF-CC-50）。原始数据在 `data/`，转换后的标准布局在 `datasets/`
 
 ## 数据集一览
 
-| 数据集 | 划分 | 点标注总数 | 说明 |
-| --- | --- | --- | --- |
-| ShanghaiTech A (Zhang 2016) | train 270 / val 30 / test 182 | A 241,677 | 官方 train 切 90/10，官方 test 留作最终评估 |
-| ShanghaiTech B (Zhang 2016) | train 360 / val 40 / test 316 | B 88,488 | 官方 train 切 90/10，官方 test 留作最终评估 |
-| JHU-Crowd++ (Sindagi 2019) | train 2,272 / val 500 / test 1,600 | 1,515,005 | 单图最多 25,791 人 |
-| UCF-QNRF (Idrees 2018) | train 约 1,081 / val 约 120 / test 334 | 1,251,642 | 官方 Train 切 90/10，Test 留作最终评估 |
-| UCF-CC-50 (Idrees 2013) | 5 折 × 36 train / 4 val / 10 test | 每折 63,974 | 极端密集；每折独立训练 |
+| 数据集                      | 划分                                   | 点标注总数  | 说明                                        |
+| --------------------------- | -------------------------------------- | ----------- | ------------------------------------------- |
+| ShanghaiTech A (Zhang 2016) | train 270 / val 30 / test 182          | A 241,677   | 官方 train 切 90/10，官方 test 留作最终评估 |
+| ShanghaiTech B (Zhang 2016) | train 360 / val 40 / test 316          | B 88,488    | 官方 train 切 90/10，官方 test 留作最终评估 |
+| JHU-Crowd++ (Sindagi 2019)  | train 2,272 / val 500 / test 1,600     | 1,515,005   | 单图最多 25,791 人                          |
+| UCF-QNRF (Idrees 2018)      | train 约 1,081 / val 约 120 / test 334 | 1,251,642   | 官方 Train 切 90/10，Test 留作最终评估      |
+| UCF-CC-50 (Idrees 2013)     | 5 折 × 36 train / 4 val / 10 test     | 每折 63,974 | 极端密集；每折独立训练                      |
 
 标准布局（`datasets/<name>/`，images 与 points 一一对应）：
 
@@ -72,7 +72,7 @@ python -m scripts.data.prepare_ucf_cc50
 ```bash
 python -m scripts.data.prepare_all        # 一个命令转换全部数据集（--force 重转）
 python -m scripts.training.train_all \
-    --weights yolo11m.pt \
+    --weights yolo11n.pt \
     --crop-size 640 \
     --batch-size 8 \
     --save-dir runs/moe_point_all
@@ -89,17 +89,17 @@ ConcatDataset（batch 内随机混合），逐数据集用内部 val 验证并�
 
 ```bash
 python -m scripts.training.train_moe \
-    --weights yolo11m.pt \
+    --weights yolo11n.pt \
     --data-root datasets/shanghaitech_AB \
     --save-dir runs/moe_point
 ```
 
-| 数据集 | --data-root | 训练 split | 评估 split |
-| --- | --- | --- | --- |
-| ShanghaiTech A+B | datasets/shanghaitech_AB | train | val |
-| JHU-Crowd++ | datasets/jhu_crowd | train | val |
-| UCF-QNRF | datasets/ucf_qnrf | train | val |
-| UCF-CC-50 | datasets/ucf_cc50 | fold{i}_train | fold{i}_val |
+| 数据集           | --data-root              | 训练 split    | 评估 split  |
+| ---------------- | ------------------------ | ------------- | ----------- |
+| ShanghaiTech A+B | datasets/shanghaitech_AB | train         | val         |
+| JHU-Crowd++      | datasets/jhu_crowd       | train         | val         |
+| UCF-QNRF         | datasets/ucf_qnrf        | train         | val         |
+| UCF-CC-50        | datasets/ucf_cc50        | fold{i}_train | fold{i}_val |
 
 UCF-CC-50 为 5 折交叉验证：逐折训练（fold0..fold4），每折用对应 `fold{i}_train`
 训练、`fold{i}_val` 选 best，训练结束后才用对应 `fold{i}_test` 评估，最终报告 5 折平均 MAE/RMSE。

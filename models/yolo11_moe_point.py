@@ -14,7 +14,7 @@ class YOLO11MoEPoint(nn.Module):
 
     def __init__(
         self,
-        weights: str = "yolo11m.pt",
+        weights: str = "yolo11n.pt",
         hidden_channels: int = 256,
         native_references: tuple[int, int, int] = (1, 4, 16),
     ) -> None:

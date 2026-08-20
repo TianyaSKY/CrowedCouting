@@ -17,7 +17,7 @@ class YOLO11Pyramid(nn.Module):
     - P5: stride 32
     """
 
-    def __init__(self, weights: str = "yolo11m.pt") -> None:
+    def __init__(self, weights: str = "yolo11n.pt") -> None:
         super().__init__()
 
         yolo = YOLO(weights)
