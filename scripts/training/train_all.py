@@ -420,7 +420,6 @@ def train_all(args: argparse.Namespace) -> None:
 
         per_dataset: dict[str, dict[str, float]] = {}
         validation_by_dataset: dict[str, dict[str, object]] = {}
-        expert_only_by_dataset = {}
         val_winner_hist = torch.zeros(
             3, dtype=torch.int64, device=device
         )
@@ -455,17 +454,6 @@ def train_all(args: argparse.Namespace) -> None:
                     epoch,
                     conf_threshold=val_image_conf,
                 )
-            if (
-                matching_mode == "independent"
-                and args.expert_only_eval_interval > 0
-                and (epoch + 1) % args.expert_only_eval_interval == 0
-            ):
-                expert_only_by_dataset[name] = tm.evaluate_expert_only_mae(
-                    model,
-                    val_loader,
-                    device,
-                )
-
         dataset_count = max(len(per_dataset), 1)
         native_macro_norm = sum(
             per_dataset[name]["native"] / val_mean_gt_counts[name]
@@ -569,9 +557,6 @@ def train_all(args: argparse.Namespace) -> None:
                 dataset_confidence[1],
                 dataset_confidence[2],
             )
-        if expert_only_by_dataset:
-            logging.info("  expert-only MAE: %s", expert_only_by_dataset)
-
         for name, value in (
             ("total", avg_loss),
             ("cls", avg_loss_items["cls"]),
@@ -609,14 +594,6 @@ def train_all(args: argparse.Namespace) -> None:
                 writer.add_scalar(f"native/{name}/matched_confidence_E{expert_index}", float(dataset_confidence[expert_index]), epoch)
                 writer.add_scalar(f"native/{name}/positive_count_E{expert_index}", float(dataset_positive[expert_index]), epoch)
 
-        for name, values in expert_only_by_dataset.items():
-            for expert_index in range(3):
-                writer.add_scalar(
-                    f"mae/{name}/expert_only_E{expert_index}",
-                    values[f"E{expert_index}"],
-                    epoch,
-                )
-
         improved = (
             matching_mode == "competitive"
             and native_weighted_norm < best_selection_score
@@ -647,7 +624,6 @@ def train_all(args: argparse.Namespace) -> None:
             "native_matched_confidence_mean": val_confidence_mean.detach().cpu(),
             "native_matched_count": val_matched_count,
             "per_dataset": per_dataset,
-            "expert_only_mae": expert_only_by_dataset,
             "args": vars(args),
             "config": tm.build_checkpoint_config(
                 args,

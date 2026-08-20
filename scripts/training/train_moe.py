@@ -336,42 +336,6 @@ def evaluate_native_count_mae(
     return result
 
 
-def evaluate_expert_only_mae(model, val_loader, device):
-    was_training = model.training
-    model.eval()
-    total_abs_error = [0.0, 0.0, 0.0]
-    total_images = 0
-
-    with torch.no_grad():
-        for batch in tqdm(
-            val_loader,
-            desc="Expert-only 验证中",
-            leave=False,
-        ):
-            images = batch["img"].to(device)
-            gt_counts = [points.shape[0] for points in batch["points"]]
-            for expert_index in range(3):
-                predictions = model(
-                    images,
-                    routing_mode="expert_only",
-                    expert_index=expert_index,
-                )
-                pred_counts = predictions["logits"].sigmoid().sum(dim=1)
-                for image_index, gt_count in enumerate(gt_counts):
-                    total_abs_error[expert_index] += abs(
-                        float(pred_counts[image_index].item()) - gt_count
-                    )
-            total_images += len(gt_counts)
-
-    if was_training:
-        model.train()
-    return {
-        f"E{expert_index}": total_abs_error[expert_index]
-        / max(total_images, 1)
-        for expert_index in range(3)
-    }
-
-
 def train_moe(args):
     if args.native_warmup_epochs < 0:
         raise ValueError("--native-warmup-epochs 不能为负数")
@@ -701,26 +665,6 @@ def train_moe(args):
             writer.add_scalar(f"native/train_matched_distance_E{expert_index}", float(train_distance_mean[expert_index]), epoch)
             writer.add_scalar(f"native/train_matched_confidence_E{expert_index}", float(train_confidence_mean[expert_index]), epoch)
 
-        if (
-            matching_mode == "independent"
-            and args.expert_only_eval_interval > 0
-            and (epoch + 1) % args.expert_only_eval_interval == 0
-        ):
-            expert_only_mae = evaluate_expert_only_mae(
-                model,
-                val_loader,
-                device,
-            )
-            logging.info("  expert-only MAE: %s", expert_only_mae)
-            for expert_index in range(3):
-                writer.add_scalar(
-                    f"mae/expert_only_E{expert_index}",
-                    expert_only_mae[f"E{expert_index}"],
-                    epoch,
-                )
-        else:
-            expert_only_mae = None
-
         if collect_visuals and validation["validation_samples"]:
             log_validation_images(
                 writer,
@@ -758,7 +702,6 @@ def train_moe(args):
             "native_matched_distance_mean": val_distance_mean.detach().cpu(),
             "native_matched_confidence_mean": val_confidence_mean.detach().cpu(),
             "native_matched_count": validation["matched_count"],
-            "expert_only_mae": expert_only_mae,
             "args": vars(args),
             "config": build_checkpoint_config(
                 args,
@@ -820,12 +763,6 @@ def build_parser():
     parser.add_argument("--backbone-lr", type=float, default=1e-4)
     parser.add_argument("--head-lr", type=float, default=1e-3)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
-    parser.add_argument(
-        "--expert-only-eval-interval",
-        type=int,
-        default=5,
-        help="每 N 个 warmup epoch 运行 E0/E1/E2-only 诊断；competition 阶段关闭",
-    )
     parser.add_argument(
         "--val-image-interval",
         type=int,
