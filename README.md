@@ -65,10 +65,11 @@ python -m scripts.data.prepare_all
 
 ```bash
 python -m scripts.training.train_moe \
-    --weights yolo11m.pt \
+    --weights yolo11n.pt \
     --data-root datasets/shanghaitech_AB \
     --native-references 1,4,16 \
     --native-warmup-epochs 5 \
+    --batch-size 8 \
     --save-dir runs/native_multiscale
 ```
 
@@ -76,8 +77,9 @@ python -m scripts.training.train_moe \
 
 ```bash
 python -m scripts.training.train_all \
-    --weights yolo11m.pt \
+    --weights yolo11n.pt \
     --save-dir runs/native_multiscale_all \
+    --batch-size 8 \
     --epochs 100
 ```
 
