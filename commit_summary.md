@@ -2,16 +2,20 @@
 
 > 生成日期：2026-08-18。基于 git 历史（60 个提交，`42b15a9` … `0047056`）与最新训练日志。
 
-## 1. 当前状态：研究已暂停
+## 1. 当前状态：native_multiscale 已切换
 
-**本项目的研究工作目前已暂停。** 暂停时的最新进展是 2026-08-18 15:36 提交的
-`0047056 Implement D2 Drop-1 Soft Top-2 MoE routing`（D2 方案，当前推荐路线）。
+当前代码已切换为唯一的 `native_multiscale` 方案：E0/E1/E2 分别位于
+P3/P4/P5，warmup 使用独立 Hungarian matching，之后使用全局 competitive
+matching。旧 D2 Router、Drop-1、Top-2/Top-1 代码与 CLI 已删除；旧 checkpoint
+不再兼容。
 
-最后一次训练为联合训练任务（`runs/moe_point_all_20260818_201021`，4 个数据集联合、
-batch 8、100 epochs，20:10 启动），日志仅记录到 Epoch 2——Router 尚未激活，
-仍处于 warm-up 随机 Drop-1 阶段，无法据此判断新方案效果。暂停时该训练仍在后台运行。
+后续实验应使用：
 
-**目前未解决的主要问题是专家坍缩（Expert Collapse）**，详见第 3 节。
+```text
+runs/native_multiscale*/best_native.pt
+```
+
+文档中阶段 0–3 的 Router/D2 内容仅保留为历史提交记录，不代表当前运行路径。
 
 ## 2. 全部提交总结（按阶段）
 

@@ -235,8 +235,7 @@ class PointDataset(Dataset):
             x0 = random.randint(0, width - crop_size)
         else:
             # 小图先等比例放大到短边至少为 crop_size，再随机裁剪。
-            # 禁止直接拉伸成正方形，否则 x/y 像素尺度会被分别改变，
-            # 进而污染点间距与 Router 尺度标签。
+            # 进而改变点坐标的像素几何关系。
             scale_up = max(
                 crop_size / max(height, 1),
                 crop_size / max(width, 1),

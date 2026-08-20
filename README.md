@@ -2,253 +2,160 @@
 
 基于 YOLO11 的人群计数项目。模型不回归边界框，只预测人头中心点，支持多数据集。
 
-2026 Aug 17 remark:To boost training effeicney,I remove data which larger than 1000.
+当前唯一模型是 **native_multiscale**：
 
-当前实现为 **D2 Task-Only MoE / Random Drop-1 + Soft Top-2**：保留
-YOLO11 Backbone+Neck、删除原始 Detect Head，替换为统一候选点网格（P3
-网格 × K 参考点）上的三专家 MoE 点检测头。训练阶段每个 candidate 随机
-Drop-1，Router 启用后在剩余两个 expert 间做 masked softmax；由
-`scripts/training/train_moe.py`（单数据集）与 `scripts/training/train_all.py`
-（多数据集联合训练）执行，支持 ShanghaiTech / JHU-Crowd++ / UCF-QNRF /
-UCF-CC-50。
+```text
+P3 -> E0(K=1)  -> 6400 candidates on 640x640
+P4 -> E1(K=4)  -> 6400 candidates on 640x640
+P5 -> E2(K=16) -> 6400 candidates on 640x640
+                 |
+                 +-> concatenate -> global Hungarian matching
+```
+
+三个 Expert 使用各自的特征层和 reference grid。参考点实际间距约为 8px，坐标偏移能力统一为约 ±16px。模型不包含 Router、Drop-1、Top-2 或尺度标签监督。
 
 ## 环境
 
 ```bash
 pip install -r requirements.txt
-# GPU 机器装 CUDA 版 torch（实测环境 Python 3.13 / torch 2.12.1+cu130 / ultralytics 8.4.71）:
-#   pip install torch torchvision --index-url https://download.pytorch.org/whl/cu130
+# GPU 机器安装匹配 CUDA 的 PyTorch wheel
 ```
 
-运行约定：**始终从项目根目录以模块方式执行**（`python -m scripts.xxx`），避免相对导入
-与工作目录问题。所有训练/评估/可视化脚本均通过 argparse 接收参数。
+始终从项目根目录以模块方式运行：
+
+```bash
+python -m scripts.training.train_moe --help
+```
 
 ## 目录
 
-- `models/`：模型结构、锚点生成和损失函数。
-  - `yolo11_pyramid.py`：`YOLO11Pyramid`，保留 Backbone+Neck、移除 Detect Head，
-    输出 P3/P4/P5（层索引与步长从 Detect Head 动态读取，不硬编码）。
-  - `moe_point_head.py`：`MoEPointHead`，三个专家（局部/中层/大范围感受野）+ 点级 Router。
-  - `yolo11_moe_point.py`：`YOLO11MoEPoint`，Backbone+Neck + MoE Point Head 组合网络。
-  - `point_moe_loss.py`：`PointMoELoss`，匈牙利匹配 + Focal 分类 + Smooth L1 定位 + 计数；
-    Router 不接收独立监督损失。
-- `scripts/data/`：数据集下载（4 个公开数据集）、ShanghaiTech 转换、离线增强与点标注转换。
-- `scripts/training/`：`train_moe.py`（单数据集，argparse）与 `train_all.py`
-  （多数据集联合训练 + 逐数据集验证）。
-- `scripts/evaluation/`：`evaluate_datasets.py` 跨数据集分组评估（MAE/RMSE）。
-- `scripts/visualization/`：`predict_moe.py` 单图 / `predict_moe_batch.py` 批量预测。
-- `test_each_dataset.py`（根目录）：Scale-MoE 模型按 Part A/B 分组的评估脚本。
-- `runs/`：训练、评估与可视化输出（运行生成）。
+- `models/yolo11_pyramid.py`：YOLO11 Backbone+Neck，输出 P3/P4/P5。
+- `models/moe_point_head.py`：native P3/P4/P5 Expert head。
+- `models/yolo11_moe_point.py`：YOLO11 与 native point head 组合网络。
+- `models/point_moe_loss.py`：独立 warmup matching、全局 competitive matching、Focal/Smooth-L1/count loss。
+- `scripts/training/train_moe.py`：单数据集训练。
+- `scripts/training/train_all.py`：多数据集联合训练与逐数据集验证。
+- `scripts/evaluation/evaluate_datasets.py`：跨数据集评估。
+- `scripts/visualization/`：单图、批量和 TensorBoard 验证图推理。
 
-## 数据集下载
+旧 D2 Router checkpoint、旧 Top-2/Top-1 评估模式和旧 Router CLI 已删除，不能继续加载。
 
-`scripts/data/` 下提供各公开人群计数数据集的下载脚本（仅用标准库，带进度条，
-从项目根目录以模块方式执行）。原始数据统一落在 `data/`。
+## 数据准备
 
-| 数据集                      | 脚本                                                             | 图像数量                                    | 标注/说明                                                 |
-| --------------------------- | ---------------------------------------------------------------- | ------------------------------------------- | --------------------------------------------------------- |
-| JHU-Crowd++ (Sindagi 2019)  | `python -m scripts.data.download_jhu_crowd`                    | 4,372（train 2,272 / val 500 / test 1,600） | 约 151 万点标注；单图最多 25,791 人；含恶劣天气与无人图像 |
-| ShanghaiTech A (Zhang 2016) | `python -m scripts.data.download_shanghaitech`（A+B 一并下载） | 482（官方 train 300 / test 182）            | 官方 train 再切 270 train / 30 val                        |
-| ShanghaiTech B (Zhang 2016) | 同上                                                             | 716（官方 train 400 / test 316）            | 官方 train 再切 360 train / 40 val                        |
-| UCF-CC-50 (Idrees 2013)     | `python -m scripts.data.download_ucf_cc50`                     | 50                                          | 5 折 outer test；每折 36 train / 4 val / 10 test          |
-| UCF-QNRF (Idrees 2018)      | `python -m scripts.data.download_ucf_qnrf`                     | 1,535（官方 Train 1,201 / Test 334）        | 官方 Train 再切约 1,081 train / 120 val；约 125 万点标注  |
+标准数据布局：
 
-各脚本均支持 `--data-dir`（默认 `data/`）与 `--keep-zip`/`--keep-rar`；已存在目标目录时
-自动跳过；解压后打印实际顶层结构。大文件支持**断点续传**：下载中断会保留 `.part` 文件，
-重跑脚本自动从断点继续（并按 Content-Length 校验完整性）。来源说明（脚本内亦有注释）：
-
-- JHU-Crowd++：官方需在 crowd-counting.com 填表，脚本直接走社区公开 Google Drive
-  镜像（jhu_crowd_v2.0.zip，约 2.87 GB），自动处理 Drive 大文件确认页。
-- ShanghaiTech：官方 Dropbox 镜像（约 166 MB），可 `--url` 换源。
-- UCF-CC-50 / UCF-QNRF：官方 CRCV 直链（rar / zip）。
-
-## 快速开始（D2 Task-Only Drop-1 / Soft Top-2 MoE）
-
-### 1. 准备数据
-
-以 ShanghaiTech 为例（其余数据集需自行把原始数据放到 `data/` 下并准备点标注）：
-
-```bash
-# 0. 下载官方数据集（约 166 MB）
-python -m scripts.data.download_shanghaitech
-
-# 1. 合并 A/B 生成 datasets/shanghaitech_AB：
-#    images/{train,val,test}/*.jpg + labels/{train,val,test}/*.txt
-#    每个 Part 的官方 train 独立切 90/10；官方 test_data 保留为 test
-python -m scripts.data.prepare_combined
-
-# 2. 虚拟框标签转纯点标签（labels/ 每行第 2、3 列 -> points/ 每行 "nx ny"）
-python -m scripts.data.prepare_point_labels
+```text
+datasets/<name>/
+  images/{train,val,test}/*.jpg
+  points/{train,val,test}/*.txt
 ```
 
-`PointDataset`（`scripts/data/point_dataset.py`）读取 `images/ + points/`：训练走 7 步在线增强
-（随机缩放 0.8–1.2、随机裁剪 `crop_size=640`、翻转 p=0.5、随机旋转 ±10° p=0.5、
-亮度 α∈[0.8,1.2]、β∈[−20,20]、HSV 色相/饱和度抖动）；
-验证走 letterbox（保持纵横比 + 居中填充 114，不改变人的尺度）。
-离线增强（对合并后的数据集静态扩充，可选）：`python -m scripts.data.augment`
-对 train 每张原图生成水平翻转、2 张 512×512 随机裁剪、±15° 随机旋转共 4 张增强样本，
-同时写出 `labels/`（5 列）与 `points/`（2 列），重复运行自动跳过已增强文件。
-
-其余数据集同样转换为标准布局（纯标准库，无需 scipy/h5py/cv2，`_matlab_utils.py`
-内置 Matlab v5 .mat 解析与 JPEG/PNG 尺寸读取）：
+每个点标注文件每行包含归一化的 `x y`。数据准备脚本：
 
 ```bash
-# JHU-Crowd++（gt 为逐图 txt，取 x y 两列）: datasets/jhu_crowd/{train,val,test}
-python -m scripts.data.prepare_jhu
-# UCF-QNRF（2024 版扁平布局 Train/Test，annPoints 点标注）: datasets/ucf_qnrf/{train,val,test}
-python -m scripts.data.prepare_qnrf
-# UCF-CC-50（5 折，seed=0；每折 36 train / 4 val / 10 test）:
-#   datasets/ucf_cc50/{fold0_train,fold0_val,fold0_test,...}
-python -m scripts.data.prepare_ucf_cc50
-```
-
-每个数据集目录都含 `images/ + labels/ + points/ + dataset.yaml`，images 与 points 一一对应。
-
-**一键流程**（转换全部 + 联合训练 + 跨数据集评估）：
-
-```bash
-# 一个命令转换全部数据集（已存在则跳过，--force 强制重转）
 python -m scripts.data.prepare_all
-
-# 在所有数据集上联合训练（按图片自然采样 + 逐数据集验证）
-python -m scripts.training.train_all \
-    --weights yolo11m.pt \
-    --crop-size 640 \
-    --batch-size 8
-
-# 跨数据集分组评估；默认 deterministic Soft Top-2
-python -m scripts.evaluation.evaluate_datasets \
-    --checkpoint runs/moe_point_all/best_top2.pt \
-    --mode top2 \
-    --batch-size 8 \
-    --dataset shanghaitech=datasets/shanghaitech_AB:val \
-    --dataset jhu=datasets/jhu_crowd:val \
-    --dataset qnrf=datasets/ucf_qnrf:test \
-    --dataset cc50=datasets/ucf_cc50:fold0_test
+# 或按数据集运行 scripts/data/ 下对应 prepare_*.py
 ```
 
-### 2. 训练
+`PointDataset` 训练时使用缩放、裁剪、翻转、旋转和颜色增强；验证时使用保持纵横比的 letterbox。
+
+## 训练
+
+单数据集：
 
 ```bash
 python -m scripts.training.train_moe \
     --weights yolo11m.pt \
     --data-root datasets/shanghaitech_AB \
-    --save-dir runs/moe_point
+    --native-references 1,4,16 \
+    --native-warmup-epochs 5 \
+    --save-dir runs/native_multiscale
 ```
 
-常用参数（默认值见 `python -m scripts.training.train_moe --help`）：
+联合训练：
 
-| 参数                              | 默认            | 说明                                                          |
-| --------------------------------- | --------------- | ------------------------------------------------------------- |
-| `--weights`                     | `yolo11m.pt`  | YOLO11 预训练权重                                             |
-| `--data-root`                   | `datasets/shanghaitech_AB` | 单数据集入口（train_all 用 `--dataset`）      |
-| `--crop-size`                   | 640             | 训练/验证裁剪尺寸                                             |
-| `--batch-size`                  | 8               |                                                               |
-| `--epochs`                      | 100             |                                                               |
-| `--hidden-channels`             | 256             | MoE head 隐层宽度                                             |
-| `--num-references`              | 4               | 每网格参考点数 K（1/4/9）                                     |
-| `--scale-centers`               | `10,20,40`    | 三专家尺度中心（像素）                                        |
-| `--backbone-lr` / `--head-lr`   | 1e-4 / 1e-3     | YOLO 主干 / MoE Head 两组 AdamW 学习率                        |
-| `--weight-decay`                | 1e-4            |                                                               |
-| `--grad-clip`                   | 10.0            | 梯度裁剪范数上限                                              |
-| `--freeze-epochs`               | 3               | Epoch 1–3 冻结 YOLO 主干；Epoch 4 起解冻                     |
-| `--init-temperature`            | 2.0             | Router 启用时 T_router 起始温度                               |
-| `--phase1-temp`                 | 1.5             | Router epoch 15 的温度；默认 `2.0 → 1.5 → 1.0`               |
-| `--soft-temp-floor`             | 1.0             | T_router 下限                                                |
-| `--temp-floor-epoch`            | 30              | Router epoch 30 到达温度下限 1.0                             |
-| `--router-warmup-epochs`        | 6               | Epoch 1–6 Router 冻结，训练使用 candidate-level Drop-1        |
-| `--expert-only-eval-interval`   | 5               | 每 N epoch 跑 E0/E1/E2-only 诊断；0 表示关闭                 |
-| `--match-top-k`                 | 2000            | 匈牙利匹配候选点上限（K=max(K, n_gt)）                        |
-| `--diagnose-scale-routing`      | off             | 可选输出尺度路由混淆矩阵；只作 diagnostic                     |
-| `--workers`                     | 4               | DataLoader 进程数                                            |
-| `--save-dir`                    | 时间戳目录      | 权重保存目录；`--resume` 时沿用原 run                         |
-| `--resume`                      | None            | 仅从 `router_training_mode=task_only_drop1_soft_top2` 恢复    |
-
-train_all 额外参数：`--dataset NAME=ROOT:TRAIN[:TRAIN2...]:EVAL`（可重复，默认 4 数据集）、
-`--allow-test-as-eval`（默认禁止 test 参与训练期选模）。
-
-训练要点：
-
-- **Task-only Router**：总损失严格为
-  `L_cls + 5 * L_point + 0.05 * L_count`。不使用 `L_route`、balance、
-  `sharp` 或任何额外 Router loss。
-- **D2 candidate Drop-1**：每个 candidate 随机丢弃一个 expert，剩余两个在
-  warm-up 期间固定为 `0.5/0.5`，Router 启用后使用 masked softmax。训练阶段
-  三个 expert 都继续执行，第一版不做 sparse dispatch。
-- **六 epoch schedule**：Epoch 1–3 backbone frozen + Router frozen；
-  Epoch 4–6 backbone trainable + Router frozen；Epoch 7+ backbone 和 Router
-  都 trainable。所有阶段都使用随机 Drop-1。
-- **温度调度**：Router 启用时重新计数，默认
-  `Router epoch 0: 2.0`、`epoch 15: 1.5`、`epoch 30: 1.0`。
-- **验证指标**：每 epoch 都计算 `full3-soft`、deterministic `Top-2` 和
-  diagnostic-only `Top-1` 的 `MAE`。主验证模式是 Top-2，按验证图片数加权的
-  normalized MAE 选择 `best_top2.pt`；full3/Top-1 只作诊断。
-- **双概率记录**：`route_probabilities` 始终是未 Drop-1 的完整三专家
-  softmax，用于 matched probability mean、full3 entropy/margin 与 collapse
-  诊断（TB `routing/` 组）；`gates` 是实际 Drop-1 / validation gate，二者不混用。
-- **Drop-1 诊断**：记录 full3 deterministic Top-1 usage（三个专家在验证集
-  上被 argmax 选中的占比），观察路由是否 collapse。
-- **Expert-only 诊断**：默认每 5 epoch 记录 E0-only、E1-only、E2-only MAE，
-  判断 expert starvation 是否已经解决。
-- **checkpoint**：保存 `best_top2.pt` 与 `last.pt`，并记录
-  `router_training_mode="task_only_drop1_soft_top2"`、
-  `expert_dropout="candidate_drop1"`、`active_experts=2`、
-  `router_start_epoch=6`、`selection_metric="top2 weighted normalized MAE"`。
-
-### 3. 评估与推理
 ```bash
-# 单图推理默认使用 deterministic Soft Top-2
-python -m scripts.visualization.predict_moe \
-    --image path/to/img.jpg \
-    --checkpoint runs/moe_point/best_top2.pt
+python -m scripts.training.train_all \
+    --weights yolo11m.pt \
+    --save-dir runs/native_multiscale_all \
+    --epochs 100
+```
 
-# 验证集批量推理：images/*_pred.jpg + predictions.csv + summary.json
-python -m scripts.visualization.predict_moe_batch \
-    --data-root datasets/shanghaitech_AB \
-    --checkpoint runs/moe_point/best_top2.pt \
-    --out-dir runs/moe_point/val_pred
+联合训练可重复指定：
 
-# 分 Part 评估；默认 Top-2，也可 --mode full3_soft / top1
+```text
+--dataset NAME=ROOT:TRAIN[:TRAIN2...]:EVAL
+```
+
+训练阶段：
+
+1. 前 `--native-warmup-epochs` 个 epoch：E0/E1/E2 各自独立 Hungarian matching；同一个 GT 可分别成为三个 Expert 的正样本。
+2. 后续 epoch：三个 Expert 的候选合并为一个 pool，对每个 GT 做一次全局 Hungarian matching；只有 winner candidate 为正样本。
+3. 总损失：`L_cls + 5 * L_point + 0.05 * L_count`。
+
+每个 epoch 记录：
+
+- E0/E1/E2 GT winner 比例
+- matched mean distance
+- matched confidence
+- positive count
+- 每个数据集的上述统计
+- E0/E1/E2 expert-only MAE
+
+checkpoint：
+
+```text
+best_native.pt
+last.pt
+```
+
+`best_native.pt` 只在 global competition 阶段按 weighted normalized MAE 选择；warmup 阶段只保存 `last.pt`。
+
+## 评估
+
+单数据集 ShanghaiTech Part A/B：
+
+```bash
 python test_each_dataset.py \
     --data-root datasets/shanghaitech_AB \
-    --checkpoint runs/moe_point/best_top2.pt \
-    --mode top2
+    --checkpoint runs/native_multiscale/best_native.pt \
+    --split val \
+    --out-dir runs/native_multiscale/test_eval
 ```
 
-MoE 计数口径：全部候选点 `logits.sigmoid()` 求和（无需置信度阈值/去重，与评估一致）；
-验证和推理使用无随机性的 `full3_soft`、`top2` 或 `top1` 模式。D2 主指标为
-deterministic Soft Top-2；Top-1 仅用于诊断。
-
-### 3.5 跨数据集分组评估
+跨数据集：
 
 ```bash
 python -m scripts.evaluation.evaluate_datasets \
-    --checkpoint runs/moe_point_all/best_top2.pt \
-    --mode top2 \
+    --checkpoint runs/native_multiscale_all/best_native.pt \
     --batch-size 8 \
     --dataset shanghaitech=datasets/shanghaitech_AB:val \
     --dataset jhu=datasets/jhu_crowd:val \
     --dataset qnrf=datasets/ucf_qnrf:test \
-    --dataset cc50_fold0=datasets/ucf_cc50:fold0_test \
-    --out-dir runs/eval_datasets
+    --dataset cc50=datasets/ucf_cc50:fold0_test \
+    --out-dir runs/native_multiscale_all/eval
 ```
 
-对每个 `NAME=ROOT:SPLIT` 分别评估并输出该数据集的 MAE/RMSE/GT/Pred：
-`<out-dir>/<name>/predictions.csv` + `summary.json`，另生成合并的
-`<out-dir>/summary.json` 与控制台汇总表。UCF-CC-50 5 折需逐折指定
-（fold0_test..fold4_test），汇总均值自行取。
+计数口径始终是所有 native candidates 的 `sum(sigmoid(logits))`。评估不使用置信度阈值作为 MAE 计数口径，也不使用 NMS。
 
-### 4. 观察 Router 行为
+## 可视化
 
-每 epoch 文本日志输出 matched probability mean、full3 entropy/margin、
-deterministic Top-1 usage 与训练 sampled usage；TensorBoard `routing/` 组记录
-`full3_entropy`、`full3_margin`、`full3_top1_usage_E{0,1,2}_pct`。
-`--diagnose-scale-routing` 开启后额外输出 GT 尺度类到预测专家的混淆矩阵
-（`diagnostic only`）。默认每 5 epoch 比较三个 expert-only MAE；若 Top-1 usage
-偏斜，先比较这些独立 expert 输出，再判断是否需要后续架构改动。
+单图：
 
-模型与损失的设计细节见：
+```bash
+python -m scripts.visualization.predict_moe \
+    --image path/to/image.jpg \
+    --checkpoint runs/native_multiscale/best_native.pt
+```
 
-- [`crowd_counting_model_summary.md`](./crowd_counting_model_summary.md)（当前 Scale-MoE 模型结构）
-- [`loss_design_explanation.md`](./loss_design_explanation.md)（`PointMoELoss` 损失设计详解）
-- [`docs/datasets.md`](./docs/datasets.md)（数据集下载/转换/训练接入/跨数据集评估指南）
+批量：
+
+```bash
+python -m scripts.visualization.predict_moe_batch \
+    --data-root datasets/shanghaitech_AB \
+    --split val \
+    --checkpoint runs/native_multiscale/best_native.pt \
+    --out-dir runs/native_multiscale/val_pred
+```
+
+颜色固定为：红色 E0/P3、绿色 E1/P4、蓝色 E2/P5。颜色来自模型输出的真实 `expert_indices`。
