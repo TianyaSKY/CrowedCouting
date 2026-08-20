@@ -167,6 +167,22 @@ def _load_native_resume(
         raise ValueError(
             "resume checkpoint 的 native_references 与当前配置不一致"
         )
+    saved_position_weight = float(
+        config.get("match_position_weight", 5.0)
+    )
+    saved_confidence_weight = float(
+        config.get("match_confidence_weight", 0.25)
+    )
+    if not math.isclose(
+        saved_position_weight,
+        args.match_position_weight,
+    ) or not math.isclose(
+        saved_confidence_weight,
+        args.match_confidence_weight,
+    ):
+        raise ValueError(
+            "resume checkpoint 的 matching cost 权重与当前配置不一致"
+        )
     model.load_state_dict(checkpoint["model"])
     try:
         optimizer.load_state_dict(checkpoint["optimizer"])
@@ -236,7 +252,11 @@ def train_all(args: argparse.Namespace) -> None:
         hidden_channels=args.hidden_channels,
         native_references=native_references,
     ).to(device)
-    criterion = PointMoELoss(match_top_k=args.match_top_k)
+    criterion = PointMoELoss(
+        match_top_k=args.match_top_k,
+        match_position_weight=args.match_position_weight,
+        match_confidence_weight=args.match_confidence_weight,
+    )
 
     train_datasets = []
     train_dataset_sizes: dict[str, int] = {}
@@ -319,6 +339,13 @@ def train_all(args: argparse.Namespace) -> None:
         args,
         native_references,
     )
+    if start_epoch >= args.freeze_epochs:
+        for param in model.yolo.parameters():
+            param.requires_grad = True
+        logging.info(
+            "resume start_epoch=%d：YOLO Backbone+Neck 保持可训练",
+            start_epoch,
+        )
 
     for epoch in range(start_epoch, args.epochs):
         epoch_started_at = time.perf_counter()
@@ -429,7 +456,8 @@ def train_all(args: argparse.Namespace) -> None:
                     conf_threshold=val_image_conf,
                 )
             if (
-                args.expert_only_eval_interval > 0
+                matching_mode == "independent"
+                and args.expert_only_eval_interval > 0
                 and (epoch + 1) % args.expert_only_eval_interval == 0
             ):
                 expert_only_by_dataset[name] = tm.evaluate_expert_only_mae(

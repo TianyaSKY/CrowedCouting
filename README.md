@@ -81,6 +81,14 @@ python -m scripts.training.train_all \
     --epochs 100
 ```
 
+competition 的候选预筛选按 Expert 平衡：`match_top_k` 名额由 E0/E1/E2 平均分配，再执行全局 Hungarian。matching cost 默认是：
+
+```text
+5.0 × normalized_position_error - 0.25 × confidence
+```
+
+可用 `--match-position-weight` 和 `--match-confidence-weight` 调整，权重会写入 checkpoint；competition 阶段关闭 full-GT expert-only MAE，避免把 Expert 负责的局部 GT 数量误读为完整图像计数能力。
+
 联合训练可重复指定：
 
 ```text
@@ -100,7 +108,7 @@ python -m scripts.training.train_all \
 - matched confidence
 - positive count
 - 每个数据集的上述统计
-- E0/E1/E2 expert-only MAE
+- warmup 阶段的 E0/E1/E2 expert-only MAE
 
 checkpoint：
 

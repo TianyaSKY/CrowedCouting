@@ -26,15 +26,16 @@ classification + localization + count
 
 ### 2.2 Global competition
 
-warmup 之后，三个候选子池合并后只做一次全局 Hungarian matching：
+warmup 之后先按 Expert 平衡 confidence 预筛选：`match_top_k` 名额尽量平均分给
+E0/E1/E2，再执行全局 Hungarian。默认 matching cost 为：
 
 ```text
-cost = 5 × normalized_L1_position_error - sigmoid(confidence_logit)
+cost = 5.0 × normalized_L1_position_error - 0.25 × confidence
 ```
 
-每个 GT 只有一个 winner candidate。winner 的 Expert 统计为 `GT winner`，其它 Expert 对重复位置的候选保持负样本。
-
-损失中的匹配索引由 detached cost 得到，但定位损失仍作用于原始预测张量，保持反向传播。
+位置权重和 confidence 权重由 CLI 配置并写入 checkpoint。每个 GT 只有一个
+winner candidate；其它 Expert 对重复位置的候选保持负样本。损失中的匹配索引由
+detached cost 得到，但定位损失仍作用于原始预测张量，保持反向传播。
 
 ## 3. Task loss
 

@@ -61,12 +61,16 @@ expert_points   tuple(E0, E1, E2)
 ### 3.2 Global competition
 
 warmup 后将三个候选子池合并。对每张图执行一次全局 matching：
+Global competition first performs expert-balanced confidence preselection. The
+`match_top_k` budget is split as evenly as possible across E0/E1/E2, then the
+remaining candidates are matched globally:
 
 ```text
-cost = 5 × normalized_L1_position_error - sigmoid(confidence_logit)
+cost = 5.0 × normalized_L1_position_error - 0.25 × confidence
 ```
 
-每个 GT 只有一个 winner candidate。其它 Expert 对同一 GT 的重复候选保持负样本。
+Both weights are checkpoint configuration fields. Each GT has one winner
+candidate; other Expert candidates remain negative samples.
 
 ### 3.3 Task loss
 

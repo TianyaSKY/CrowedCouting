@@ -39,8 +39,8 @@ class PointMoELoss(nn.Module):
     """Native multiscale classification, localization, and count loss.
 
     Warmup uses independent per-expert matching.  Competitive training and
-    validation use one global Hungarian assignment over the concatenated
-    P3/P4/P5 candidate pool:
+    validation use an expert-balanced preselection followed by one global
+    Hungarian assignment:
 
         L = L_cls + 5 * L_point + 0.05 * L_count
     """
@@ -50,11 +50,21 @@ class PointMoELoss(nn.Module):
         coordinate_weight: float = 5.0,
         count_weight: float = 0.05,
         match_top_k: int = 2000,
+        match_position_weight: float = 5.0,
+        match_confidence_weight: float = 0.25,
     ) -> None:
         super().__init__()
+        if match_top_k <= 0:
+            raise ValueError("match_top_k 必须为正数")
+        if match_position_weight <= 0:
+            raise ValueError("match_position_weight 必须为正数")
+        if match_confidence_weight < 0:
+            raise ValueError("match_confidence_weight 不能为负数")
         self.coordinate_weight = coordinate_weight
         self.count_weight = count_weight
         self.match_top_k = match_top_k
+        self.match_position_weight = match_position_weight
+        self.match_confidence_weight = match_confidence_weight
 
 
     @staticmethod
@@ -64,13 +74,16 @@ class PointMoELoss(nn.Module):
         gt: torch.Tensor,
         scale: torch.Tensor,
         match_top_k: int,
+        match_position_weight: float,
+        match_confidence_weight: float,
+        expert_indices: torch.Tensor | None = None,
     ) -> tuple[
         torch.Tensor,
         torch.Tensor,
         torch.Tensor,
         torch.Tensor,
     ]:
-        """Return detached Hungarian indices and their differentiable values."""
+        """Preselect candidates, then return differentiable Hungarian matches."""
         number_of_gt = gt.shape[0]
         if number_of_gt == 0:
             empty = torch.empty(
@@ -80,13 +93,44 @@ class PointMoELoss(nn.Module):
             )
             return empty, empty, pred_points[:0], gt[:0]
 
-        top_k = max(match_top_k, number_of_gt)
+        top_k = max(
+            match_top_k,
+            number_of_gt,
+            3 if expert_indices is not None else 1,
+        )
         if pred_logits.shape[0] > top_k:
-            match_indices = pred_logits.topk(top_k).indices
+            if expert_indices is None:
+                match_indices = pred_logits.topk(top_k).indices
+            else:
+                quotas = [
+                    top_k // 3
+                    + int(expert_index < top_k % 3)
+                    for expert_index in range(3)
+                ]
+                selected_indices = []
+                for expert_index, quota in enumerate(quotas):
+                    if quota <= 0:
+                        continue
+                    expert_candidates = torch.nonzero(
+                        expert_indices == expert_index,
+                        as_tuple=False,
+                    ).flatten()
+                    if expert_candidates.numel() > quota:
+                        selected_local = pred_logits[
+                            expert_candidates
+                        ].topk(quota).indices
+                        expert_candidates = expert_candidates[
+                            selected_local
+                        ]
+                    selected_indices.append(expert_candidates)
+                match_indices = torch.cat(selected_indices)
+        else:
+            match_indices = None
+
+        if match_indices is not None:
             match_logits = pred_logits[match_indices]
             match_points = pred_points[match_indices]
         else:
-            match_indices = None
             match_logits = pred_logits
             match_points = pred_points
 
@@ -101,8 +145,9 @@ class PointMoELoss(nn.Module):
             p=1,
         )
         total_cost = (
-            5.0 * coordinate_cost
-            - match_logits.sigmoid().unsqueeze(0)
+            match_position_weight * coordinate_cost
+            - match_confidence_weight
+            * match_logits.sigmoid().unsqueeze(0)
         )
         gt_indices, pred_indices = linear_sum_assignment(
             total_cost.detach().float().cpu().numpy()
@@ -206,6 +251,8 @@ class PointMoELoss(nn.Module):
                             gt,
                             scale,
                             self.match_top_k,
+                            self.match_position_weight,
+                            self.match_confidence_weight,
                         )
                         targets[matched_indices] = 1.0
                         image_point_loss = (
@@ -273,6 +320,9 @@ class PointMoELoss(nn.Module):
                         gt,
                         scale,
                         self.match_top_k,
+                        self.match_position_weight,
+                        self.match_confidence_weight,
+                        expert_indices[batch_index],
                     )
                     targets[matched_indices] = 1.0
                     matched_sources = expert_indices[

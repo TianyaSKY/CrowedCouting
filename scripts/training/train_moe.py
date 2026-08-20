@@ -132,6 +132,13 @@ def build_checkpoint_config(
         ),
         "selection_metric": "native weighted normalized MAE",
         "match_top_k": int(criterion.match_top_k),
+        "match_position_weight": float(
+            criterion.match_position_weight
+        ),
+        "match_confidence_weight": float(
+            criterion.match_confidence_weight
+        ),
+        "candidate_preselection": "expert_balanced_top_k",
     }
 
 
@@ -393,14 +400,21 @@ def train_moe(args):
             backup = os.path.join(args.save_dir, "best_native_prev.pt")
             if not os.path.exists(backup):
                 shutil.copy2(old_best, backup)
-                logging.info("旧 best_native.pt 已备份到 %s", backup)
+                logging.info(
+                    "旧 best_native.pt 已备份到 %s",
+                    backup,
+                )
+    criterion = PointMoELoss(
+        match_top_k=args.match_top_k,
+        match_position_weight=args.match_position_weight,
+        match_confidence_weight=args.match_confidence_weight,
+    )
 
     model = YOLO11MoEPoint(
         weights=args.weights,
         hidden_channels=args.hidden_channels,
         native_references=native_references,
     ).to(device)
-    criterion = PointMoELoss(match_top_k=args.match_top_k)
 
     train_dataset = PointDataset(
         args.data_root,
@@ -475,6 +489,22 @@ def train_moe(args):
             raise ValueError(
                 "resume checkpoint 的 native_references 与当前配置不一致"
             )
+        saved_position_weight = float(
+            config.get("match_position_weight", 5.0)
+        )
+        saved_confidence_weight = float(
+            config.get("match_confidence_weight", 0.25)
+        )
+        if not math.isclose(
+            saved_position_weight,
+            args.match_position_weight,
+        ) or not math.isclose(
+            saved_confidence_weight,
+            args.match_confidence_weight,
+        ):
+            raise ValueError(
+                "resume checkpoint 的 matching cost 权重与当前配置不一致"
+            )
         model.load_state_dict(checkpoint["model"])
         try:
             optimizer.load_state_dict(checkpoint["optimizer"])
@@ -485,6 +515,13 @@ def train_moe(args):
         best_selection_score = float(
             checkpoint.get("best_selection_score", float("inf"))
         )
+        if start_epoch >= args.freeze_epochs:
+            for param in model.yolo.parameters():
+                param.requires_grad = True
+            logging.info(
+                "resume start_epoch=%d：YOLO Backbone+Neck 保持可训练",
+                start_epoch,
+            )
 
         old_best = os.path.join(args.save_dir, "best_native.pt")
         if os.path.exists(old_best):
@@ -665,7 +702,8 @@ def train_moe(args):
             writer.add_scalar(f"native/train_matched_confidence_E{expert_index}", float(train_confidence_mean[expert_index]), epoch)
 
         if (
-            args.expert_only_eval_interval > 0
+            matching_mode == "independent"
+            and args.expert_only_eval_interval > 0
             and (epoch + 1) % args.expert_only_eval_interval == 0
         ):
             expert_only_mae = evaluate_expert_only_mae(
@@ -786,7 +824,7 @@ def build_parser():
         "--expert-only-eval-interval",
         type=int,
         default=5,
-        help="每 N 个 epoch 运行 E0/E1/E2-only 诊断；0 关闭",
+        help="每 N 个 warmup epoch 运行 E0/E1/E2-only 诊断；competition 阶段关闭",
     )
     parser.add_argument(
         "--val-image-interval",
@@ -797,6 +835,18 @@ def build_parser():
     parser.add_argument("--val-image-count", type=int, default=4)
     parser.add_argument("--val-image-conf", type=float, default=0.5)
     parser.add_argument("--match-top-k", type=int, default=2000)
+    parser.add_argument(
+        "--match-position-weight",
+        type=float,
+        default=5.0,
+        help="Hungarian cost 的位置误差权重",
+    )
+    parser.add_argument(
+        "--match-confidence-weight",
+        type=float,
+        default=0.25,
+        help="Hungarian cost 的 confidence 权重",
+    )
     parser.add_argument("--freeze-epochs", type=int, default=3)
     parser.add_argument("--grad-clip", type=float, default=10.0)
     parser.add_argument("--workers", type=int, default=4)
