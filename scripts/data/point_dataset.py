@@ -9,80 +9,6 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset
 
-def letterbox_image(
-    image: np.ndarray,
-    crop_size: int,
-) -> tuple[np.ndarray, float, int, int]:
-    """Resize an image with aspect-ratio preservation and centered padding."""
-    if crop_size <= 0:
-        raise ValueError("crop_size must be positive")
-
-    height, width = image.shape[:2]
-    scale = min(
-        crop_size / max(width, 1),
-        crop_size / max(height, 1),
-    )
-    new_width = max(1, int(round(width * scale)))
-    new_height = max(1, int(round(height * scale)))
-    resized = cv2.resize(
-        image,
-        (new_width, new_height),
-        interpolation=cv2.INTER_LINEAR,
-    )
-
-    pad_x = (crop_size - new_width) // 2
-    pad_y = (crop_size - new_height) // 2
-    padded = cv2.copyMakeBorder(
-        resized,
-        pad_y,
-        crop_size - new_height - pad_y,
-        pad_x,
-        crop_size - new_width - pad_x,
-        cv2.BORDER_CONSTANT,
-        value=(114, 114, 114),
-    )
-    return padded, scale, pad_x, pad_y
-
-
-def letterbox_points(
-    points: np.ndarray,
-    scale: float,
-    pad_x: int,
-    pad_y: int,
-    crop_size: int,
-) -> np.ndarray:
-    """Map original-image points into letterboxed pixel coordinates."""
-    transformed = np.asarray(points, dtype=np.float32).reshape(-1, 2).copy()
-    if transformed.shape[0] == 0:
-        return transformed
-    transformed *= np.asarray([scale, scale], dtype=np.float32)
-    transformed += np.asarray([pad_x, pad_y], dtype=np.float32)
-    transformed[:, 0] = np.clip(transformed[:, 0], 0, crop_size - 1)
-    transformed[:, 1] = np.clip(transformed[:, 1], 0, crop_size - 1)
-    return transformed
-
-
-def inverse_letterbox_points(
-    points: np.ndarray,
-    scale: float,
-    pad_x: int,
-    pad_y: int,
-    width: int,
-    height: int,
-) -> np.ndarray:
-    """Map letterboxed pixel coordinates back into original-image space."""
-    if scale <= 0:
-        raise ValueError("letterbox scale must be positive")
-    transformed = np.asarray(points, dtype=np.float32).reshape(-1, 2).copy()
-    if transformed.shape[0] == 0:
-        return transformed
-    transformed -= np.asarray([pad_x, pad_y], dtype=np.float32)
-    transformed /= scale
-    transformed[:, 0] = np.clip(transformed[:, 0], 0, max(width - 1, 0))
-    transformed[:, 1] = np.clip(transformed[:, 1], 0, max(height - 1, 0))
-    return transformed
-
-
 
 def load_points(point_path: str, width: int, height: int) -> np.ndarray:
     """读取点标注文件（每行: x_normalized y_normalized），返回像素坐标 [N, 2]。"""
@@ -118,7 +44,7 @@ class PointDataset(Dataset):
         "points": Tensor[N, 2]（像素坐标）
         "image_path": 原始图片的稳定绝对/相对路径字符串
 
-    训练在线增强（augment=True）：
+    训练在线增强：
         缩放 0.8–1.2 → 随机裁剪 crop_size → 水平翻转 p=0.5
         → 随机旋转 ±10° p=0.5 → 亮度/对比度 → HSV 色相/饱和度抖动
     """
@@ -128,14 +54,14 @@ class PointDataset(Dataset):
         root: str,
         split: str = "train",
         crop_size: int = 640,
-        augment: bool = True,
     ) -> None:
         super().__init__()
 
         self.image_dir = os.path.join(root, "images", split)
         self.points_dir = os.path.join(root, "points", split)
+
         self.crop_size = crop_size
-        self.augment = augment
+
 
         self.image_paths = sorted(
             glob.glob(os.path.join(self.image_dir, "*.jpg"))
@@ -180,16 +106,9 @@ class PointDataset(Dataset):
 
         height, width = image.shape[:2]
         points = load_points(point_path, width, height)
-
-        if self.augment:
-            image, points = self._augment_train(
-                image, points, height, width
-            )
-        else:
-            # 验证/测试：letterbox 保持纵横比，避免压扁改变人的尺度
-            image, points = self._letterbox(
-                image, points, height, width
-            )
+        image, points = self._augment_train(
+            image, points, height, width
+        )
 
         image_tensor = (
             torch.from_numpy(image.astype(np.float32) / 255.0)
@@ -355,27 +274,6 @@ class PointDataset(Dataset):
             )
 
         return image, points
-
-    def _letterbox(
-        self,
-        image: np.ndarray,
-        points: np.ndarray,
-        height: int,
-        width: int,
-    ) -> tuple[np.ndarray, np.ndarray]:
-        """等比例缩放后居中填充到 crop_size x crop_size，同步变换点坐标。"""
-        padded, scale, pad_x, pad_y = letterbox_image(
-            image,
-            self.crop_size,
-        )
-        return padded, letterbox_points(
-            points,
-            scale,
-            pad_x,
-            pad_y,
-            self.crop_size,
-        )
-
 
 def point_collate_fn(
     batch: list[dict[str, object]],

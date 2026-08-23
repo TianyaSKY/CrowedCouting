@@ -1,6 +1,7 @@
 /datasets
 /data
 runs/
+*.pt
 
 # Python / bytecode
 __pycache__/

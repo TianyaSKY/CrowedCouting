@@ -16,10 +16,12 @@ import numpy as np
 import torch
 from tqdm import tqdm
 
-from scripts.data.point_dataset import letterbox_image
+from scripts.data.point_dataset import load_points
+from scripts.inference.tiling import run_tiled_inference
 from scripts.visualization.predict_moe import (
     EXPERT_COLORS,
     load_model,
+    overlay_probability,
     resolve_inference_settings,
 )
 
@@ -39,17 +41,6 @@ def setup_logging(log_path: str) -> None:
     )
 
 
-def load_gt_points(point_path: str, width: int, height: int) -> np.ndarray:
-    points = []
-    if os.path.exists(point_path):
-        with open(point_path, encoding="utf-8") as file:
-            for line in file:
-                parts = line.split()
-                if len(parts) >= 2:
-                    points.append(
-                        [float(parts[0]) * width, float(parts[1]) * height]
-                    )
-    return np.asarray(points, dtype=np.float32).reshape(-1, 2)
 
 
 def draw_result(
@@ -91,35 +82,6 @@ def draw_result(
     return np.vstack([header, result])
 
 
-def native_heatmap(scores, model, imgsz: int) -> np.ndarray:
-    heat = np.zeros((imgsz, imgsz), dtype=np.float32)
-    offset = 0
-    for stride, references in zip(
-        model.point_head.output_strides,
-        model.point_head.references_per_expert,
-    ):
-        height_cells = imgsz // int(stride)
-        width_cells = imgsz // int(stride)
-        count = height_cells * width_cells * references
-        level_scores = scores[offset:offset + count]
-        offset += count
-        if level_scores.numel() != count:
-            continue
-        level_conf = (
-            level_scores.reshape(height_cells, width_cells, references)
-            .max(dim=-1)
-            .values.cpu()
-            .numpy()
-        )
-        heat = np.maximum(
-            heat,
-            cv2.resize(
-                level_conf,
-                (imgsz, imgsz),
-                interpolation=cv2.INTER_LINEAR,
-            ),
-        )
-    return heat
 
 
 def predict_batch(args):
@@ -153,55 +115,49 @@ def predict_batch(args):
             if image_bgr is None:
                 logging.warning("无法读取 %s，跳过", image_path)
                 continue
-            height, width = image_bgr.shape[:2]
-            padded, scale, pad_x, pad_y = letterbox_image(image_bgr, imgsz)
-            image_rgb = cv2.cvtColor(padded, cv2.COLOR_BGR2RGB)
-            tensor = (
-                torch.from_numpy(image_rgb.astype(np.float32) / 255.0)
-                .permute(2, 0, 1)
-                .unsqueeze(0)
-                .to(device)
+            result = run_tiled_inference(
+                model,
+                image_bgr,
+                device,
+                imgsz,
+                overlap=args.overlap,
+                tile_batch_size=args.tile_batch_size,
+                conf_threshold=args.conf,
             )
-            with torch.no_grad():
-                predictions = model(tensor)
-            scores = predictions["logits"].sigmoid()[0]
-            crop_points = predictions["points"][0]
-            sources = predictions["expert_indices"][0]
-            keep = scores > args.conf
             if args.count_mode == "soft":
-                pred_count = float(scores.sum().item())
+                pred_count = result.count
             else:
-                pred_count = int(keep.sum().item())
+                pred_count = int(len(result.points))
 
             if args.heatmap:
-                heat = native_heatmap(scores, model, imgsz)
-                new_w = max(1, int(round(width * scale)))
-                new_h = max(1, int(round(height * scale)))
-                heat = heat[pad_y:pad_y + new_h, pad_x:pad_x + new_w]
-                heat = cv2.resize(heat, (width, height), interpolation=cv2.INTER_LINEAR)
-                heat_vis = cv2.applyColorMap(
-                    (np.clip(heat, 0, 1) * 255).astype(np.uint8),
-                    cv2.COLORMAP_JET,
-                )
-                overlay = cv2.addWeighted(
-                    image_bgr,
-                    1.0 - args.heat_alpha,
-                    heat_vis,
-                    args.heat_alpha,
-                    0,
-                )
                 heat_dir = os.path.join(args.out_dir, "heatmaps")
                 os.makedirs(heat_dir, exist_ok=True)
-                cv2.imwrite(os.path.join(heat_dir, base_name + "_heat.jpg"), overlay)
+                cv2.imwrite(
+                    os.path.join(heat_dir, base_name + "_prob.jpg"),
+                    overlay_probability(
+                        image_bgr,
+                        result.prob_map,
+                        args.heat_alpha,
+                    ),
+                )
+                normalized = cv2.normalize(
+                    result.prob_map,
+                    None,
+                    0,
+                    255,
+                    cv2.NORM_MINMAX,
+                )
+                cv2.imwrite(
+                    os.path.join(heat_dir, base_name + "_prob_raw.png"),
+                    cv2.applyColorMap(
+                        normalized.astype(np.uint8),
+                        cv2.COLORMAP_JET,
+                    ),
+                )
 
-            crop_points = crop_points[keep].cpu().numpy()
-            sources = sources[keep].cpu().numpy()
-            pred_points = (
-                crop_points - np.array([pad_x, pad_y], dtype=np.float32)
-            ) / scale
-            pred_points[:, 0] = np.clip(pred_points[:, 0], 0, width - 1)
-            pred_points[:, 1] = np.clip(pred_points[:, 1], 0, height - 1)
-            gt_points = load_gt_points(
+            pred_points = result.points
+            sources = result.sources
+            gt_points = load_points(
                 os.path.join(points_dir, base_name + ".txt"),
                 width,
                 height,
@@ -234,6 +190,9 @@ def predict_batch(args):
         "count_mode": args.count_mode,
         "heatmap": args.heatmap,
         "imgsz": imgsz,
+        "inference": "tiled_cosine",
+        "overlap": args.overlap,
+        "tile_batch_size": args.tile_batch_size,
         "checkpoint": args.checkpoint,
         "expert_usage": {
             f"expert{i}": int(expert_counts[i]) for i in range(3)
@@ -259,8 +218,9 @@ def parse_args():
     parser.add_argument("--imgsz", type=int, default=None)
     parser.add_argument("--conf", type=float, default=0.5)
     parser.add_argument("--count-mode", choices=("soft", "thresh"), default="soft")
-    parser.add_argument("--heatmap", action="store_true")
     parser.add_argument("--heat-alpha", type=float, default=0.45)
+    parser.add_argument("--overlap", type=float, default=0.5)
+    parser.add_argument("--tile-batch-size", type=int, default=8)
     parser.add_argument("--out-dir", type=str, required=True)
     return parser.parse_args()
 

@@ -5,13 +5,12 @@ import csv
 import json
 import logging
 import os
-
 import numpy as np
-import torch
-from torch.utils.data import DataLoader
+import cv2
 from tqdm import tqdm
 
-from scripts.data.point_dataset import PointDataset, point_collate_fn
+from scripts.data.point_dataset import PointDataset, load_points
+from scripts.inference.tiling import run_tiled_inference
 from scripts.visualization.plot_utils import (
     create_moe_comparison_figure,
     generate_markdown_report,
@@ -83,15 +82,6 @@ def evaluate_datasets(args: argparse.Namespace) -> None:
             root,
             split=split,
             crop_size=crop_size,
-            augment=False,
-        )
-        loader = DataLoader(
-            dataset,
-            batch_size=args.batch_size,
-            shuffle=False,
-            num_workers=args.workers,
-            collate_fn=point_collate_fn,
-            pin_memory=device == "cuda",
         )
         metrics = CountMetrics()
         processed = 0
@@ -105,41 +95,49 @@ def evaluate_datasets(args: argparse.Namespace) -> None:
                 ["filename", "gt_count", "pred_count", "abs_error"]
             )
             with torch.inference_mode():
-                for batch in tqdm(loader, desc=name):
-                    images = batch["img"].to(device)
-                    gt_points = batch["points"]
-                    predictions = model(images)
-                    pred_counts = (
-                        predictions["logits"].sigmoid().sum(dim=1).cpu().tolist()
+                for image_path in tqdm(dataset.image_paths, desc=name):
+                    filename = os.path.basename(image_path)
+                    image_bgr = cv2.imread(image_path)
+                    if image_bgr is None:
+                        logging.warning("无法读取 %s，跳过", image_path)
+                        continue
+                    height, width = image_bgr.shape[:2]
+                    gt_points = load_points(
+                        os.path.join(
+                            dataset.points_dir,
+                            os.path.splitext(filename)[0] + ".txt",
+                        ),
+                        width,
+                        height,
                     )
-                    for index, (points, pred_count) in enumerate(
-                        zip(gt_points, pred_counts)
-                    ):
-                        filename = os.path.basename(
-                            dataset.image_paths[processed + index]
-                        )
-                        gt_count = int(points.shape[0])
-                        pred_count = float(pred_count)
-                        abs_error = abs(pred_count - gt_count)
-                        metrics.update(gt_count, pred_count)
-                        detailed_records.append(
-                            {
-                                "dataset_index": processed + index,
-                                "filename": filename,
-                                "gt_count": gt_count,
-                                "pred_count": pred_count,
-                                "abs_error": abs_error,
-                            }
-                        )
-                        writer.writerow(
-                            [
-                                filename,
-                                gt_count,
-                                f"{pred_count:.3f}",
-                                f"{abs_error:.3f}",
-                            ]
-                        )
-                    processed += len(gt_points)
+                    result = run_tiled_inference(
+                        model,
+                        image_bgr,
+                        device,
+                        crop_size,
+                    )
+                    gt_count = int(gt_points.shape[0])
+                    pred_count = float(result.count)
+                    abs_error = abs(pred_count - gt_count)
+                    metrics.update(gt_count, pred_count)
+                    detailed_records.append(
+                        {
+                            "dataset_index": processed,
+                            "filename": filename,
+                            "gt_count": gt_count,
+                            "pred_count": pred_count,
+                            "abs_error": abs_error,
+                        }
+                    )
+                    writer.writerow(
+                        [
+                            filename,
+                            gt_count,
+                            f"{pred_count:.3f}",
+                            f"{abs_error:.3f}",
+                        ]
+                    )
+                    processed += 1
 
         summary = metrics.as_dict()
         summary.update(
@@ -148,7 +146,8 @@ def evaluate_datasets(args: argparse.Namespace) -> None:
                 "root": root,
                 "split": split,
                 "architecture": NATIVE_ARCHITECTURE,
-                "count_metric": "native_sum_sigmoid",
+                "count_metric": "native_sum_sigmoid_tiled",
+                "inference": "tiled_cosine",
             }
         )
         with open(
@@ -186,16 +185,37 @@ def evaluate_datasets(args: argparse.Namespace) -> None:
             ]
             with torch.inference_mode():
                 for tag, record in selected:
-                    index = int(record["dataset_index"])
-                    raw_sample = dataset[index]
-                    sample_image = raw_sample["img"].unsqueeze(0).to(device)
-                    sample_prediction = model(sample_image)
+                    image_path = dataset.image_paths[
+                        int(record["dataset_index"])
+                    ]
+                    image_bgr = cv2.imread(image_path)
+                    if image_bgr is None:
+                        logging.warning("无法读取 %s，跳过可视化", image_path)
+                        continue
+                    sample_image_rgb = cv2.cvtColor(
+                        image_bgr, cv2.COLOR_BGR2RGB
+                    )
+                    height, width = image_bgr.shape[:2]
+                    gt_points = load_points(
+                        os.path.join(
+                            dataset.points_dir,
+                            os.path.splitext(record["filename"])[0] + ".txt",
+                        ),
+                        width,
+                        height,
+                    )
+                    result = run_tiled_inference(
+                        model,
+                        image_bgr,
+                        device,
+                        crop_size,
+                    )
                     figure = create_moe_comparison_figure(
-                        image=sample_image[0],
-                        gt_points=raw_sample["points"],
-                        pred_points=sample_prediction["points"][0].cpu(),
-                        pred_routes=sample_prediction["expert_indices"][0].cpu(),
-                        pred_scores=sample_prediction["logits"][0].sigmoid().cpu(),
+                        image=sample_image_rgb,
+                        gt_points=gt_points,
+                        pred_points=result.points,
+                        pred_routes=result.sources,
+                        pred_scores=result.scores,
                         gt_count=float(record["gt_count"]),
                         pred_count=float(record["pred_count"]),
                         title=(
