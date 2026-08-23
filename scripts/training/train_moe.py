@@ -9,6 +9,7 @@ os.environ.setdefault(
     "PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True"
 )
 
+import cv2
 import numpy as np
 import torch
 from torch.utils.data import DataLoader
@@ -17,7 +18,8 @@ from tqdm import tqdm
 
 from models.point_moe_loss import PointMoELoss
 from models.yolo11_moe_point import YOLO11MoEPoint
-from scripts.data.point_dataset import PointDataset, point_collate_fn
+from scripts.data.point_dataset import PointDataset, load_points, point_collate_fn
+from scripts.inference.tiling import run_tiled_inference, tiled_forward
 from scripts.visualization.validation_visualizer import (
     log_validation_images,
 )
@@ -217,9 +219,12 @@ def log_system_metrics(
 
 def evaluate_native_count_mae(
     model,
-    val_loader,
+    val_dataset,
     device,
     criterion: PointMoELoss | None = None,
+    crop_size: int = 640,
+    overlap: float = 0.5,
+    tile_batch_size: int = 8,
     max_visual_samples: int = 0,
 ):
     if max_visual_samples < 0:
@@ -246,72 +251,110 @@ def evaluate_native_count_mae(
     confidence_sum = torch.zeros(3, device=device)
     matched_count = 0
     validation_samples: list[dict[str, object]] = []
-
     with torch.no_grad():
-        for batch in tqdm(val_loader, desc="Native 验证中", leave=False):
-            images = batch["img"].to(device)
-            gt_points = [p.to(device) for p in batch["points"]]
-            predictions = model(images)
-            pred_counts = predictions["logits"].sigmoid().sum(dim=1)
+        for image_path in tqdm(
+            val_dataset.image_paths,
+            desc="Native 验证中",
+            leave=False,
+        ):
+            image_bgr = cv2.imread(image_path)
+            if image_bgr is None:
+                logging.warning("无法读取 %s，跳过", image_path)
+                continue
+            height, width = image_bgr.shape[:2]
+            gt_points_np = load_points(
+                os.path.join(
+                    val_dataset.points_dir,
+                    os.path.splitext(os.path.basename(image_path))[0]
+                    + ".txt",
+                ),
+                width,
+                height,
+            )
+            forward = tiled_forward(
+                model,
+                image_bgr,
+                device,
+                crop_size,
+                overlap=overlap,
+                tile_batch_size=tile_batch_size,
+            )
+            pred_count = float(
+                sum(grid.sum() for grid in forward["fused_levels"].values())
+            )
 
-            for image_index, gt in enumerate(gt_points):
-                error = float(pred_counts[image_index].item()) - gt.shape[0]
-                total_abs_error += abs(error)
-                total_squared_error += error * error
-                total_bias += error
+            error = pred_count - gt_points_np.shape[0]
+            total_abs_error += abs(error)
+            total_squared_error += error * error
+            total_bias += error
 
             if criterion is not None:
-                native_loss, loss_items = criterion(
-                    predictions,
-                    gt_points,
-                    image_size=images.shape[-2:],
-                    matching_mode="competitive",
-                )
-                loss_sums["total"] += native_loss.detach()
-                for name in ("cls", "point", "count"):
-                    loss_sums[name] += loss_items[name].detach()
-                winner_hist += loss_items["winner_hist"].to(
-                    device=device,
-                    dtype=torch.int64,
-                )
-                positive_count += loss_items["positive_count"].to(device)
-                distance_sum += loss_items["matched_distance_sum"].to(device)
-                confidence_sum += loss_items[
-                    "matched_confidence_sum"
-                ].to(device)
-                matched_count += int(loss_items["matched_count"].item())
+                origins = forward["origins"]
+                flat_index = 0
+                for predictions in forward["tile_predictions"]:
+                    batch_size = predictions["logits"].shape[0]
+                    tile_gts = []
+                    for tile_index in range(batch_size):
+                        y0, x0 = origins[flat_index]
+                        flat_index += 1
+                        local = gt_points_np - np.asarray(
+                            [x0, y0], dtype=np.float32
+                        )
+                        keep = (
+                            (local[:, 0] >= 0)
+                            & (local[:, 0] < crop_size)
+                            & (local[:, 1] >= 0)
+                            & (local[:, 1] < crop_size)
+                        )
+                        local = np.clip(local[keep], 0, crop_size - 1)
+                        tile_gts.append(
+                            torch.from_numpy(local).to(device)
+                        )
+                    native_loss, loss_items = criterion(
+                        predictions,
+                        tile_gts,
+                        image_size=(crop_size, crop_size),
+                        matching_mode="competitive",
+                    )
+                    loss_sums["total"] += native_loss.detach()
+                    for name in ("cls", "point", "count"):
+                        loss_sums[name] += loss_items[name].detach()
+                    winner_hist += loss_items["winner_hist"].to(
+                        device=device,
+                        dtype=torch.int64,
+                    )
+                    positive_count += loss_items["positive_count"].to(device)
+                    distance_sum += loss_items["matched_distance_sum"].to(device)
+                    confidence_sum += loss_items[
+                        "matched_confidence_sum"
+                    ].to(device)
+                    matched_count += int(loss_items["matched_count"].item())
+                    num_batches += 1
 
             if len(validation_samples) < max_visual_samples:
-                image_paths = batch.get("image_paths", [])
-                for image_index in range(len(gt_points)):
-                    if len(validation_samples) >= max_visual_samples:
-                        break
-                    image_path = None
-                    if isinstance(image_paths, list):
-                        image_path = image_paths[image_index]
-                    validation_samples.append(
-                        {
-                            "image": images[image_index].detach().cpu(),
-                            "gt_points": gt_points[
-                                image_index
-                            ].detach().cpu(),
-                            "predictions": {
-                                name: predictions[name][image_index]
-                                .detach()
-                                .cpu()
-                                for name in (
-                                    "logits",
-                                    "points",
-                                    "expert_indices",
-                                )
-                            },
-                            "image_path": image_path,
-                        }
-                    )
+                result = run_tiled_inference(
+                    model,
+                    image_bgr,
+                    device,
+                    crop_size,
+                    overlap=overlap,
+                    tile_batch_size=tile_batch_size,
+                )
+                validation_samples.append(
+                    {
+                        "image": cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB),
+                        "gt_points": gt_points_np.copy(),
+                        "predictions": {
+                            "logits": result.scores,
+                            "points": result.points,
+                            "expert_indices": result.sources,
+                        },
+                        "image_path": image_path,
+                        "pred_count": pred_count,
+                    }
+                )
 
-            total_images += len(gt_points)
-            num_batches += 1
-
+            total_images += 1
     if was_training:
         model.train()
 
@@ -384,13 +427,11 @@ def train_moe(args):
         args.data_root,
         split="train",
         crop_size=args.crop_size,
-        augment=True,
     )
     val_dataset = PointDataset(
         args.data_root,
         split="val",
         crop_size=args.crop_size,
-        augment=False,
     )
     val_mean_gt_count = dataset_mean_gt_count(val_dataset)
     val_image_interval, val_image_count, val_image_conf = (
@@ -417,14 +458,6 @@ def train_moe(args):
         collate_fn=point_collate_fn,
         drop_last=True,
     )
-    val_loader = DataLoader(
-        val_dataset,
-        batch_size=args.batch_size,
-        shuffle=False,
-        num_workers=args.workers,
-        collate_fn=point_collate_fn,
-    )
-
     if args.freeze_epochs > 0:
         logging.info(
             "前 %d 个 epoch 冻结 YOLO Backbone+Neck",
@@ -561,9 +594,10 @@ def train_moe(args):
         )
         validation = evaluate_native_count_mae(
             model,
-            val_loader,
+            val_dataset,
             device,
             criterion=criterion,
+            crop_size=args.crop_size,
             max_visual_samples=val_image_count if collect_visuals else 0,
         )
 

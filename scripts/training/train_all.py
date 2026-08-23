@@ -266,7 +266,6 @@ def train_all(args: argparse.Namespace) -> None:
                 root,
                 split=split,
                 crop_size=args.crop_size,
-                augment=True,
             )
             train_datasets.append(dataset)
             train_dataset_sizes[name] = (
@@ -282,7 +281,7 @@ def train_all(args: argparse.Namespace) -> None:
         drop_last=True,
     )
 
-    val_loaders = {}
+    val_datasets = {}
     val_mean_gt_counts = {}
     val_image_counts: dict[str, int] = {}
     for name, root, _, eval_split in specs:
@@ -290,24 +289,16 @@ def train_all(args: argparse.Namespace) -> None:
             root,
             split=eval_split,
             crop_size=args.crop_size,
-            augment=False,
         )
         val_mean_gt_counts[name] = mean_gt_count(val_dataset)
         val_image_counts[name] = len(val_dataset)
-        val_loaders[name] = DataLoader(
-            val_dataset,
-            batch_size=args.batch_size,
-            shuffle=False,
-            num_workers=args.workers,
-            collate_fn=point_collate_fn,
-        )
+        val_datasets[name] = val_dataset
         logging.info(
             "  %s 验证集: %d images，平均 GT 人数: %.3f",
             name,
             val_image_counts[name],
             val_mean_gt_counts[name],
         )
-
     val_image_interval, val_image_count, val_image_conf = (
         tm.validation_image_options(args)
     )
@@ -422,22 +413,15 @@ def train_all(args: argparse.Namespace) -> None:
         val_confidence_sum = torch.zeros(3, device=device)
         val_matched_count = 0
 
-        for name, val_loader in val_loaders.items():
+        for name, val_dataset in val_datasets.items():
             validation = tm.evaluate_native_count_mae(
                 model,
-                val_loader,
+                val_dataset,
                 device,
                 criterion=criterion,
+                crop_size=args.crop_size,
                 max_visual_samples=val_image_count if collect_visuals else 0,
             )
-            validation_by_dataset[name] = validation
-            per_dataset[name] = {"native": validation["mae"]}
-            val_winner_hist += validation["winner_hist"].to(device)
-            val_positive_count += validation["positive_count"].to(device)
-            val_distance_sum += validation["matched_distance_sum"].to(device)
-            val_confidence_sum += validation[
-                "matched_confidence_sum"
-            ].to(device)
             val_matched_count += validation["matched_count"]
 
             if collect_visuals and validation["validation_samples"]:

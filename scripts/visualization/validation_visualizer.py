@@ -67,8 +67,9 @@ def _prediction_tensors(
         points_array = points_array[0]
     if source_array.ndim == 2:
         source_array = source_array[0]
+    # 验证样本中的 "logits" 已是 NMS 后的 sigmoid 置信度，无需再过 sigmoid。
     return (
-        1.0 / (1.0 + np.exp(-logits_array)),
+        logits_array,
         points_array.reshape(-1, 2),
         source_array.reshape(-1),
     )
@@ -137,18 +138,19 @@ def _add_header_banner(
         )
     return np.vstack([header, image_bgr])
 
-
 def render_validation_sample(
     image: torch.Tensor | np.ndarray,
     gt_points: torch.Tensor | np.ndarray,
     predictions: Mapping[str, torch.Tensor | np.ndarray],
     image_path: str | None = None,
     conf_threshold: float = 0.5,
+    pred_count: float | None = None,
 ) -> np.ndarray:
     """Render one native_multiscale validation prediction as an RGB panel.
 
     The right panel uses the source expert recorded in ``expert_indices``.
-    Metric count remains the exact validation count ``sum(sigmoid(logits))``.
+    Metric count uses ``pred_count`` (融合软计数) when provided, otherwise
+    the stored sigmoid score sum.
     """
     if not 0.0 <= conf_threshold <= 1.0:
         raise ValueError("conf_threshold must be between 0 and 1")
@@ -189,7 +191,9 @@ def render_validation_sample(
             filled=True,
             radius=max(2, min(prediction_panel.shape[:2]) // 220),
         )
-    metric_count = float(scores.sum())
+    metric_count = (
+        float(pred_count) if pred_count is not None else float(scores.sum())
+    )
     visible_count = int(visible.sum())
     abs_error = abs(metric_count - len(gt_array))
     prediction_panel = _add_header_banner(
@@ -210,7 +214,6 @@ def render_validation_batch(
     samples: Sequence[Mapping[str, object]],
     conf_threshold: float = 0.5,
 ) -> list[np.ndarray]:
-    """Render a fixed validation sample collection without another forward."""
     return [
         render_validation_sample(
             sample["image"],  # type: ignore[arg-type]
@@ -218,6 +221,7 @@ def render_validation_batch(
             sample["predictions"],  # type: ignore[arg-type]
             image_path=sample.get("image_path"),  # type: ignore[arg-type]
             conf_threshold=conf_threshold,
+            pred_count=sample.get("pred_count"),  # type: ignore[arg-type]
         )
         for sample in samples
     ]

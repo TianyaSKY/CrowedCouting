@@ -13,11 +13,14 @@ os.environ.setdefault(
 )
 
 import torch
-from torch.utils.data import DataLoader, Dataset
+import cv2
 from tqdm import tqdm
 
 from models.yolo11_moe_point import YOLO11MoEPoint
-from scripts.data.point_dataset import PointDataset, point_collate_fn
+import numpy as np
+
+from scripts.data.point_dataset import PointDataset, load_points
+from scripts.inference.tiling import run_tiled_inference
 from scripts.visualization.plot_utils import (
     create_moe_comparison_figure,
     generate_markdown_report,
@@ -67,22 +70,6 @@ class CountMetrics:
         }
 
 
-class NamedPointDataset(Dataset):
-    def __init__(self, dataset: PointDataset) -> None:
-        self.dataset = dataset
-
-    def __len__(self) -> int:
-        return len(self.dataset)
-
-    def __getitem__(self, index: int) -> dict[str, object]:
-        sample = self.dataset[index]
-        filename = os.path.basename(self.dataset.image_paths[index])
-        base_name = os.path.splitext(filename)[0]
-        return {
-            **sample,
-            "filename": filename,
-            "subset": infer_subset(base_name),
-        }
 
 
 def infer_subset(base_name: str) -> str:
@@ -93,11 +80,6 @@ def infer_subset(base_name: str) -> str:
     return "other"
 
 
-def evaluation_collate(batch: list[dict[str, object]]) -> dict[str, object]:
-    model_batch = point_collate_fn(batch)  # type: ignore[arg-type]
-    model_batch["filenames"] = [sample["filename"] for sample in batch]
-    model_batch["subsets"] = [sample["subset"] for sample in batch]
-    return model_batch
 
 
 def setup_logging(log_path: str) -> None:
@@ -233,16 +215,6 @@ def evaluate(args: argparse.Namespace) -> None:
         args.data_root,
         split=args.split,
         crop_size=crop_size,
-        augment=False,
-    )
-    dataset = NamedPointDataset(base_dataset)
-    loader = DataLoader(
-        dataset,
-        batch_size=args.batch_size,
-        shuffle=False,
-        num_workers=args.workers,
-        collate_fn=evaluation_collate,
-        pin_memory=device == "cuda",
     )
 
     metrics = {
@@ -260,47 +232,58 @@ def evaluate(args: argparse.Namespace) -> None:
             ["filename", "subset", "gt_count", "pred_count", "abs_error"]
         )
         with torch.inference_mode():
-            for batch in tqdm(loader, desc="Native 测试中", leave=False):
-                images = batch["img"].to(device, non_blocking=True)
-                gt_points = batch["points"]
-                filenames = batch["filenames"]
-                subsets = batch["subsets"]
-                predictions = model(images)
-                pred_counts = (
-                    predictions["logits"]
-                    .sigmoid()
-                    .sum(dim=1)
-                    .cpu()
-                    .tolist()
+            for image_path in tqdm(
+                base_dataset.image_paths,
+                desc="Native 测试中",
+                leave=False,
+            ):
+                filename = os.path.basename(image_path)
+                subset = infer_subset(filename)
+                image_bgr = cv2.imread(image_path)
+                if image_bgr is None:
+                    logging.warning("无法读取 %s，跳过", image_path)
+                    continue
+                height, width = image_bgr.shape[:2]
+                gt_points = load_points(
+                    os.path.join(
+                        base_dataset.points_dir,
+                        os.path.splitext(filename)[0] + ".txt",
+                    ),
+                    width,
+                    height,
                 )
-                for index, (filename, subset, points, pred_count) in enumerate(
-                    zip(filenames, subsets, gt_points, pred_counts)
-                ):
-                    gt_count = int(points.shape[0])
-                    pred_count = float(pred_count)
-                    abs_error = abs(pred_count - gt_count)
-                    metrics["overall"].update(gt_count, pred_count)
-                    metrics[str(subset)].update(gt_count, pred_count)
-                    detailed_records.append(
-                        {
-                            "dataset_index": processed_count + index,
-                            "filename": filename,
-                            "subset": str(subset),
-                            "gt_count": gt_count,
-                            "pred_count": pred_count,
-                            "abs_error": abs_error,
-                        }
-                    )
-                    writer.writerow(
-                        [filename, subset, gt_count, f"{pred_count:.6f}", f"{abs_error:.6f}"]
-                    )
-                processed_count += len(gt_points)
+                result = run_tiled_inference(
+                    model,
+                    image_bgr,
+                    device,
+                    crop_size,
+                )
+                gt_count = int(gt_points.shape[0])
+                pred_count = float(result.count)
+                abs_error = abs(pred_count - gt_count)
+                metrics["overall"].update(gt_count, pred_count)
+                metrics[str(subset)].update(gt_count, pred_count)
+                detailed_records.append(
+                    {
+                        "dataset_index": processed_count,
+                        "filename": filename,
+                        "subset": str(subset),
+                        "gt_count": gt_count,
+                        "pred_count": pred_count,
+                        "abs_error": abs_error,
+                    }
+                )
+                writer.writerow(
+                    [filename, subset, gt_count, f"{pred_count:.6f}", f"{abs_error:.6f}"]
+                )
+                processed_count += 1
 
     if metrics["overall"].num_images == 0:
         raise RuntimeError("没有成功评估任何图像")
 
     summary = {
-        "count_metric": "native_sum_sigmoid",
+        "count_metric": "native_sum_sigmoid_tiled",
+        "inference": "tiled_cosine",
         "imgsz": crop_size,
         "checkpoint": args.checkpoint,
         "checkpoint_metadata": metadata,
@@ -343,20 +326,38 @@ def evaluate(args: argparse.Namespace) -> None:
         ]
         with torch.inference_mode():
             for tag, record in selected:
-                index = int(record["dataset_index"])
-                raw_sample = base_dataset[index]
-                sample_image = raw_sample["img"].unsqueeze(0).to(device)
-                sample_prediction = model(sample_image)
-                sample_scores = sample_prediction["logits"][0].sigmoid().cpu()
-                sample_points = sample_prediction["points"][0].cpu()
-                sample_sources = sample_prediction["expert_indices"][0].cpu()
+                image_path = base_dataset.image_paths[
+                    int(record["dataset_index"])
+                ]
+                image_bgr = cv2.imread(image_path)
+                if image_bgr is None:
+                    logging.warning("无法读取 %s，跳过可视化", image_path)
+                    continue
+                sample_image_rgb = cv2.cvtColor(
+                    image_bgr, cv2.COLOR_BGR2RGB
+                )
+                height, width = image_bgr.shape[:2]
+                gt_points = load_points(
+                    os.path.join(
+                        base_dataset.points_dir,
+                        os.path.splitext(record["filename"])[0] + ".txt",
+                    ),
+                    width,
+                    height,
+                )
+                result = run_tiled_inference(
+                    model,
+                    image_bgr,
+                    device,
+                    crop_size,
+                )
                 clean_id = str(record["filename"]).replace(".jpg", "")
                 figure = create_moe_comparison_figure(
-                    image=sample_image[0],
-                    gt_points=raw_sample["points"],
-                    pred_points=sample_points,
-                    pred_routes=sample_sources,
-                    pred_scores=sample_scores,
+                    image=sample_image_rgb,
+                    gt_points=gt_points,
+                    pred_points=result.points,
+                    pred_routes=result.sources,
+                    pred_scores=result.scores,
                     gt_count=float(record["gt_count"]),
                     pred_count=float(record["pred_count"]),
                     title=(

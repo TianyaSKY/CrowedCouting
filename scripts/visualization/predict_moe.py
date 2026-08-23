@@ -7,7 +7,7 @@ import numpy as np
 import torch
 
 from models.yolo11_moe_point import YOLO11MoEPoint
-from scripts.data.point_dataset import inverse_letterbox_points, letterbox_image
+from scripts.inference.tiling import run_tiled_inference
 
 NATIVE_ARCHITECTURE = "native_multiscale"
 EXPERT_COLORS = [
@@ -117,41 +117,49 @@ def load_model(weights_path, checkpoint_path, device):
     return model
 
 
+def overlay_probability(
+    image_bgr: np.ndarray,
+    prob_map: np.ndarray,
+    alpha: float,
+) -> np.ndarray:
+    normalized = cv2.normalize(
+        prob_map,
+        None,
+        0,
+        255,
+        cv2.NORM_MINMAX,
+    )
+    heat = cv2.applyColorMap(
+        normalized.astype(np.uint8),
+        cv2.COLORMAP_JET,
+    )
+    return cv2.addWeighted(image_bgr, 1.0 - alpha, heat, alpha, 0)
+
+
 def predict_image(
     model,
     image_bgr: np.ndarray,
     device: str,
     imgsz: int = 640,
     conf_threshold: float = 0.5,
+    overlap: float = 0.5,
+    tile_batch_size: int = 8,
 ):
-    original_height, original_width = image_bgr.shape[:2]
-    padded_bgr, scale, pad_x, pad_y = letterbox_image(image_bgr, imgsz)
-    image_rgb = cv2.cvtColor(padded_bgr, cv2.COLOR_BGR2RGB)
-    tensor = (
-        torch.from_numpy(image_rgb.astype(np.float32) / 255.0)
-        .permute(2, 0, 1)
-        .unsqueeze(0)
-        .to(device)
-    )
-    with torch.no_grad():
-        predictions = model(tensor)
-    scores = predictions["logits"].sigmoid()[0]
-    points = predictions["points"][0]
-    sources = predictions["expert_indices"][0]
-    keep = scores > conf_threshold
-    selected_points = inverse_letterbox_points(
-        points[keep].cpu().numpy(),
-        scale,
-        pad_x,
-        pad_y,
-        original_width,
-        original_height,
+    result = run_tiled_inference(
+        model,
+        image_bgr,
+        device,
+        imgsz,
+        overlap=overlap,
+        tile_batch_size=tile_batch_size,
+        conf_threshold=conf_threshold,
     )
     return (
-        selected_points,
-        sources[keep].cpu().numpy(),
-        scores[keep].cpu().numpy(),
-        float(scores.sum().item()),
+        result.points,
+        result.sources,
+        result.scores,
+        result.count,
+        result.prob_map,
     )
 
 
@@ -200,12 +208,14 @@ def predict_main(args):
     image = cv2.imread(args.image)
     if image is None:
         raise FileNotFoundError(f"无法读取图片 {args.image}")
-    points, sources, _, metric_count = predict_image(
+    points, sources, _, metric_count, prob_map = predict_image(
         model,
         image,
         device,
         imgsz=imgsz,
         conf_threshold=args.conf,
+        overlap=args.overlap,
+        tile_batch_size=args.tile_batch_size,
     )
     logging.info("Native count=%.3f，Visible points=%d", metric_count, len(points))
     for expert_index in range(3):
@@ -215,9 +225,23 @@ def predict_main(args):
             int((sources == expert_index).sum()),
         )
     result = draw_predictions(image, points, sources, metric_count)
-    out_path = args.output or args.image.replace(".jpg", "_native_pred.jpg")
+    stem = os.path.splitext(args.output or args.image)[0]
+    out_path = f"{stem}_pred.jpg"
+    prob_overlay_path = f"{stem}_prob.jpg"
+    prob_raw_path = f"{stem}_prob_raw.png"
     cv2.imwrite(out_path, result)
+    cv2.imwrite(
+        prob_overlay_path,
+        overlay_probability(image, prob_map, args.heat_alpha),
+    )
+    normalized = cv2.normalize(prob_map, None, 0, 255, cv2.NORM_MINMAX)
+    cv2.imwrite(
+        prob_raw_path,
+        cv2.applyColorMap(normalized.astype(np.uint8), cv2.COLORMAP_JET),
+    )
     logging.info("已将预测结果保存至 %s", out_path)
+    logging.info("概率叠加图: %s", prob_overlay_path)
+    logging.info("独立伪彩概率图: %s", prob_raw_path)
 
 
 def parse_args():
@@ -239,6 +263,9 @@ def parse_args():
     parser.add_argument("--imgsz", type=int, default=None)
     parser.add_argument("--conf", type=float, default=0.5)
     parser.add_argument("--output", type=str, default=None)
+    parser.add_argument("--overlap", type=float, default=0.5)
+    parser.add_argument("--tile-batch-size", type=int, default=8)
+    parser.add_argument("--heat-alpha", type=float, default=0.45)
     return parser.parse_args()
 
 
