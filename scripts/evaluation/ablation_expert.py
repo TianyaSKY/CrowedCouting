@@ -12,6 +12,11 @@
 
 统计：Recall@8/16/32、mean/median 最近距离（仅有限距离）、各专家计数 MAE
 （专家计数 = 该专家层 fused soft count）。
+
+另按 GT scale proxy（与最近 3 个 GT 距离的 median）切成
+dense_small / medium / sparse_large 三桶，分别统计
+Recall@8/16/32、最近距离 mean/median 与 GT 邻域最大置信度，
+用于诊断 E2 是总体定位差还是专门漏掉近景/大目标。
 """
 from __future__ import annotations
 
@@ -42,6 +47,12 @@ from test_each_dataset import load_checkpoint_model
 
 RADII = (8, 16, 32)
 
+# GT 邻域置信度统计半径（取最大 recall 半径）。
+NEIGHBORHOOD_RADIUS = 32
+# scale proxy 的最近邻数量（对每个 GT 取最近的 3 个 GT 距离的 median）。
+SCALE_K = 3
+SCALE_BIN_NAMES = ("dense_small", "medium", "sparse_large")
+
 
 def setup_logging(log_path: str) -> None:
     logging.basicConfig(
@@ -54,6 +65,55 @@ def setup_logging(log_path: str) -> None:
         ],
         force=True,
     )
+
+
+def scale_proxies(gt: np.ndarray) -> np.ndarray:
+    """每个 GT 的 scale proxy：与最近 SCALE_K 个 GT 距离的 median。
+
+    密集人群中的 GT proxy 小（近景/小头），孤立 GT proxy 大
+    （远景/大头）。不足 SCALE_K 个邻居时用现有邻居；无邻居记 inf。
+    """
+    count = gt.shape[0]
+    proxies = np.full(count, np.inf, dtype=np.float64)
+    if count < 2:
+        return proxies
+    distances = np.linalg.norm(
+        gt[:, None, :] - gt[None, :, :], axis=-1
+    )
+    for index in range(count):
+        neighbors = np.sort(distances[index])
+        neighbors = neighbors[neighbors > 1e-6]
+        if neighbors.size == 0:
+            continue
+        proxies[index] = float(
+            np.median(neighbors[:SCALE_K])
+        )
+    return proxies
+
+
+def scale_bin_thresholds(
+    proxies: np.ndarray,
+) -> tuple[float, float]:
+    """按 33.3%/66.7% 分位切分 scale proxy；inf 归入 sparse_large。"""
+    finite = proxies[np.isfinite(proxies)]
+    if finite.size < 2:
+        return 0.0, 0.0
+    return (
+        float(np.quantile(finite, 1.0 / 3.0)),
+        float(np.quantile(finite, 2.0 / 3.0)),
+    )
+
+
+def assign_scale_bin(
+    proxy: float,
+    thresholds: tuple[float, float],
+) -> str:
+    low, high = thresholds
+    if proxy <= low:
+        return "dense_small"
+    if proxy <= high:
+        return "medium"
+    return "sparse_large"
 
 
 @dataclass
@@ -127,6 +187,59 @@ class ExpertStats:
         return result
 
 
+@dataclass
+class ScaleBinStats:
+    """按 GT scale proxy 分桶的定位/置信度统计（run 级候选）。"""
+
+    gt_total: int = 0
+    dist_list: list[float] = field(default_factory=list)
+    recall_counts: dict[float, int] = field(
+        default_factory=lambda: {radius: 0 for radius in RADII}
+    )
+    neighborhood_conf_sum: float = 0.0
+
+    def update(
+        self,
+        nearest_dist: float,
+        neighborhood_max_conf: float,
+    ) -> None:
+        self.gt_total += 1
+        if np.isfinite(nearest_dist):
+            self.dist_list.append(float(nearest_dist))
+            for radius in RADII:
+                if nearest_dist <= radius:
+                    self.recall_counts[radius] += 1
+        self.neighborhood_conf_sum += float(neighborhood_max_conf)
+
+    def summary(self) -> dict[str, float | int | None]:
+        if self.gt_total == 0:
+            return {
+                "gt_total": 0,
+                "recall@8px": None,
+                "recall@16px": None,
+                "recall@32px": None,
+                "mean_dist_px": None,
+                "median_dist_px": None,
+                "mean_neighborhood_conf": None,
+            }
+        distances = np.asarray(self.dist_list)
+        return {
+            "gt_total": self.gt_total,
+            "recall@8px": self.recall_counts[8] / self.gt_total,
+            "recall@16px": self.recall_counts[16] / self.gt_total,
+            "recall@32px": self.recall_counts[32] / self.gt_total,
+            "mean_dist_px": (
+                float(distances.mean()) if distances.size > 0 else None
+            ),
+            "median_dist_px": (
+                float(np.median(distances)) if distances.size > 0 else None
+            ),
+            "mean_neighborhood_conf": (
+                self.neighborhood_conf_sum / self.gt_total
+            ),
+        }
+
+
 def evaluate_checkpoint(
     args,
     checkpoint_path: str,
@@ -152,6 +265,8 @@ def evaluate_checkpoint(
     if not image_paths:
         raise FileNotFoundError(f"未在 {image_dir} 中找到任何 jpg 图片")
 
+    # 全 run 的逐 GT 记录: (scale_proxy, 到 run 候选的最近距离, 邻域最大置信度)
+    gt_scale_records: list[tuple[float, float, float]] = []
     stats = [ExpertStats() for _ in range(3)]
     run_tag = os.path.basename(os.path.dirname(checkpoint_path))
     per_image_rows: list[dict[str, object]] = []
@@ -202,6 +317,42 @@ def evaluate_checkpoint(
                 "filename": os.path.basename(image_path),
                 "gt_count": gt_count,
             }
+            if gt_count > 0:
+                proxies = scale_proxies(gt)
+                row["gt_proxy_median"] = (
+                    float(np.median(proxies[np.isfinite(proxies)]))
+                    if np.isfinite(proxies).any()
+                    else None
+                )
+                if pred_points.shape[0] > 0:
+                    pair = torch.cdist(
+                        torch.from_numpy(pred_points).float(),
+                        torch.from_numpy(gt).float(),
+                        p=2,
+                    )
+                    nearest_dists = pair.min(dim=0).values.numpy()
+                    neighborhood_confs = np.zeros(gt_count)
+                    for gt_index in range(gt_count):
+                        nearby = pair[:, gt_index] <= NEIGHBORHOOD_RADIUS
+                        if bool(nearby.any()):
+                            neighborhood_confs[gt_index] = float(
+                                pred_scores[nearby].max()
+                            )
+                else:
+                    nearest_dists = np.full(
+                        gt_count, np.inf, dtype=np.float32
+                    )
+                    neighborhood_confs = np.zeros(gt_count)
+                for gt_index in range(gt_count):
+                    gt_scale_records.append(
+                        (
+                            float(proxies[gt_index]),
+                            float(nearest_dists[gt_index]),
+                            float(neighborhood_confs[gt_index]),
+                        )
+                    )
+            else:
+                row["gt_proxy_median"] = None
             expert_counts = [0.0, 0.0, 0.0]
             expert_dists: list[np.ndarray | None] = [
                 None,
@@ -294,6 +445,28 @@ def evaluate_checkpoint(
                     ),
                 )
 
+    # 按 scale proxy 分桶统计（诊断大/小目标定位差异）。
+    proxies = np.asarray(
+        [record[0] for record in gt_scale_records],
+        dtype=np.float64,
+    )
+    thresholds = scale_bin_thresholds(proxies)
+    bin_stats = {
+        name: ScaleBinStats() for name in SCALE_BIN_NAMES
+    }
+    for proxy, nearest_dist, neighborhood_conf in gt_scale_records:
+        bin_stats[
+            assign_scale_bin(proxy, thresholds)
+        ].update(nearest_dist, neighborhood_conf)
+    scale_bins = {
+        name: bin_stats[name].summary() for name in SCALE_BIN_NAMES
+    }
+    scale_bins["thresholds"] = {
+        "p33": thresholds[0],
+        "p66": thresholds[1],
+        "scale_proxy": "median distance to 3 nearest GT",
+    }
+
     return {
         "checkpoint": checkpoint_path,
         "run": run_tag,
@@ -304,6 +477,7 @@ def evaluate_checkpoint(
             f"E{expert}": stats[expert].summary()
             for expert in range(3)
         },
+        "scale_bins": scale_bins,
         "per_image": per_image_rows,
     }
 
@@ -344,9 +518,42 @@ def main(args: argparse.Namespace) -> None:
     for checkpoint_path in args.checkpoint:
         result = evaluate_checkpoint(args, checkpoint_path, device)
         all_results.append(result)
-        logging.info("== %s (routing=%s) ==", result["run"], result["routing_mode"])
-        for expert in range(3):
-            logging.info("  %s", format_recall_line(result, expert))
+        scale_bins = result.get("scale_bins", {})
+        if scale_bins:
+            thresholds = scale_bins.get("thresholds", {})
+            logging.info(
+                "  scale bins (proxy=median dist to 3 nearest GT, "
+                "p33=%.1fpx p66=%.1fpx):",
+                thresholds.get("p33", 0.0),
+                thresholds.get("p66", 0.0),
+            )
+            for name in SCALE_BIN_NAMES:
+                summary = scale_bins.get(name, {})
+                line = (
+                    f"    {name:<12} n={summary.get('gt_total', 0):>5}"
+                )
+                for radius in RADII:
+                    recall = summary.get(f"recall@{radius}px")
+                    line += (
+                        f" R@{radius}={recall * 100:.1f}%"
+                        if recall is not None
+                        else f" R@{radius}=N/A"
+                    )
+                mean_dist = summary.get("mean_dist_px")
+                median_dist = summary.get("median_dist_px")
+                line += (
+                    f" meanD={mean_dist:.1f}px" if mean_dist is not None else " meanD=N/A"
+                )
+                line += (
+                    f" medD={median_dist:.1f}px" if median_dist is not None else " medD=N/A"
+                )
+                neighborhood_conf = summary.get("mean_neighborhood_conf")
+                line += (
+                    f" neighConf={neighborhood_conf:.3f}"
+                    if neighborhood_conf is not None
+                    else " neighConf=N/A"
+                )
+                logging.info("%s", line)
 
     summary_path = os.path.join(args.out_dir, "summary.json")
     with open(summary_path, "w", encoding="utf-8") as summary_file:
@@ -380,14 +587,9 @@ def main(args: argparse.Namespace) -> None:
             for expert in range(3)
             for radius in RADII
         ]
-        + [
-            f"meanD_E{expert}"
-            for expert in range(3)
-        ]
-        + [
-            f"medianD_E{expert}"
-            for expert in range(3)
-        ]
+        + [f"meanD_E{expert}" for expert in range(3)]
+        + [f"medianD_E{expert}" for expert in range(3)]
+        + ["gt_proxy_median"]
     )
     with open(csv_path, "w", newline="", encoding="utf-8") as csv_file:
         writer = csv.writer(csv_file)
@@ -408,6 +610,7 @@ def main(args: argparse.Namespace) -> None:
                     ]
                     + [row[f"meanD_E{expert}"] for expert in range(3)]
                     + [row[f"medianD_E{expert}"] for expert in range(3)]
+                    + [row["gt_proxy_median"]]
                 )
     logging.info("汇总: %s", summary_path)
     logging.info("逐图明细: %s", csv_path)
