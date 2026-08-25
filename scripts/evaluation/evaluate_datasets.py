@@ -6,7 +6,6 @@ import json
 import logging
 import os
 import numpy as np
-import torch
 import cv2
 from tqdm import tqdm
 

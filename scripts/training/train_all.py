@@ -422,16 +422,6 @@ def train_all(args: argparse.Namespace) -> None:
                 crop_size=args.crop_size,
                 max_visual_samples=val_image_count if collect_visuals else 0,
             )
-            validation_by_dataset[name] = validation
-            per_dataset[name] = {"native": validation["mae"]}
-            val_winner_hist += validation["winner_hist"].to(device)
-            val_positive_count += validation["positive_count"].to(device)
-            val_distance_sum += validation["matched_distance_sum"].to(
-                device
-            )
-            val_confidence_sum += validation[
-                "matched_confidence_sum"
-            ].to(device)
             val_matched_count += validation["matched_count"]
 
             if collect_visuals and validation["validation_samples"]:

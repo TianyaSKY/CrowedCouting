@@ -115,7 +115,6 @@ def predict_batch(args):
             if image_bgr is None:
                 logging.warning("无法读取 %s，跳过", image_path)
                 continue
-            height, width = image_bgr.shape[:2]
             result = run_tiled_inference(
                 model,
                 image_bgr,
@@ -155,48 +154,6 @@ def predict_batch(args):
                         cv2.COLORMAP_JET,
                     ),
                 )
-            if args.per_expert_heatmap and result.fused_levels:
-                stride_to_expert = {
-                    int(stride): expert_index
-                    for expert_index, stride in enumerate(
-                        model.point_head.output_strides
-                    )
-                }
-                for stride, grid in result.fused_levels.items():
-                    expert_index = stride_to_expert[int(stride)]
-                    level_map = cv2.resize(
-                        grid,
-                        (width, height),
-                        interpolation=cv2.INTER_LINEAR,
-                    )
-                    cv2.imwrite(
-                        os.path.join(
-                            heat_dir,
-                            f"{base_name}_prob_E{expert_index}.jpg",
-                        ),
-                        overlay_probability(
-                            image_bgr,
-                            level_map,
-                            args.heat_alpha,
-                        ),
-                    )
-                    level_normalized = cv2.normalize(
-                        level_map,
-                        None,
-                        0,
-                        255,
-                        cv2.NORM_MINMAX,
-                    )
-                    cv2.imwrite(
-                        os.path.join(
-                            heat_dir,
-                            f"{base_name}_prob_E{expert_index}_raw.png",
-                        ),
-                        cv2.applyColorMap(
-                            level_normalized.astype(np.uint8),
-                            cv2.COLORMAP_JET,
-                        ),
-                    )
 
             pred_points = result.points
             sources = result.sources
@@ -262,18 +219,6 @@ def parse_args():
     parser.add_argument("--conf", type=float, default=0.5)
     parser.add_argument("--count-mode", choices=("soft", "thresh"), default="soft")
     parser.add_argument("--heat-alpha", type=float, default=0.45)
-    parser.add_argument(
-        "--heatmap",
-        action=argparse.BooleanOptionalAction,
-        default=False,
-        help="是否额外输出概率热力图叠加与原始概率图",
-    )
-    parser.add_argument(
-        "--per-expert-heatmap",
-        action=argparse.BooleanOptionalAction,
-        default=False,
-        help="是否按 E0/E1/E2 分别输出各专家层的置信度热力图",
-    )
     parser.add_argument("--overlap", type=float, default=0.5)
     parser.add_argument("--tile-batch-size", type=int, default=8)
     parser.add_argument("--out-dir", type=str, required=True)
