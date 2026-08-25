@@ -43,6 +43,20 @@ def _points_to_numpy(points: torch.Tensor | np.ndarray) -> np.ndarray:
         points = points.detach().cpu().numpy()
     return np.asarray(points, dtype=np.float32).reshape(-1, 2)
 
+def _probability_map_to_numpy(
+    probability_map: torch.Tensor | np.ndarray,
+) -> np.ndarray:
+    if isinstance(probability_map, torch.Tensor):
+        probability_map = probability_map.detach().cpu().float().numpy()
+    probability_array = np.asarray(probability_map, dtype=np.float32)
+    if probability_array.ndim != 2:
+        raise ValueError("probability map must have shape [H,W]")
+    if not np.isfinite(probability_array).all():
+        raise ValueError("probability map must contain only finite values")
+    return probability_array
+
+
+
 
 def _prediction_tensors(
     predictions: Mapping[str, torch.Tensor | np.ndarray],
@@ -137,6 +151,33 @@ def _add_header_banner(
             cv2.LINE_AA,
         )
     return np.vstack([header, image_bgr])
+
+def render_probability_heatmap(
+    image: torch.Tensor | np.ndarray,
+    probability_map: torch.Tensor | np.ndarray,
+) -> np.ndarray:
+    """Render a full-resolution probability map as an RGB heatmap."""
+    image_bgr = _image_to_bgr(image)
+    probability_array = _probability_map_to_numpy(probability_map)
+    if probability_array.shape != image_bgr.shape[:2]:
+        raise ValueError(
+            "probability map shape must match validation image height and width"
+        )
+
+    normalized = cv2.normalize(
+        probability_array,
+        None,
+        0,
+        255,
+        cv2.NORM_MINMAX,
+    )
+    heatmap_bgr = cv2.applyColorMap(
+        normalized.astype(np.uint8),
+        cv2.COLORMAP_JET,
+    )
+    return cv2.cvtColor(heatmap_bgr, cv2.COLOR_BGR2RGB)
+
+
 
 def render_validation_sample(
     image: torch.Tensor | np.ndarray,
@@ -234,13 +275,30 @@ def log_validation_images(
     epoch: int,
     conf_threshold: float = 0.5,
 ) -> None:
-    """Write rendered samples under ``<tag_prefix>/sample_NN``."""
-    for sample_index, image in enumerate(
-        render_validation_batch(samples, conf_threshold=conf_threshold)
-    ):
+    """Write prediction panels and probability heatmaps for each sample."""
+    for sample_index, sample in enumerate(samples):
+        image = render_validation_sample(
+            sample["image"],  # type: ignore[arg-type]
+            sample["gt_points"],  # type: ignore[arg-type]
+            sample["predictions"],  # type: ignore[arg-type]
+            image_path=sample.get("image_path"),  # type: ignore[arg-type]
+            conf_threshold=conf_threshold,
+            pred_count=sample.get("pred_count"),  # type: ignore[arg-type]
+        )
         writer.add_image(
             f"{tag_prefix}/sample_{sample_index:02d}",
             image,
+            global_step=epoch,
+            dataformats="HWC",
+        )
+
+        probability_heatmap = render_probability_heatmap(
+            sample["image"],  # type: ignore[arg-type]
+            sample["prob_map"],  # type: ignore[arg-type]
+        )
+        writer.add_image(
+            f"{tag_prefix}/probability_heatmap_{sample_index:02d}",
+            probability_heatmap,
             global_step=epoch,
             dataformats="HWC",
         )

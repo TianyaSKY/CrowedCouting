@@ -108,6 +108,7 @@ competition 的候选预筛选按 Expert 平衡：`match_top_k` 名额由 E0/E1/
 - E0/E1/E2 GT winner 比例（训练与验证，看专家分工与塌缩）
 - 各专家胜出时的 matched mean distance（验证，定位精度）
 - 各专家胜出时的 matched confidence（验证）
+- TensorBoard 验证图：`val_images/<dataset>/sample_NN` 显示 GT/预测对比，`val_images/<dataset>/probability_heatmap_NN` 显示同一验证图的全分辨率融合概率热力图；两者均受 `--val-image-interval` 和 `--val-image-count` 控制。
 
 checkpoint：
 

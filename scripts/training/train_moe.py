@@ -350,6 +350,7 @@ def evaluate_native_count_mae(
                             "points": result.points,
                             "expert_indices": result.sources,
                         },
+                        "prob_map": result.prob_map,
                         "image_path": image_path,
                         "pred_count": pred_count,
                     }
