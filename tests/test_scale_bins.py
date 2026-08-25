@@ -12,6 +12,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from scripts.evaluation.ablation_expert import (
     SCALE_BIN_NAMES,
     ScaleBinStats,
+    _raw_max_confidences,
     assign_scale_bin,
     scale_bin_thresholds,
     scale_proxies,
@@ -81,6 +82,41 @@ def test_scale_bin_stats_recall_and_neighborhood():
         (0.95 + 0.8 + 0.0) / 3.0
     )
 
+
+
+def test_raw_max_confidences_chunks_candidates_and_gt():
+    gt = np.array(
+        [[0.0, 0.0], [50.0, 0.0], [100.0, 100.0]],
+        dtype=np.float32,
+    )
+    raw_points = np.array(
+        [
+            [10.0, 0.0],
+            [42.0, 0.0],
+            [30.0, 0.0],
+            [80.0, 0.0],
+            [100.0, 132.0],
+            [200.0, 200.0],
+        ],
+        dtype=np.float32,
+    )
+    raw_scores = np.array([0.2, 0.4, 0.7, 0.9, 0.8, 0.99])
+
+    actual = _raw_max_confidences(
+        raw_points,
+        raw_scores,
+        gt,
+        candidate_chunk_size=2,
+        gt_chunk_size=2,
+    )
+
+    np.testing.assert_allclose(
+        actual,
+        np.array(
+            [[0.2, 0.7], [0.4, 0.9], [0.0, 0.8]],
+            dtype=np.float32,
+        ),
+    )
 
 def test_scale_bin_names_consistency():
     assert SCALE_BIN_NAMES == ("dense_small", "medium", "sparse_large")

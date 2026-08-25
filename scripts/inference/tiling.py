@@ -46,14 +46,39 @@ class TiledResult:
     raw_sources: np.ndarray # [M] expert_indices
 
 
-def _tile_starts(length: int, size: int, stride: int) -> tuple[list[int], int]:
-    """返回该维度的切块起点与 pad 后的长度（只补右/下）。"""
-    if length < size:
+def _tile_starts(
+    length: int,
+    size: int,
+    stride: int,
+    alignment: int,
+) -> tuple[list[int], int]:
+    """返回对齐的切块起点与只补右/下后的长度。
+
+    所有起点和 pad 后长度均对齐到最大输出 stride，保证每层特征
+    网格可用精确的 ``origin // level_stride`` 映射回原图。
+    """
+    if alignment <= 0:
+        raise ValueError("alignment must be positive")
+    if stride <= 0:
+        raise ValueError("stride must be positive")
+    if size % alignment != 0:
+        raise ValueError(
+            "tile size must be divisible by the output-stride alignment"
+        )
+    if length <= size:
         return [0], size
-    starts = list(range(0, length - size + 1, stride))
-    if starts[-1] != length - size:
-        starts.append(length - size)
-    return starts, length
+
+    aligned_stride = max(
+        alignment,
+        round(stride / alignment) * alignment,
+    )
+    final_start = (
+        (length - size + alignment - 1) // alignment
+    ) * alignment
+    starts = list(range(0, final_start + 1, aligned_stride))
+    if starts[-1] != final_start:
+        starts.append(final_start)
+    return starts, final_start + size
 
 
 def _pool_window(window_2d: np.ndarray, level_stride: int) -> np.ndarray:
@@ -143,9 +168,27 @@ def tiled_forward(
     if not 0.0 <= overlap < 1.0:
         raise ValueError("overlap must be in [0, 1)")
 
+    output_alignment = max(
+        int(value) for value in model.point_head.output_strides
+    )
+    if crop_size % output_alignment != 0:
+        raise ValueError(
+            "crop_size must be divisible by the maximum output stride "
+            f"({output_alignment})"
+        )
     stride = max(1, round(crop_size * (1.0 - overlap)))
-    ys, padded_h = _tile_starts(height, crop_size, stride)
-    xs, padded_w = _tile_starts(width, crop_size, stride)
+    ys, padded_h = _tile_starts(
+        height,
+        crop_size,
+        stride,
+        alignment=output_alignment,
+    )
+    xs, padded_w = _tile_starts(
+        width,
+        crop_size,
+        stride,
+        alignment=output_alignment,
+    )
     if (padded_h, padded_w) != (height, width):
         image_bgr = cv2.copyMakeBorder(
             image_bgr,
@@ -156,6 +199,8 @@ def tiled_forward(
             cv2.BORDER_CONSTANT,
             value=(114, 114, 114),
         )
+    assert all(y0 % output_alignment == 0 for y0 in ys)
+    assert all(x0 % output_alignment == 0 for x0 in xs)
 
     output_strides = [
         int(value) for value in model.point_head.output_strides
@@ -302,7 +347,7 @@ def run_tiled_inference(
     overlap: float = 0.5,
     tile_batch_size: int = 8,
     conf_threshold: float = 0.5,
-    nms_radius: int | None = None,
+    nms_radius: float = 4.0,
     routing_mode: str = "native",
     expert_index: int | None = None,
     return_raw_candidates: bool = False,
@@ -312,8 +357,11 @@ def run_tiled_inference(
     return_raw_candidates=True 时同时返回阈值/NMS 之前的全部候选
     （raw_points/raw_scores/raw_sources，原图坐标），用于不受阈值
     影响的置信度诊断（如 GT 邻域最大原始置信度）。
+    ``nms_radius`` 默认为 4px，仅去除重叠 tile 的重复候选。
     """
     height, width = image_bgr.shape[:2]
+    if nms_radius < 0:
+        raise ValueError("nms_radius must be non-negative")
     forward = tiled_forward(
         model,
         image_bgr,
@@ -341,8 +389,6 @@ def run_tiled_inference(
         prob_map = np.maximum(prob_map, upsampled)
     prob_map = prob_map[:height, :width]
 
-    if nms_radius is None:
-        nms_radius = crop_size // 4
 
     candidate_points: list[np.ndarray] = []
     candidate_scores: list[np.ndarray] = []
@@ -358,9 +404,12 @@ def run_tiled_inference(
         for tile_index in range(probs.shape[0]):
             y0, x0 = origins[origin_index]
             origin_index += 1
+            tile_probs = probs[tile_index]
+            tile_points = points[tile_index]
+            tile_sources = sources[tile_index]
             if return_raw_candidates:
                 raw_points = (
-                    points[tile_index].cpu().numpy()
+                    tile_points.cpu().numpy()
                     + np.asarray([x0, y0], dtype=np.float32)
                 )
                 raw_points[:, 0] = np.clip(
@@ -371,25 +420,16 @@ def run_tiled_inference(
                 )
                 raw_points_list.append(raw_points.astype(np.float32))
                 raw_scores_list.append(
-                    probs[tile_index].cpu().numpy().astype(np.float32)
+                    tile_probs.cpu().numpy().astype(np.float32)
                 )
                 raw_sources_list.append(
-                    sources[tile_index].cpu().numpy().astype(np.int64)
+                    tile_sources.cpu().numpy().astype(np.int64)
                 )
-            keep = probs[tile_index] > conf_threshold
-    origin_index = 0
-    for predictions in forward["tile_predictions"]:
-        probs = predictions["logits"].sigmoid()
-        points = predictions["points"]
-        sources = predictions["expert_indices"]
-        for tile_index in range(probs.shape[0]):
-            y0, x0 = origins[origin_index]
-            origin_index += 1
-            keep = probs[tile_index] > conf_threshold
+            keep = tile_probs > conf_threshold
             if not bool(keep.any()):
                 continue
             selected_points = (
-                points[tile_index][keep].cpu().numpy()
+                tile_points[keep].cpu().numpy()
                 + np.asarray([x0, y0], dtype=np.float32)
             )
             selected_points[:, 0] = np.clip(
@@ -400,10 +440,10 @@ def run_tiled_inference(
             )
             candidate_points.append(selected_points.astype(np.float32))
             candidate_scores.append(
-                probs[tile_index][keep].cpu().numpy().astype(np.float32)
+                tile_probs[keep].cpu().numpy().astype(np.float32)
             )
             candidate_sources.append(
-                sources[tile_index][keep].cpu().numpy().astype(np.int64)
+                tile_sources[keep].cpu().numpy().astype(np.int64)
             )
 
     if not candidate_points:

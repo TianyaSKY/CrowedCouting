@@ -22,6 +22,9 @@ import torch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from scripts.evaluation.ablation_compare_images import (
+    build_parser as build_compare_parser,
+)
 from scripts.inference.tiling import run_tiled_inference, tiled_forward
 from scripts.visualization.predict_moe import (
     _routing_settings,
@@ -267,6 +270,30 @@ def test_heatmap_peak_lands_on_p5_reference_position():
     assert prob_map[peak_y, peak_x] > 0.9
 
 
+def test_non_aligned_image_uses_stride_aligned_tile_origins():
+    """右下 tile 必须 pad 到 P5 stride，不能用 floor(origin / 32)。"""
+    model = FakePointModel(base_logit=-5.0)
+    model.set_cell(2, 18, 18, 5, 10.0)
+    image = np.zeros((773, 1001, 3), dtype=np.uint8)
+    forward = tiled_forward(
+        model,
+        image,
+        DEVICE,
+        CROP,
+        overlap=0.5,
+        routing_mode="expert_only",
+        expert_index=2,
+    )
+
+    assert forward["padded_hw"] == (800, 1024)
+    assert all(
+        y0 % 32 == 0 and x0 % 32 == 0
+        for y0, x0 in forward["origins"]
+    )
+    # 末 tile origin=(160,384)，P5 cell=(18,18) 落在 (23,30)。
+    assert forward["fused_levels"][32][23, 30] > 0.9
+
+
 def test_overlap_fusion_does_not_double_count():
     """常量 logits 场下，多 tile overlap 融合的软计数 ≈ 单 tile 计数。"""
     model = FakePointModel(base_logit=-2.0)
@@ -316,6 +343,28 @@ def test_run_tiled_inference_expert_only_sources_all_e2():
     assert result.level_counts[8] == 0.0
     assert result.level_counts[16] == 0.0
     assert result.count > 0
+
+
+def test_default_nms_radius_keeps_people_eight_pixels_apart():
+    """默认 4px NMS 不得把相距 8px 的两个点合并。"""
+    model = FakePointModel(base_logit=-8.0)
+    model.set_cell(0, 10, 10, 0, 10.0)
+    model.set_cell(0, 10, 11, 0, 10.0)
+    result = run_tiled_inference(
+        model,
+        blank_image(CROP),
+        DEVICE,
+        CROP,
+        overlap=0.5,
+    )
+
+    assert result.points.shape == (2, 2)
+    assert result.sources.tolist() == [0, 0]
+
+
+def test_compare_images_defaults_to_four_pixel_nms():
+    args = build_compare_parser().parse_args(["--checkpoint", "e0.pt"])
+    assert args.nms_radius == 4
 
 
 def test_routing_settings_native_checkpoint():

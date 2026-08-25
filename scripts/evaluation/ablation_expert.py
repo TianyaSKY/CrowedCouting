@@ -49,6 +49,8 @@ RADII = (8, 16, 32)
 
 # GT 邻域原始置信度统计半径（不受阈值/NMS 影响）。
 RAW_CONF_RADII = (16, 32)
+RAW_CONF_CANDIDATE_CHUNK_SIZE = 4096
+RAW_CONF_GT_CHUNK_SIZE = 4096
 # scale proxy 的最近邻数量（对每个 GT 取最近的 3 个 GT 距离的 median）。
 SCALE_K = 3
 SCALE_BIN_NAMES = ("dense_small", "medium", "sparse_large")
@@ -114,6 +116,85 @@ def assign_scale_bin(
     if proxy <= high:
         return "medium"
     return "sparse_large"
+
+
+def _raw_max_confidences(
+    raw_points: np.ndarray,
+    raw_scores: np.ndarray,
+    gt: np.ndarray,
+    candidate_chunk_size: int = RAW_CONF_CANDIDATE_CHUNK_SIZE,
+    gt_chunk_size: int = RAW_CONF_GT_CHUNK_SIZE,
+) -> np.ndarray:
+    """返回每个 GT 在各诊断半径内的最大原始置信度。
+
+    候选和 GT 均分块，避免为一张大图构造
+    ``[all_raw_candidates, all_gt]`` 距离矩阵。
+    """
+    if candidate_chunk_size <= 0:
+        raise ValueError("candidate_chunk_size must be positive")
+    if gt_chunk_size <= 0:
+        raise ValueError("gt_chunk_size must be positive")
+
+    max_confs = np.zeros(
+        (gt.shape[0], len(RAW_CONF_RADII)),
+        dtype=np.float32,
+    )
+    if raw_points.shape[0] == 0 or gt.shape[0] == 0:
+        return max_confs
+    if raw_points.shape[0] != raw_scores.shape[0]:
+        raise ValueError("raw_points and raw_scores must have equal length")
+
+    points_tensor = torch.from_numpy(
+        np.ascontiguousarray(raw_points, dtype=np.float32)
+    )
+    scores_tensor = torch.from_numpy(
+        np.ascontiguousarray(raw_scores, dtype=np.float32)
+    )
+    gt_tensor = torch.from_numpy(
+        np.ascontiguousarray(gt, dtype=np.float32)
+    )
+    max_conf_tensor = torch.zeros(
+        (gt.shape[0], len(RAW_CONF_RADII)),
+        dtype=torch.float32,
+    )
+    for candidate_start in range(
+        0,
+        points_tensor.shape[0],
+        candidate_chunk_size,
+    ):
+        candidate_end = min(
+            candidate_start + candidate_chunk_size,
+            points_tensor.shape[0],
+        )
+        candidate_points = points_tensor[
+            candidate_start:candidate_end
+        ]
+        candidate_scores = scores_tensor[
+            candidate_start:candidate_end
+        ]
+        for gt_start in range(0, gt_tensor.shape[0], gt_chunk_size):
+            gt_end = min(gt_start + gt_chunk_size, gt_tensor.shape[0])
+            distances = torch.cdist(
+                candidate_points,
+                gt_tensor[gt_start:gt_end],
+                p=2,
+            )
+            for radius_index, radius in enumerate(RAW_CONF_RADII):
+                nearby = distances <= radius
+                if not bool(nearby.any()):
+                    continue
+                chunk_max = torch.where(
+                    nearby,
+                    candidate_scores[:, None],
+                    0.0,
+                ).amax(dim=0)
+                max_conf_tensor[gt_start:gt_end, radius_index] = (
+                    torch.maximum(
+                        max_conf_tensor[gt_start:gt_end, radius_index],
+                        chunk_max,
+                    )
+                )
+    return max_conf_tensor.numpy()
 
 
 @dataclass
@@ -354,26 +435,11 @@ def evaluate_checkpoint(
                     )
                 # 原始候选（阈值/NMS 之前）的 GT 邻域最大置信度：
                 # 不受 conf 过滤影响，能区分 0.02 / 0.08 / 0.30 的差异。
-                raw_max_confs = np.zeros(
-                    (gt_count, len(RAW_CONF_RADII)),
-                    dtype=np.float32,
+                raw_max_confs = _raw_max_confidences(
+                    raw_points,
+                    raw_scores,
+                    gt,
                 )
-                if raw_points.shape[0] > 0:
-                    raw_pair = torch.cdist(
-                        torch.from_numpy(raw_points).float(),
-                        torch.from_numpy(gt).float(),
-                        p=2,
-                    )
-                    raw_pair_np = raw_pair.numpy()
-                    for gt_index in range(gt_count):
-                        for radius_index, radius in enumerate(
-                            RAW_CONF_RADII
-                        ):
-                            nearby = raw_pair_np[:, gt_index] <= radius
-                            if bool(nearby.any()):
-                                raw_max_confs[gt_index, radius_index] = (
-                                    float(raw_scores[nearby].max())
-                                )
                 for gt_index in range(gt_count):
                     gt_scale_records.append(
                         (

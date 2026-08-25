@@ -183,6 +183,7 @@ def main(args: argparse.Namespace) -> None:
                     overlap=args.overlap,
                     tile_batch_size=args.tile_batch_size,
                     conf_threshold=args.conf_threshold,
+                    nms_radius=args.nms_radius,
                     routing_mode=routing,
                     expert_index=expert_index,
                 )
@@ -245,6 +246,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--out-dir", type=str, default="runs/ablation_eval/compare")
     parser.add_argument("--conf-threshold", type=float, default=0.3)
+    parser.add_argument(
+        "--nms-radius",
+        type=int,
+        default=4,
+        help="tiled 推理 NMS 去重半径；默认 4px 只去重 overlap 的重复候选",
+    )
     parser.add_argument("--overlap", type=float, default=0.5)
     parser.add_argument("--tile-batch-size", type=int, default=8)
     parser.add_argument(
