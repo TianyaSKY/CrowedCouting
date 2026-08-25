@@ -57,7 +57,7 @@ python -m scripts.data.prepare_all
 # 或按数据集运行 scripts/data/ 下对应 prepare_*.py
 ```
 
-`PointDataset` 训练时使用缩放、裁剪、翻转、旋转和颜色增强；验证时使用保持纵横比的 letterbox。
+`PointDataset` 训练时使用缩放、裁剪、翻转、旋转和颜色增强；验证/评估不使用 letterbox，而是原图分辨率重叠滑窗裁切 + 余弦窗融合（见 `scripts/inference/tiling.py`）。
 
 ## 训练
 
@@ -143,7 +143,9 @@ python -m scripts.evaluation.evaluate_datasets \
     --out-dir runs/native_multiscale_all/eval
 ```
 
-计数口径始终是所有 native candidates 的 `sum(sigmoid(logits))`。评估不使用置信度阈值作为 MAE 计数口径，也不使用 NMS。
+计数口径始终是所有 native candidates 的 `sum(sigmoid(logits))`（tiled 推理中按 reference 维度求和；热力图是逐位置取 reference 最大值，两条链路不混用）。评估不使用置信度阈值作为 MAE 计数口径，也不使用 NMS。
+
+单专家消融 checkpoint（`--expert-index` 训练）在推理/评估时自动从 checkpoint 恢复 `routing_mode=expert_only` 与 `expert_index`，无需在命令行重复指定。
 
 ## 可视化
 

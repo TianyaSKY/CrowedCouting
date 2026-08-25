@@ -172,6 +172,8 @@ def load_checkpoint_model(
         "crop_size": crop_size,
         "native_warmup_epochs": config.get("native_warmup_epochs"),
         "matching_stage": config.get("matching_stage"),
+        "routing_mode": config.get("routing_mode", "native"),
+        "expert_index": config.get("expert_index"),
         "config": config,
     }
     return model, metadata
@@ -202,13 +204,16 @@ def evaluate(args: argparse.Namespace) -> None:
     )
     crop_size = args.imgsz or int(metadata["crop_size"])
     logging.info(
-        "checkpoint: epoch=%s best_mae=%s hidden=%s refs=%s crop_size=%s architecture=%s",
+        "checkpoint: epoch=%s best_mae=%s hidden=%s refs=%s crop_size=%s "
+        "architecture=%s routing_mode=%s expert_index=%s",
         metadata["epoch"],
         metadata["best_mae"],
         metadata["hidden_channels"],
         metadata["native_references"],
         crop_size,
         metadata["architecture"],
+        metadata["routing_mode"],
+        metadata["expert_index"],
     )
 
     base_dataset = PointDataset(
@@ -257,6 +262,8 @@ def evaluate(args: argparse.Namespace) -> None:
                     image_bgr,
                     device,
                     crop_size,
+                    routing_mode=metadata["routing_mode"],
+                    expert_index=metadata["expert_index"],
                 )
                 gt_count = int(gt_points.shape[0])
                 pred_count = float(result.count)
@@ -350,6 +357,8 @@ def evaluate(args: argparse.Namespace) -> None:
                     image_bgr,
                     device,
                     crop_size,
+                    routing_mode=metadata["routing_mode"],
+                    expert_index=metadata["expert_index"],
                 )
                 clean_id = str(record["filename"]).replace(".jpg", "")
                 figure = create_moe_comparison_figure(

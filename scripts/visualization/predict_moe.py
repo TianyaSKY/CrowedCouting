@@ -62,6 +62,38 @@ def _checkpoint_settings(
     return weights, hidden_channels, (references[0], references[1], references[2])
 
 
+def _routing_settings(
+    checkpoint,
+) -> tuple[str, int | None]:
+    """从 checkpoint config 恢复推理路由配置。
+
+    返回 (routing_mode, expert_index)；native checkpoint 返回
+    ("native", None)，expert_only checkpoint 返回 ("expert_only", 2) 等。
+    """
+    if not isinstance(checkpoint, dict):
+        return "native", None
+    config = checkpoint.get("config", {})
+    if not isinstance(config, dict):
+        return "native", None
+    routing_mode = str(config.get("routing_mode", "native"))
+    if routing_mode not in {"native", "expert_only"}:
+        raise ValueError(
+            f"checkpoint 记录了未知 routing_mode={routing_mode!r}"
+        )
+    expert_index = config.get("expert_index")
+    if expert_index is not None:
+        expert_index = int(expert_index)
+        if not 0 <= expert_index <= 2:
+            raise ValueError(
+                f"checkpoint expert_index={expert_index} 超出 0..2"
+            )
+    if routing_mode == "expert_only" and expert_index is None:
+        raise ValueError(
+            "checkpoint routing_mode=expert_only 但缺少 expert_index"
+        )
+    return routing_mode, expert_index
+
+
 def resolve_inference_settings(
     checkpoint_path: str | None,
     imgsz: int | None = None,
@@ -92,6 +124,12 @@ def _checkpoint_state_dict(checkpoint):
 
 
 def load_model(weights_path, checkpoint_path, device):
+    """加载 checkpoint 并恢复其记录的推理路由配置。
+
+    返回 (model, metadata)，metadata 含 routing_mode / expert_index，
+    供调用方显式传给 tiled inference，避免 E2-only checkpoint
+    回落到默认 native 三专家推理。
+    """
     checkpoint = _read_checkpoint(checkpoint_path)
     weights, hidden_channels, native_references = _checkpoint_settings(
         checkpoint,
@@ -107,14 +145,21 @@ def load_model(weights_path, checkpoint_path, device):
         raise ValueError("checkpoint 中缺少 model state_dict")
     model.load_state_dict(state_dict)
     model.eval()
+    routing_mode, expert_index = _routing_settings(checkpoint)
     logging.info(
-        "从 %s 加载 native_multiscale 权重 (weights=%s, hidden=%d, refs=%s)",
+        "从 %s 加载 native_multiscale 权重 (weights=%s, hidden=%d, refs=%s, "
+        "routing_mode=%s, expert_index=%s)",
         checkpoint_path,
         weights,
         hidden_channels,
         native_references,
+        routing_mode,
+        expert_index,
     )
-    return model
+    return model, {
+        "routing_mode": routing_mode,
+        "expert_index": expert_index,
+    }
 
 
 def overlay_probability(
@@ -144,6 +189,8 @@ def predict_image(
     conf_threshold: float = 0.5,
     overlap: float = 0.5,
     tile_batch_size: int = 8,
+    routing_mode: str = "native",
+    expert_index: int | None = None,
 ):
     result = run_tiled_inference(
         model,
@@ -153,6 +200,8 @@ def predict_image(
         overlap=overlap,
         tile_batch_size=tile_batch_size,
         conf_threshold=conf_threshold,
+        routing_mode=routing_mode,
+        expert_index=expert_index,
     )
     return (
         result.points,
@@ -168,6 +217,8 @@ def draw_predictions(
     points: np.ndarray,
     sources: np.ndarray,
     metric_count: float | None = None,
+    routing_mode: str = "native",
+    expert_index: int | None = None,
 ) -> np.ndarray:
     result = image_bgr.copy()
     for point, source in zip(points, sources):
@@ -177,6 +228,10 @@ def draw_predictions(
         cv2.circle(result, (x, y), radius=3, color=color, thickness=-1)
     if metric_count is None:
         metric_count = float(len(points))
+    if routing_mode == "expert_only":
+        mode_label = f"E{expert_index}-only"
+    else:
+        mode_label = "Native"
     header = np.full(
         (42, result.shape[1], 3),
         (24, 24, 24),
@@ -184,7 +239,7 @@ def draw_predictions(
     )
     cv2.putText(
         header,
-        f"Native Soft Count: {metric_count:.1f} | Visible Points: {len(points)}",
+        f"{mode_label} Soft Count: {metric_count:.1f} | Visible Points: {len(points)}",
         (15, 28),
         cv2.FONT_HERSHEY_SIMPLEX,
         0.75,
@@ -203,7 +258,19 @@ def predict_main(args):
         force=True,
     )
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    model = load_model(args.weights, args.checkpoint, device)
+    model, metadata = load_model(args.weights, args.checkpoint, device)
+    routing_mode = metadata["routing_mode"]
+    expert_index = metadata["expert_index"]
+    if args.expert_index is not None:
+        expert_index = int(args.expert_index)
+        routing_mode = (
+            "expert_only" if expert_index is not None else "native"
+        )
+        logging.info(
+            "命令行覆盖推理路由: routing_mode=%s expert_index=%s",
+            routing_mode,
+            expert_index,
+        )
     imgsz = resolve_inference_settings(args.checkpoint, imgsz=args.imgsz)
     image = cv2.imread(args.image)
     if image is None:
@@ -216,15 +283,29 @@ def predict_main(args):
         conf_threshold=args.conf,
         overlap=args.overlap,
         tile_batch_size=args.tile_batch_size,
+        routing_mode=routing_mode,
+        expert_index=expert_index,
     )
-    logging.info("Native count=%.3f，Visible points=%d", metric_count, len(points))
-    for expert_index in range(3):
+    logging.info(
+        "%s count=%.3f，Visible points=%d",
+        f"E{expert_index}-only" if routing_mode == "expert_only" else "Native",
+        metric_count,
+        len(points),
+    )
+    for expert_index_loop in range(3):
         logging.info(
             "  专家 %d: %d 个可见点",
-            expert_index,
-            int((sources == expert_index).sum()),
+            expert_index_loop,
+            int((sources == expert_index_loop).sum()),
         )
-    result = draw_predictions(image, points, sources, metric_count)
+    result = draw_predictions(
+        image,
+        points,
+        sources,
+        metric_count,
+        routing_mode=routing_mode,
+        expert_index=expert_index,
+    )
     stem = os.path.splitext(args.output or args.image)[0]
     out_path = f"{stem}_pred.jpg"
     prob_overlay_path = f"{stem}_prob.jpg"
@@ -266,6 +347,12 @@ def parse_args():
     parser.add_argument("--overlap", type=float, default=0.5)
     parser.add_argument("--tile-batch-size", type=int, default=8)
     parser.add_argument("--heat-alpha", type=float, default=0.45)
+    parser.add_argument(
+        "--expert-index",
+        type=int,
+        default=None,
+        help="覆盖 checkpoint 记录的 expert_index（0/1/2）；缺省自动恢复",
+    )
     return parser.parse_args()
 
 

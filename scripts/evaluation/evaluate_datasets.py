@@ -62,13 +62,16 @@ def evaluate_datasets(args: argparse.Namespace) -> None:
     )
     crop_size = args.imgsz or int(metadata["crop_size"])
     logging.info(
-        "checkpoint: epoch=%s best_mae=%s hidden=%s refs=%s crop_size=%s architecture=%s",
+        "checkpoint: epoch=%s best_mae=%s hidden=%s refs=%s crop_size=%s "
+        "architecture=%s routing_mode=%s expert_index=%s",
         metadata["epoch"],
         metadata["best_mae"],
         metadata["hidden_channels"],
         metadata["native_references"],
         crop_size,
         metadata["architecture"],
+        metadata["routing_mode"],
+        metadata["expert_index"],
     )
 
     specs = [parse_dataset_spec(spec) for spec in args.dataset]
@@ -115,6 +118,8 @@ def evaluate_datasets(args: argparse.Namespace) -> None:
                         image_bgr,
                         device,
                         crop_size,
+                        routing_mode=metadata["routing_mode"],
+                        expert_index=metadata["expert_index"],
                     )
                     gt_count = int(gt_points.shape[0])
                     pred_count = float(result.count)
@@ -209,6 +214,8 @@ def evaluate_datasets(args: argparse.Namespace) -> None:
                         image_bgr,
                         device,
                         crop_size,
+                        routing_mode=metadata["routing_mode"],
+                        expert_index=metadata["expert_index"],
                     )
                     figure = create_moe_comparison_figure(
                         image=sample_image_rgb,

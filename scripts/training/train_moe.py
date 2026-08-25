@@ -276,15 +276,6 @@ def evaluate_native_count_mae(
                 logging.warning("无法读取 %s，跳过", image_path)
                 continue
             height, width = image_bgr.shape[:2]
-            gt_points_np = load_points(
-                os.path.join(
-                    val_dataset.points_dir,
-                    os.path.splitext(os.path.basename(image_path))[0]
-                    + ".txt",
-                ),
-                width,
-                height,
-            )
             forward = tiled_forward(
                 model,
                 image_bgr,
@@ -292,10 +283,10 @@ def evaluate_native_count_mae(
                 crop_size,
                 overlap=overlap,
                 tile_batch_size=tile_batch_size,
+                routing_mode=routing_mode,
+                expert_index=expert_index,
             )
-            pred_count = float(
-                sum(grid.sum() for grid in forward["fused_levels"].values())
-            )
+            pred_count = float(forward["soft_count"])
 
             error = pred_count - gt_points_np.shape[0]
             total_abs_error += abs(error)
@@ -353,6 +344,8 @@ def evaluate_native_count_mae(
                     crop_size,
                     overlap=overlap,
                     tile_batch_size=tile_batch_size,
+                    routing_mode=routing_mode,
+                    expert_index=expert_index,
                 )
                 validation_samples.append(
                     {

@@ -4,10 +4,14 @@
 - 左上: E0-only (P3)      - 右上: E1-only (P4)
 - 左下: E2-only (P5)      - 右下: 联合 native (三专家)
 每个面板: 原图 + GT(空心圆) + 该 run 的预测点(实心点，按置信度阈值过滤)。
+
+推理协议与正式评估一致：原始分辨率图像直接前向（不裁剪、不增强），
+GT 与预测点都位于原图像素坐标系。
 """
 from __future__ import annotations
 
 import argparse
+import glob
 import logging
 import os
 
@@ -21,8 +25,9 @@ import matplotlib.pyplot as plt
 import numpy as np
 import torch
 from tqdm import tqdm
+import cv2
 
-from scripts.data.point_dataset import PointDataset
+from scripts.data.point_dataset import load_points
 from test_each_dataset import load_checkpoint_model
 
 EXPERT_COLORS = {
@@ -53,9 +58,7 @@ def load_models(
     entries = []
     for path in checkpoint_paths:
         model, metadata = load_checkpoint_model(path, weights, device)
-        config = metadata["config"]
-        assert isinstance(config, dict)
-        expert_index = config.get("expert_index")
+        expert_index = metadata.get("expert_index")
         if expert_index is not None:
             expert_index = int(expert_index)
         routing = "expert_only" if expert_index is not None else "native"
@@ -123,41 +126,39 @@ def main(args: argparse.Namespace) -> None:
     device = "cuda" if torch.cuda.is_available() else "cpu"
     logging.info("使用设备: %s", device)
 
-    dataset = PointDataset(
-        args.data_root,
-        split=args.split,
-        crop_size=args.imgsz,
-        augment=False,
+    image_dir = os.path.join(args.data_root, "images", args.split)
+    points_dir = os.path.join(args.data_root, "points", args.split)
+    image_paths = sorted(glob.glob(os.path.join(image_dir, "*.jpg")))
+    if not image_paths:
+        raise FileNotFoundError(f"未在 {image_dir} 中找到任何 jpg 图片")
+    selected = (
+        image_paths
+        if args.max_images < 0
+        else image_paths[: args.max_images]
     )
+
     entries = load_models(args.checkpoint, args.weights, device)
     logging.info(
         "面板顺序: %s",
         " | ".join(tag for tag, _, _, _ in entries),
     )
 
-    selected = (
-        list(range(len(dataset)))
-        if args.max_images < 0
-        else list(range(min(args.max_images, len(dataset))))
-    )
-
-    for index in tqdm(selected, desc="生成对比图"):
-        sample = dataset[index]
-        image = sample["img"]
-        gt = sample["points"]
-        filename = os.path.basename(dataset.image_paths[index])
-        image_np = (
-            image.permute(1, 2, 0).numpy()
-            if isinstance(image, torch.Tensor)
-            else np.asarray(image)
+    for image_path in tqdm(selected, desc="生成对比图"):
+        filename = os.path.basename(image_path)
+        image_bgr = cv2.imread(image_path)
+        if image_bgr is None:
+            logging.warning("无法读取 %s，跳过", image_path)
+            continue
+        height, width = image_bgr.shape[:2]
+        gt = load_points(
+            os.path.join(
+                points_dir,
+                os.path.splitext(filename)[0] + ".txt",
+            ),
+            width,
+            height,
         )
-        image_np = np.clip(
-            np.asarray(image_np, dtype=np.float32) * 255.0
-            if image_np.max() <= 1.5
-            else image_np,
-            0,
-            255,
-        ).astype(np.uint8)
+        image_rgb = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
 
         cols = min(len(entries), 2)
         rows = (len(entries) + 1) // 2
@@ -170,7 +171,14 @@ def main(args: argparse.Namespace) -> None:
         axes = np.asarray(axes).reshape(-1)
 
         with torch.inference_mode():
-            input_image = image.unsqueeze(0).to(device)
+            input_image = (
+                torch.from_numpy(
+                    image_rgb.astype(np.float32) / 255.0
+                )
+                .permute(2, 0, 1)
+                .unsqueeze(0)
+                .to(device)
+            )
             for panel_index, (tag, model, routing, expert_index) in enumerate(
                 entries
             ):
@@ -182,8 +190,8 @@ def main(args: argparse.Namespace) -> None:
                 ax = axes[panel_index]
                 render_panel(
                     ax,
-                    image_np,
-                    gt.numpy() if not isinstance(gt, torch.Tensor) else gt.numpy(),
+                    image_rgb,
+                    gt,
                     predictions,
                     routing,
                     args.conf_threshold,
@@ -202,14 +210,14 @@ def main(args: argparse.Namespace) -> None:
             axes[extra].axis("off")
 
         fig.suptitle(
-            f"{filename} (crop={args.imgsz}, conf>{args.conf_threshold})",
+            f"{filename} ({width}x{height}, conf>{args.conf_threshold})",
             fontsize=15,
             fontweight="bold",
             y=0.995,
         )
         plt.tight_layout(rect=[0, 0, 1, 0.98])
         out_path = os.path.join(
-            args.out_dir, f"{index:03d}_{os.path.splitext(filename)[0]}.jpg"
+            args.out_dir, f"{os.path.splitext(filename)[0]}.jpg"
         )
         fig.savefig(out_path, bbox_inches="tight")
         plt.close(fig)
@@ -230,7 +238,6 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--data-root", type=str, default="datasets/shanghaitech_AB")
     parser.add_argument("--split", type=str, default="val")
     parser.add_argument("--weights", type=str, default="yolo11n.pt")
-    parser.add_argument("--imgsz", type=int, default=640)
     parser.add_argument("--out-dir", type=str, default="runs/ablation_eval/compare")
     parser.add_argument("--conf-threshold", type=float, default=0.3)
     parser.add_argument(

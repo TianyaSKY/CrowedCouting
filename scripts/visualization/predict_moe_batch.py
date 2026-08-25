@@ -84,10 +84,26 @@ def draw_result(
 
 
 
-def predict_batch(args):
-    os.makedirs(args.out_dir, exist_ok=True)
-    setup_logging(os.path.join(args.out_dir, "predict.log"))
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    model, metadata = load_model(args.weights, args.checkpoint, device)
+    routing_mode = metadata["routing_mode"]
+    expert_index = metadata["expert_index"]
+    if args.expert_index is not None:
+        expert_index = int(args.expert_index)
+        routing_mode = (
+            "expert_only" if expert_index is not None else "native"
+        )
+        logging.info(
+            "命令行覆盖推理路由: routing_mode=%s expert_index=%s",
+            routing_mode,
+            expert_index,
+        )
+    imgsz = resolve_inference_settings(args.checkpoint, imgsz=args.imgsz)
+    logging.info(
+        "推理设置: imgsz=%d routing_mode=%s expert_index=%s",
+        imgsz,
+        routing_mode,
+        expert_index,
+    )
     model = load_model(args.weights, args.checkpoint, device)
     imgsz = resolve_inference_settings(args.checkpoint, imgsz=args.imgsz)
     logging.info("Native 推理设置: imgsz=%d", imgsz)
@@ -123,6 +139,8 @@ def predict_batch(args):
                 overlap=args.overlap,
                 tile_batch_size=args.tile_batch_size,
                 conf_threshold=args.conf,
+                routing_mode=routing_mode,
+                expert_index=expert_index,
             )
             if args.count_mode == "soft":
                 pred_count = result.count
@@ -193,7 +211,11 @@ def predict_batch(args):
         "inference": "tiled_cosine",
         "overlap": args.overlap,
         "tile_batch_size": args.tile_batch_size,
-        "checkpoint": args.checkpoint,
+        "routing_mode": routing_mode,
+        "expert_index": expert_index,
+        "expert_usage": {
+            f"expert{i}": int(expert_counts[i]) for i in range(3)
+        },
         "expert_usage": {
             f"expert{i}": int(expert_counts[i]) for i in range(3)
         },
@@ -221,7 +243,13 @@ def parse_args():
     parser.add_argument("--heat-alpha", type=float, default=0.45)
     parser.add_argument("--overlap", type=float, default=0.5)
     parser.add_argument("--tile-batch-size", type=int, default=8)
-    parser.add_argument("--out-dir", type=str, required=True)
+    parser.add_argument(
+        "--expert-index",
+        type=int,
+        default=None,
+        help="覆盖 checkpoint 记录的 expert_index（0/1/2）；缺省自动恢复",
+    )
+    return parser.parse_args()
     return parser.parse_args()
 
 
