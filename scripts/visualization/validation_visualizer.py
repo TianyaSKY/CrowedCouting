@@ -176,6 +176,42 @@ def render_probability_heatmap(
         cv2.COLORMAP_JET,
     )
     return cv2.cvtColor(heatmap_bgr, cv2.COLOR_BGR2RGB)
+def render_probability_overlay(
+    image: torch.Tensor | np.ndarray,
+    probability_map: torch.Tensor | np.ndarray,
+    alpha: float = 0.45,
+) -> np.ndarray:
+    """Render a probability heatmap blended with the original image."""
+    if not 0.0 <= alpha <= 1.0:
+        raise ValueError("alpha must be between 0 and 1")
+    image_bgr = _image_to_bgr(image)
+    probability_array = _probability_map_to_numpy(probability_map)
+    if probability_array.shape != image_bgr.shape[:2]:
+        raise ValueError(
+            "probability map shape must match validation image height and width"
+        )
+
+    normalized = cv2.normalize(
+        probability_array,
+        None,
+        0,
+        255,
+        cv2.NORM_MINMAX,
+    )
+    heatmap_bgr = cv2.applyColorMap(
+        normalized.astype(np.uint8),
+        cv2.COLORMAP_JET,
+    )
+    overlay_bgr = cv2.addWeighted(
+        image_bgr,
+        1.0 - alpha,
+        heatmap_bgr,
+        alpha,
+        0,
+    )
+    return cv2.cvtColor(overlay_bgr, cv2.COLOR_BGR2RGB)
+
+
 
 
 
@@ -299,6 +335,16 @@ def log_validation_images(
         writer.add_image(
             f"{tag_prefix}/probability_heatmap_{sample_index:02d}",
             probability_heatmap,
+            global_step=epoch,
+            dataformats="HWC",
+        )
+        probability_overlay = render_probability_overlay(
+            sample["image"],  # type: ignore[arg-type]
+            sample["prob_map"],  # type: ignore[arg-type]
+        )
+        writer.add_image(
+            f"{tag_prefix}/probability_overlay_{sample_index:02d}",
+            probability_overlay,
             global_step=epoch,
             dataformats="HWC",
         )

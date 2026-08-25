@@ -49,6 +49,14 @@ class TestValidationVisualizer(unittest.TestCase):
         heatmap_tag = "val_images/demo/probability_heatmap_00"
         self.assertIn("val_images/demo/sample_00", image_tags)
         self.assertIn(heatmap_tag, image_tags)
+        overlay_tag = "val_images/demo/probability_overlay_00"
+        self.assertIn(overlay_tag, image_tags)
+
+        overlay_events = event_accumulator.Images(overlay_tag)
+        self.assertEqual(len(overlay_events), 1)
+        self.assertEqual(overlay_events[0].step, 7)
+        self.assertEqual(overlay_events[0].width, image.shape[1])
+        self.assertEqual(overlay_events[0].height, image.shape[0])
 
         heatmap_events = event_accumulator.Images(heatmap_tag)
         self.assertEqual(len(heatmap_events), 1)
