@@ -158,6 +158,7 @@ def draw_result(
                         args.heat_alpha,
                     ),
                 )
+                # contrast：每图 min-max，只用于看空间结构。
                 normalized = cv2.normalize(
                     result.prob_map,
                     None,
@@ -166,11 +167,17 @@ def draw_result(
                     cv2.NORM_MINMAX,
                 )
                 cv2.imwrite(
-                    os.path.join(heat_dir, base_name + "_prob_raw.png"),
+                    os.path.join(heat_dir, base_name + "_prob_contrast.png"),
                     cv2.applyColorMap(
                         normalized.astype(np.uint8),
                         cv2.COLORMAP_JET,
                     ),
+                )
+                # fixed：概率 0.0→0 / 1.0→255 固定映射，跨模型可直接比较强度。
+                fixed = np.clip(result.prob_map, 0.0, 1.0)
+                cv2.imwrite(
+                    os.path.join(heat_dir, base_name + "_prob_fixed.png"),
+                    (fixed * 255).astype(np.uint8),
                 )
 
             pred_points = result.points

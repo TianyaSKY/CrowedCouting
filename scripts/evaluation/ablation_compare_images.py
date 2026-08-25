@@ -5,8 +5,9 @@
 - 左下: E2-only (P5)      - 右下: 联合 native (三专家)
 每个面板: 原图 + GT(空心圆) + 该 run 的预测点(实心点，按置信度阈值过滤)。
 
-推理协议与正式评估一致：原始分辨率图像直接前向（不裁剪、不增强），
-GT 与预测点都位于原图像素坐标系。
+推理协议与正式评估完全一致：tiled 滑窗(imgsz crop) + 余弦窗融合 +
+conf 过滤 + NMS，GT 与预测点都在原图像素坐标系，避免整图直接前向
+在高分辨率数据集（QNRF/JHU）上与正式 MAE/Recall 口径不一致。
 """
 from __future__ import annotations
 
@@ -19,15 +20,16 @@ os.environ.setdefault(
     "PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True"
 )
 
+import cv2
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
 from tqdm import tqdm
-import cv2
 
 from scripts.data.point_dataset import load_points
+from scripts.inference.tiling import run_tiled_inference
 from test_each_dataset import load_checkpoint_model
 
 EXPERT_COLORS = {
@@ -76,7 +78,9 @@ def render_panel(
     ax,
     image: np.ndarray,
     gt: np.ndarray,
-    predictions: dict[str, torch.Tensor],
+    pred_points: np.ndarray,
+    pred_scores: np.ndarray,
+    pred_sources: np.ndarray,
     routing: str,
     conf_threshold: float,
 ) -> None:
@@ -92,13 +96,10 @@ def render_panel(
             s=26,
             marker="o",
         )
-    logits = predictions["logits"][0].sigmoid().cpu().numpy()
-    points = predictions["points"][0].cpu().numpy()
-    indices = predictions["expert_indices"][0].cpu().numpy()
-    keep = logits > conf_threshold
+    keep = pred_scores > conf_threshold
     if keep.any():
-        points = points[keep]
-        indices = indices[keep]
+        points = pred_points[keep]
+        sources = pred_sources[keep]
         if routing == "expert_only":
             ax.scatter(
                 points[:, 0],
@@ -109,7 +110,7 @@ def render_panel(
             )
         else:
             for expert in range(3):
-                mask = indices == expert
+                mask = sources == expert
                 if mask.any():
                     ax.scatter(
                         points[mask, 0],
@@ -171,19 +172,17 @@ def main(args: argparse.Namespace) -> None:
         axes = np.asarray(axes).reshape(-1)
 
         with torch.inference_mode():
-            input_image = (
-                torch.from_numpy(
-                    image_rgb.astype(np.float32) / 255.0
-                )
-                .permute(2, 0, 1)
-                .unsqueeze(0)
-                .to(device)
-            )
             for panel_index, (tag, model, routing, expert_index) in enumerate(
                 entries
             ):
-                predictions = model(
-                    input_image,
+                result = run_tiled_inference(
+                    model,
+                    image_bgr,
+                    device,
+                    args.imgsz,
+                    overlap=args.overlap,
+                    tile_batch_size=args.tile_batch_size,
+                    conf_threshold=args.conf_threshold,
                     routing_mode=routing,
                     expert_index=expert_index,
                 )
@@ -192,15 +191,14 @@ def main(args: argparse.Namespace) -> None:
                     ax,
                     image_rgb,
                     gt,
-                    predictions,
+                    result.points,
+                    result.scores,
+                    result.sources,
                     routing,
                     args.conf_threshold,
                 )
-                pred_count = float(
-                    predictions["logits"].sigmoid().sum()
-                )
                 ax.set_title(
-                    f"{tag} | GT={gt.shape[0]} Pred={pred_count:.1f}",
+                    f"{tag} | GT={gt.shape[0]} Pred={result.count:.1f}",
                     fontsize=13,
                     fontweight="bold",
                     pad=6,
@@ -210,7 +208,8 @@ def main(args: argparse.Namespace) -> None:
             axes[extra].axis("off")
 
         fig.suptitle(
-            f"{filename} ({width}x{height}, conf>{args.conf_threshold})",
+            f"{filename} ({width}x{height}, tiled crop={args.imgsz}, "
+            f"conf>{args.conf_threshold})",
             fontsize=15,
             fontweight="bold",
             y=0.995,
@@ -227,7 +226,7 @@ def main(args: argparse.Namespace) -> None:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="同一张 val 图的 E0/E1/E2/联合 横向对比面板"
+        description="同一张 val 图的 E0/E1/E2/联合 横向对比面板（tiled 推理协议）"
     )
     parser.add_argument(
         "--checkpoint",
@@ -238,8 +237,16 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--data-root", type=str, default="datasets/shanghaitech_AB")
     parser.add_argument("--split", type=str, default="val")
     parser.add_argument("--weights", type=str, default="yolo11n.pt")
+    parser.add_argument(
+        "--imgsz",
+        type=int,
+        default=640,
+        help="tiled crop size（与正式评估一致）",
+    )
     parser.add_argument("--out-dir", type=str, default="runs/ablation_eval/compare")
     parser.add_argument("--conf-threshold", type=float, default=0.3)
+    parser.add_argument("--overlap", type=float, default=0.5)
+    parser.add_argument("--tile-batch-size", type=int, default=8)
     parser.add_argument(
         "--max-images",
         type=int,

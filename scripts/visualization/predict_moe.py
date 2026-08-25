@@ -309,20 +309,26 @@ def predict_main(args):
     stem = os.path.splitext(args.output or args.image)[0]
     out_path = f"{stem}_pred.jpg"
     prob_overlay_path = f"{stem}_prob.jpg"
-    prob_raw_path = f"{stem}_prob_raw.png"
+    prob_contrast_path = f"{stem}_prob_contrast.png"
+    prob_fixed_path = f"{stem}_prob_fixed.png"
     cv2.imwrite(out_path, result)
     cv2.imwrite(
         prob_overlay_path,
         overlay_probability(image, prob_map, args.heat_alpha),
     )
+    # contrast：每图 min-max，只用于看空间结构。
     normalized = cv2.normalize(prob_map, None, 0, 255, cv2.NORM_MINMAX)
     cv2.imwrite(
-        prob_raw_path,
+        prob_contrast_path,
         cv2.applyColorMap(normalized.astype(np.uint8), cv2.COLORMAP_JET),
     )
+    # fixed：概率 0.0→0 / 1.0→255 固定映射，跨模型可直接比较强度。
+    fixed = np.clip(prob_map, 0.0, 1.0)
+    cv2.imwrite(prob_fixed_path, (fixed * 255).astype(np.uint8))
     logging.info("已将预测结果保存至 %s", out_path)
     logging.info("概率叠加图: %s", prob_overlay_path)
-    logging.info("独立伪彩概率图: %s", prob_raw_path)
+    logging.info("独立伪彩概率图(contrast): %s", prob_contrast_path)
+    logging.info("独立概率图(fixed [0,1]): %s", prob_fixed_path)
 
 
 def parse_args():

@@ -47,8 +47,8 @@ from test_each_dataset import load_checkpoint_model
 
 RADII = (8, 16, 32)
 
-# GT 邻域置信度统计半径（取最大 recall 半径）。
-NEIGHBORHOOD_RADIUS = 32
+# GT 邻域原始置信度统计半径（不受阈值/NMS 影响）。
+RAW_CONF_RADII = (16, 32)
 # scale proxy 的最近邻数量（对每个 GT 取最近的 3 个 GT 距离的 median）。
 SCALE_K = 3
 SCALE_BIN_NAMES = ("dense_small", "medium", "sparse_large")
@@ -189,19 +189,28 @@ class ExpertStats:
 
 @dataclass
 class ScaleBinStats:
-    """按 GT scale proxy 分桶的定位/置信度统计（run 级候选）。"""
+    """按 GT scale proxy 分桶的定位/置信度统计（run 级候选）。
+
+    recall 来自 conf>=args.conf 的候选（与 Recall@r 口径一致）；
+    RawMaxConf 来自阈值/NMS 之前的全部原始候选。
+    """
 
     gt_total: int = 0
     dist_list: list[float] = field(default_factory=list)
     recall_counts: dict[float, int] = field(
         default_factory=lambda: {radius: 0 for radius in RADII}
     )
-    neighborhood_conf_sum: float = 0.0
+    raw_conf_sums: dict[float, float] = field(
+        default_factory=lambda: {
+            radius: 0.0 for radius in RAW_CONF_RADII
+        }
+    )
 
     def update(
         self,
         nearest_dist: float,
-        neighborhood_max_conf: float,
+        raw_max_conf_16: float,
+        raw_max_conf_32: float,
     ) -> None:
         self.gt_total += 1
         if np.isfinite(nearest_dist):
@@ -209,7 +218,8 @@ class ScaleBinStats:
             for radius in RADII:
                 if nearest_dist <= radius:
                     self.recall_counts[radius] += 1
-        self.neighborhood_conf_sum += float(neighborhood_max_conf)
+        self.raw_conf_sums[16] += float(raw_max_conf_16)
+        self.raw_conf_sums[32] += float(raw_max_conf_32)
 
     def summary(self) -> dict[str, float | int | None]:
         if self.gt_total == 0:
@@ -220,7 +230,8 @@ class ScaleBinStats:
                 "recall@32px": None,
                 "mean_dist_px": None,
                 "median_dist_px": None,
-                "mean_neighborhood_conf": None,
+                "raw_max_conf@16px": None,
+                "raw_max_conf@32px": None,
             }
         distances = np.asarray(self.dist_list)
         return {
@@ -234,8 +245,11 @@ class ScaleBinStats:
             "median_dist_px": (
                 float(np.median(distances)) if distances.size > 0 else None
             ),
-            "mean_neighborhood_conf": (
-                self.neighborhood_conf_sum / self.gt_total
+            "raw_max_conf@16px": (
+                self.raw_conf_sums[16] / self.gt_total
+            ),
+            "raw_max_conf@32px": (
+                self.raw_conf_sums[32] / self.gt_total
             ),
         }
 
@@ -265,8 +279,8 @@ def evaluate_checkpoint(
     if not image_paths:
         raise FileNotFoundError(f"未在 {image_dir} 中找到任何 jpg 图片")
 
-    # 全 run 的逐 GT 记录: (scale_proxy, 到 run 候选的最近距离, 邻域最大置信度)
-    gt_scale_records: list[tuple[float, float, float]] = []
+    # 全 run 的逐 GT 记录: (scale_proxy, 最近距离, RawMaxConf@16, RawMaxConf@32)
+    gt_scale_records: list[tuple[float, float, float, float]] = []
     stats = [ExpertStats() for _ in range(3)]
     run_tag = os.path.basename(os.path.dirname(checkpoint_path))
     per_image_rows: list[dict[str, object]] = []
@@ -306,10 +320,13 @@ def evaluate_checkpoint(
                 nms_radius=args.nms_radius,
                 routing_mode=routing_mode,
                 expert_index=expert_index,
+                return_raw_candidates=True,
             )
             pred_points = result.points
             pred_sources = result.sources
             pred_scores = result.scores
+            raw_points = result.raw_points
+            raw_scores = result.raw_scores
             pred_count = float(result.count)
 
             row: dict[str, object] = {
@@ -331,24 +348,39 @@ def evaluate_checkpoint(
                         p=2,
                     )
                     nearest_dists = pair.min(dim=0).values.numpy()
-                    neighborhood_confs = np.zeros(gt_count)
-                    for gt_index in range(gt_count):
-                        nearby = pair[:, gt_index] <= NEIGHBORHOOD_RADIUS
-                        if bool(nearby.any()):
-                            neighborhood_confs[gt_index] = float(
-                                pred_scores[nearby].max()
-                            )
                 else:
                     nearest_dists = np.full(
                         gt_count, np.inf, dtype=np.float32
                     )
-                    neighborhood_confs = np.zeros(gt_count)
+                # 原始候选（阈值/NMS 之前）的 GT 邻域最大置信度：
+                # 不受 conf 过滤影响，能区分 0.02 / 0.08 / 0.30 的差异。
+                raw_max_confs = np.zeros(
+                    (gt_count, len(RAW_CONF_RADII)),
+                    dtype=np.float32,
+                )
+                if raw_points.shape[0] > 0:
+                    raw_pair = torch.cdist(
+                        torch.from_numpy(raw_points).float(),
+                        torch.from_numpy(gt).float(),
+                        p=2,
+                    )
+                    raw_pair_np = raw_pair.numpy()
+                    for gt_index in range(gt_count):
+                        for radius_index, radius in enumerate(
+                            RAW_CONF_RADII
+                        ):
+                            nearby = raw_pair_np[:, gt_index] <= radius
+                            if bool(nearby.any()):
+                                raw_max_confs[gt_index, radius_index] = (
+                                    float(raw_scores[nearby].max())
+                                )
                 for gt_index in range(gt_count):
                     gt_scale_records.append(
                         (
                             float(proxies[gt_index]),
                             float(nearest_dists[gt_index]),
-                            float(neighborhood_confs[gt_index]),
+                            float(raw_max_confs[gt_index, 0]),
+                            float(raw_max_confs[gt_index, 1]),
                         )
                     )
             else:
@@ -454,10 +486,12 @@ def evaluate_checkpoint(
     bin_stats = {
         name: ScaleBinStats() for name in SCALE_BIN_NAMES
     }
-    for proxy, nearest_dist, neighborhood_conf in gt_scale_records:
+    for proxy, nearest_dist, raw_conf_16, raw_conf_32 in (
+        gt_scale_records
+    ):
         bin_stats[
             assign_scale_bin(proxy, thresholds)
-        ].update(nearest_dist, neighborhood_conf)
+        ].update(nearest_dist, raw_conf_16, raw_conf_32)
     scale_bins = {
         name: bin_stats[name].summary() for name in SCALE_BIN_NAMES
     }
@@ -547,12 +581,13 @@ def main(args: argparse.Namespace) -> None:
                 line += (
                     f" medD={median_dist:.1f}px" if median_dist is not None else " medD=N/A"
                 )
-                neighborhood_conf = summary.get("mean_neighborhood_conf")
-                line += (
-                    f" neighConf={neighborhood_conf:.3f}"
-                    if neighborhood_conf is not None
-                    else " neighConf=N/A"
-                )
+                for radius in RAW_CONF_RADII:
+                    raw_conf = summary.get(f"raw_max_conf@{radius}px")
+                    line += (
+                        f" RawMaxConf@{radius}={raw_conf:.3f}"
+                        if raw_conf is not None
+                        else f" RawMaxConf@{radius}=N/A"
+                    )
                 logging.info("%s", line)
 
     summary_path = os.path.join(args.out_dir, "summary.json")

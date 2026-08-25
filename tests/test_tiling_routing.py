@@ -350,6 +350,35 @@ def test_routing_settings_missing_expert_index_raises():
         _routing_settings(checkpoint)
 
 
+def test_raw_candidates_include_below_threshold():
+    """P1: RawMaxConf 必须来自阈值/NMS 之前的原始候选。
+
+    低于 conf 阈值的候选不应进入 result.points，但必须出现在
+    raw_points/raw_scores 中（否则 0.02/0.08/0.30 的置信度差异
+    会被阈值全部抹成 0）。
+    """
+    model = FakePointModel(base_logit=-8.0)
+    model.set_cell(2, 10, 12, 5, -0.6)  # sigmoid(-0.6) ≈ 0.354 < 0.5
+    result = run_tiled_inference(
+        model,
+        blank_image(CROP),
+        DEVICE,
+        CROP,
+        overlap=0.5,
+        conf_threshold=0.5,
+        routing_mode="expert_only",
+        expert_index=2,
+        return_raw_candidates=True,
+    )
+    assert result.points.shape[0] == 0
+    assert result.raw_points.shape[0] == 20 * 20 * 16
+    assert result.raw_scores.max() == pytest.approx(
+        float(torch.sigmoid(torch.tensor(-0.6))),
+        rel=1e-5,
+    )
+    assert result.raw_sources.tolist() == [2] * result.raw_points.shape[0]
+
+
 @pytest.mark.skipif(
     not os.path.exists("yolo11n.pt"),
     reason="需要本地 yolo11n.pt",

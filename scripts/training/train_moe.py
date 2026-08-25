@@ -276,6 +276,15 @@ def evaluate_native_count_mae(
                 logging.warning("无法读取 %s，跳过", image_path)
                 continue
             height, width = image_bgr.shape[:2]
+            gt_points_np = load_points(
+                os.path.join(
+                    val_dataset.points_dir,
+                    os.path.splitext(os.path.basename(image_path))[0]
+                    + ".txt",
+                ),
+                width,
+                height,
+            )
             forward = tiled_forward(
                 model,
                 image_bgr,

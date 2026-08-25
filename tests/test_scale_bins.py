@@ -63,9 +63,9 @@ def test_thresholds_and_binning():
 def test_scale_bin_stats_recall_and_neighborhood():
     stats = ScaleBinStats()
     # 命中 @8、命中 @32 但未命中 @16、完全未命中（inf）
-    stats.update(4.0, 0.9)
-    stats.update(20.0, 0.5)
-    stats.update(np.inf, 0.0)
+    stats.update(4.0, 0.9, 0.95)
+    stats.update(20.0, 0.5, 0.8)
+    stats.update(np.inf, 0.0, 0.0)
     summary = stats.summary()
     assert summary["gt_total"] == 3
     assert summary["recall@8px"] == pytest.approx(1.0 / 3.0)
@@ -74,8 +74,11 @@ def test_scale_bin_stats_recall_and_neighborhood():
     # mean/median 只统计有限距离
     assert summary["mean_dist_px"] == pytest.approx(12.0)
     assert summary["median_dist_px"] == pytest.approx(12.0)
-    assert summary["mean_neighborhood_conf"] == pytest.approx(
+    assert summary["raw_max_conf@16px"] == pytest.approx(
         (0.9 + 0.5 + 0.0) / 3.0
+    )
+    assert summary["raw_max_conf@32px"] == pytest.approx(
+        (0.95 + 0.8 + 0.0) / 3.0
     )
 
 

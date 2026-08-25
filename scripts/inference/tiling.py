@@ -41,6 +41,9 @@ class TiledResult:
     sources: np.ndarray     # [N] expert_indices
     scores: np.ndarray      # [N] sigmoid 置信度
     prob_map: np.ndarray    # [H,W] float32 全分辨率概率热力图
+    raw_points: np.ndarray  # [M,2] 阈值/NMS 之前的全部候选（原图坐标）
+    raw_scores: np.ndarray  # [M] 原始 sigmoid 置信度
+    raw_sources: np.ndarray # [M] expert_indices
 
 
 def _tile_starts(length: int, size: int, stride: int) -> tuple[list[int], int]:
@@ -302,8 +305,14 @@ def run_tiled_inference(
     nms_radius: int | None = None,
     routing_mode: str = "native",
     expert_index: int | None = None,
+    return_raw_candidates: bool = False,
 ) -> TiledResult:
-    """滑窗推理完整出口：软计数 + 全分辨率概率热力图 + NMS 后点位。"""
+    """滑窗推理完整出口：软计数 + 全分辨率概率热力图 + NMS 后点位。
+
+    return_raw_candidates=True 时同时返回阈值/NMS 之前的全部候选
+    （raw_points/raw_scores/raw_sources，原图坐标），用于不受阈值
+    影响的置信度诊断（如 GT 邻域最大原始置信度）。
+    """
     height, width = image_bgr.shape[:2]
     forward = tiled_forward(
         model,
@@ -338,6 +347,36 @@ def run_tiled_inference(
     candidate_points: list[np.ndarray] = []
     candidate_scores: list[np.ndarray] = []
     candidate_sources: list[np.ndarray] = []
+    raw_points_list: list[np.ndarray] = []
+    raw_scores_list: list[np.ndarray] = []
+    raw_sources_list: list[np.ndarray] = []
+    origin_index = 0
+    for predictions in forward["tile_predictions"]:
+        probs = predictions["logits"].sigmoid()
+        points = predictions["points"]
+        sources = predictions["expert_indices"]
+        for tile_index in range(probs.shape[0]):
+            y0, x0 = origins[origin_index]
+            origin_index += 1
+            if return_raw_candidates:
+                raw_points = (
+                    points[tile_index].cpu().numpy()
+                    + np.asarray([x0, y0], dtype=np.float32)
+                )
+                raw_points[:, 0] = np.clip(
+                    raw_points[:, 0], 0, max(width - 1, 0)
+                )
+                raw_points[:, 1] = np.clip(
+                    raw_points[:, 1], 0, max(height - 1, 0)
+                )
+                raw_points_list.append(raw_points.astype(np.float32))
+                raw_scores_list.append(
+                    probs[tile_index].cpu().numpy().astype(np.float32)
+                )
+                raw_sources_list.append(
+                    sources[tile_index].cpu().numpy().astype(np.int64)
+                )
+            keep = probs[tile_index] > conf_threshold
     origin_index = 0
     for predictions in forward["tile_predictions"]:
         probs = predictions["logits"].sigmoid()
@@ -375,6 +414,21 @@ def run_tiled_inference(
             sources=np.zeros((0,), dtype=np.int64),
             scores=np.zeros((0,), dtype=np.float32),
             prob_map=prob_map,
+            raw_points=(
+                np.concatenate(raw_points_list, axis=0)
+                if raw_points_list
+                else np.zeros((0, 2), dtype=np.float32)
+            ),
+            raw_scores=(
+                np.concatenate(raw_scores_list, axis=0)
+                if raw_scores_list
+                else np.zeros((0,), dtype=np.float32)
+            ),
+            raw_sources=(
+                np.concatenate(raw_sources_list, axis=0)
+                if raw_sources_list
+                else np.zeros((0,), dtype=np.int64)
+            ),
         )
 
     all_points = np.concatenate(candidate_points, axis=0)
@@ -390,4 +444,19 @@ def run_tiled_inference(
         sources=all_sources[kept_order],
         scores=kept_scores,
         prob_map=prob_map,
+        raw_points=(
+            np.concatenate(raw_points_list, axis=0)
+            if raw_points_list
+            else np.zeros((0, 2), dtype=np.float32)
+        ),
+        raw_scores=(
+            np.concatenate(raw_scores_list, axis=0)
+            if raw_scores_list
+            else np.zeros((0,), dtype=np.float32)
+        ),
+        raw_sources=(
+            np.concatenate(raw_sources_list, axis=0)
+            if raw_sources_list
+            else np.zeros((0,), dtype=np.int64)
+        ),
     )
