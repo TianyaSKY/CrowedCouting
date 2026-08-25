@@ -6,7 +6,7 @@
 每个面板: 原图 + GT(空心圆) + 该 run 的预测点(实心点，按置信度阈值过滤)。
 
 推理协议与正式评估完全一致：tiled 滑窗(imgsz crop) + 余弦窗融合 +
-conf 过滤 + NMS，GT 与预测点都在原图像素坐标系，避免整图直接前向
+tile ownership + conf 过滤 + NMS，GT 与预测点都在原图像素坐标系，避免整图直接前向
 在高分辨率数据集（QNRF/JHU）上与正式 MAE/Recall 口径不一致。
 """
 from __future__ import annotations
@@ -250,7 +250,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--nms-radius",
         type=int,
         default=4,
-        help="tiled 推理 NMS 去重半径；默认 4px 只去重 overlap 的重复候选",
+        help="tiled 推理 NMS 去重半径；ownership 后默认 4px",
     )
     parser.add_argument("--overlap", type=float, default=0.5)
     parser.add_argument("--tile-batch-size", type=int, default=8)

@@ -39,14 +39,10 @@ class PointDataset(Dataset):
             ├── train/*.txt     # 每行: x_normalized y_normalized
             └── val/*.txt
 
-    输出：
-        "img":    Tensor[3, H, W]（RGB，0~1，当前图像像素坐标空间）
-        "points": Tensor[N, 2]（像素坐标）
-        "image_path": 原始图片的稳定绝对/相对路径字符串
+    默认仅训练 split（``train`` 或 ``*_train``）启用在线增强；验证/测试
+    split 直接返回原图尺寸与原图坐标。可用 ``augment=True/False`` 显式
+    覆盖，``max_samples`` 用于受控 smoke test。
 
-    训练在线增强：
-        缩放 0.8–1.2 → 随机裁剪 crop_size → 水平翻转 p=0.5
-        → 随机旋转 ±10° p=0.5 → 亮度/对比度 → HSV 色相/饱和度抖动
     """
 
     def __init__(
@@ -54,18 +50,27 @@ class PointDataset(Dataset):
         root: str,
         split: str = "train",
         crop_size: int = 640,
+        augment: bool | None = None,
+        max_samples: int | None = None,
     ) -> None:
         super().__init__()
 
         self.image_dir = os.path.join(root, "images", split)
         self.points_dir = os.path.join(root, "points", split)
 
+        if crop_size <= 0:
+            raise ValueError("crop_size must be positive")
+        if max_samples is not None and max_samples <= 0:
+            raise ValueError("max_samples must be positive when provided")
         self.crop_size = crop_size
-
+        is_train_split = split == "train" or split.lower().endswith("_train")
+        self.augment = is_train_split if augment is None else bool(augment)
 
         self.image_paths = sorted(
             glob.glob(os.path.join(self.image_dir, "*.jpg"))
         )
+        if max_samples is not None:
+            self.image_paths = self.image_paths[:max_samples]
 
         if not self.image_paths:
             raise FileNotFoundError(
@@ -103,12 +108,12 @@ class PointDataset(Dataset):
         if image_bgr is None:
             raise FileNotFoundError(f"无法读取图片 {image_path}")
         image = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
-
         height, width = image.shape[:2]
         points = load_points(point_path, width, height)
-        image, points = self._augment_train(
-            image, points, height, width
-        )
+        if self.augment:
+            image, points = self._augment_train(
+                image, points, height, width
+            )
 
         image_tensor = (
             torch.from_numpy(image.astype(np.float32) / 255.0)

@@ -5,8 +5,10 @@ import csv
 import json
 import logging
 import os
-import numpy as np
+
 import cv2
+import numpy as np
+import torch
 from tqdm import tqdm
 
 from scripts.data.point_dataset import PointDataset, load_points
@@ -50,8 +52,9 @@ def format_row(name: str, metrics: CountMetrics) -> str:
 
 
 def evaluate_datasets(args: argparse.Namespace) -> None:
+    if args.batch_size <= 0:
+        raise ValueError("--batch-size must be positive")
     os.makedirs(args.out_dir, exist_ok=True)
-    setup_logging(os.path.join(args.out_dir, "evaluate.log"))
     device = "cuda" if torch.cuda.is_available() else "cpu"
     logging.info("使用设备: %s", device)
 
@@ -62,10 +65,11 @@ def evaluate_datasets(args: argparse.Namespace) -> None:
     )
     crop_size = args.imgsz or int(metadata["crop_size"])
     logging.info(
-        "checkpoint: epoch=%s best_mae=%s hidden=%s refs=%s crop_size=%s "
-        "architecture=%s routing_mode=%s expert_index=%s",
+        "checkpoint: epoch=%s best_raw_mae=%s selection=%s hidden=%s "
+        "refs=%s crop_size=%s architecture=%s routing_mode=%s expert_index=%s",
         metadata["epoch"],
-        metadata["best_mae"],
+        metadata["best_raw_mae"],
+        metadata["selection_metric"],
         metadata["hidden_channels"],
         metadata["native_references"],
         crop_size,
@@ -118,6 +122,7 @@ def evaluate_datasets(args: argparse.Namespace) -> None:
                         image_bgr,
                         device,
                         crop_size,
+                        tile_batch_size=args.batch_size,
                         routing_mode=metadata["routing_mode"],
                         expert_index=metadata["expert_index"],
                     )
@@ -151,8 +156,9 @@ def evaluate_datasets(args: argparse.Namespace) -> None:
                 "root": root,
                 "split": split,
                 "architecture": NATIVE_ARCHITECTURE,
-                "count_metric": "native_sum_sigmoid_tiled",
+                "count_metric": "native_sum_sigmoid_tiled_padding_safe",
                 "inference": "tiled_cosine",
+                "tile_batch_size": args.batch_size,
             }
         )
         with open(
@@ -214,6 +220,7 @@ def evaluate_datasets(args: argparse.Namespace) -> None:
                         image_bgr,
                         device,
                         crop_size,
+                        tile_batch_size=args.batch_size,
                         routing_mode=metadata["routing_mode"],
                         expert_index=metadata["expert_index"],
                     )
@@ -358,7 +365,7 @@ def parse_args():
     )
     parser.add_argument("--imgsz", type=int, default=None)
     parser.add_argument("--batch-size", type=int, default=16)
-    parser.add_argument("--workers", type=int, default=4)
+
     parser.add_argument("--out-dir", type=str, default="runs/native_multiscale/eval_datasets")
     parser.add_argument("--save-scatter", action="store_true", default=True)
     parser.add_argument("--no-scatter", dest="save_scatter", action="store_false")

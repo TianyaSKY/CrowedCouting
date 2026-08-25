@@ -1,4 +1,4 @@
-"""Tests for scale-bin metrics (Commit B: large-target diagnosis)."""
+"""Tests for local-density proxy bins and confidence diagnostics."""
 from __future__ import annotations
 
 import os
@@ -54,11 +54,11 @@ def test_thresholds_and_binning():
     low, high = scale_bin_thresholds(proxies)
     assert low < high
     bins = [assign_scale_bin(float(p), (low, high)) for p in proxies]
-    assert bins[:2] == ["dense_small", "dense_small"]
-    assert bins[2] == "medium"
-    assert bins[3:5] == ["sparse_large", "sparse_large"]
-    # inf 归入 sparse_large
-    assert bins[5] == "sparse_large"
+    assert bins[:2] == ["dense_small_proxy", "dense_small_proxy"]
+    assert bins[2] == "medium_proxy"
+    assert bins[3:5] == ["sparse_large_proxy", "sparse_large_proxy"]
+    # inf 归入 sparse_large_proxy
+    assert bins[5] == "sparse_large_proxy"
 
 
 def test_scale_bin_stats_recall_and_neighborhood():
@@ -119,4 +119,8 @@ def test_raw_max_confidences_chunks_candidates_and_gt():
     )
 
 def test_scale_bin_names_consistency():
-    assert SCALE_BIN_NAMES == ("dense_small", "medium", "sparse_large")
+    assert SCALE_BIN_NAMES == (
+        "dense_small_proxy",
+        "medium_proxy",
+        "sparse_large_proxy",
+    )

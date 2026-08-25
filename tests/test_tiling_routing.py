@@ -241,13 +241,8 @@ def test_single_tile_soft_count_equals_sum_sigmoid_native():
     ), f"soft_count={forward['soft_count']} != sum(sigmoid)={expected}"
 
 
-def test_heatmap_peak_lands_on_p5_reference_position():
-    """P5 20x20x16：只把 cell=(10,12), ref=5 的 logit 设高。
-
-    峰值必须落在该 reference 的 P5 原图位置所在 cell 内：
-    cell (10,12) 覆盖 y∈[320,352), x∈[384,416)，中心 (336,400)。
-    防止 20x20x16 被误解码为 80x80x1 的回归。
-    """
+def test_heatmap_peak_lands_on_dense_p5_reference_position():
+    """P5 20x20x16 must preserve its 4x4 reference sub-lattice."""
     model = FakePointModel(base_logit=-5.0)
     model.set_cell(2, 10, 12, 5, 10.0)
     result = run_tiled_inference(
@@ -263,10 +258,9 @@ def test_heatmap_peak_lands_on_p5_reference_position():
     assert prob_map.shape == (CROP, CROP)
     flat_index = int(np.argmax(prob_map))
     peak_y, peak_x = divmod(flat_index, CROP)
-    assert 320 <= peak_y < 352, f"峰值 y={peak_y} 不在 cell(10,12) 内"
-    assert 384 <= peak_x < 416, f"峰值 x={peak_x} 不在 cell(10,12) 内"
-    assert abs(peak_y - 336) <= 3 and abs(peak_x - 400) <= 3
-    # 峰值置信度必须来自该高 logit（≈sigmoid(10)），而非背景。
+    # cell=(10,12), ref=5 => base=(x=396, y=332).
+    assert abs(peak_y - 332) <= 3, f"峰值 y={peak_y} 未落在真实 reference"
+    assert abs(peak_x - 396) <= 3, f"峰值 x={peak_x} 未落在真实 reference"
     assert prob_map[peak_y, peak_x] > 0.9
 
 
@@ -293,6 +287,47 @@ def test_non_aligned_image_uses_stride_aligned_tile_origins():
     # 末 tile origin=(160,384)，P5 cell=(18,18) 落在 (23,30)。
     assert forward["fused_levels"][32][23, 30] > 0.9
 
+
+def test_non_aligned_padding_does_not_inflate_count():
+    model = FakePointModel(base_logit=-2.0)
+    image = np.zeros((773, 1001, 3), dtype=np.uint8)
+    forward = tiled_forward(
+        model,
+        image,
+        DEVICE,
+        CROP,
+        overlap=0.5,
+        routing_mode="expert_only",
+        expert_index=2,
+    )
+    mask = forward["reference_masks"][32]
+    probability = float(torch.sigmoid(torch.tensor(-2.0)))
+    expected = float(mask.sum()) * probability
+    assert forward["level_counts"][32] == pytest.approx(expected, rel=1e-4)
+    assert mask.sum() < 25 * 32 * 16
+
+
+def test_padded_points_are_dropped_not_clipped():
+    model = FakePointModel(base_logit=-8.0)
+    # The last local P5 cell maps into the padded lower-right corner.
+    model.set_cell(2, 19, 19, 15, 10.0)
+    image = np.zeros((100, 100, 3), dtype=np.uint8)
+    result = run_tiled_inference(
+        model,
+        image,
+        DEVICE,
+        CROP,
+        overlap=0.5,
+        conf_threshold=0.5,
+        routing_mode="expert_only",
+        expert_index=2,
+        return_raw_candidates=True,
+    )
+    assert result.points.shape[0] == 0
+    assert result.raw_points.shape[0] > 0
+    assert np.all(result.raw_points[:, 0] < image.shape[1])
+    assert np.all(result.raw_points[:, 1] < image.shape[0])
+    assert result.raw_scores.max() < 0.5
 
 def test_overlap_fusion_does_not_double_count():
     """常量 logits 场下，多 tile overlap 融合的软计数 ≈ 单 tile 计数。"""
@@ -321,6 +356,43 @@ def test_overlap_fusion_does_not_double_count():
     assert relative < 1e-3, (
         f"overlap 融合计数 {multi['soft_count']} 与单 tile "
         f"{single['soft_count']} 偏差 {relative:.4f}（疑似翻倍）"
+    )
+
+def test_tile_ownership_selects_owner_over_higher_scoring_overlap():
+    class OwnershipModel(FakePointModel):
+        def forward(self, image, routing_mode="native", expert_index=None):
+            result = super().forward(
+                image,
+                routing_mode=routing_mode,
+                expert_index=expert_index,
+            )
+            # The synthetic image encodes each tile's x origin in pixel 0.
+            for batch_index in range(image.shape[0]):
+                origin_x = int(round(float(image[batch_index, 0, 0, 0] * 255)))
+                cell_x = 20 if origin_x == 0 else 0
+                cell_y = 12
+                e0_index = cell_y * 40 + cell_x
+                result["logits"][batch_index, e0_index] = (
+                    10.0 if origin_x == 0 else 9.0
+                )
+            return result
+
+    model = OwnershipModel(base_logit=-8.0)
+    image = np.zeros((320, 480, 3), dtype=np.uint8)
+    image[:] = np.arange(480, dtype=np.uint8)[None, :, None]
+    result = run_tiled_inference(
+        model,
+        image,
+        DEVICE,
+        320,
+        overlap=0.5,
+        conf_threshold=0.5,
+    )
+    assert result.points.shape == (1, 2)
+    np.testing.assert_allclose(result.points[0], [164.0, 100.0])
+    assert result.scores[0] == pytest.approx(
+        float(torch.sigmoid(torch.tensor(9.0))),
+        rel=1e-5,
     )
 
 

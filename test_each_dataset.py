@@ -164,6 +164,10 @@ def load_checkpoint_model(
     metadata: dict[str, object] = {
         "architecture": NATIVE_ARCHITECTURE,
         "epoch": checkpoint.get("epoch"),
+        "best_raw_mae": checkpoint.get(
+            "best_raw_mae",
+            checkpoint.get("best_mae"),
+        ),
         "best_mae": checkpoint.get("best_mae"),
         "selection_metric": checkpoint.get("selection_metric"),
         "weights": weights,
@@ -204,10 +208,11 @@ def evaluate(args: argparse.Namespace) -> None:
     )
     crop_size = args.imgsz or int(metadata["crop_size"])
     logging.info(
-        "checkpoint: epoch=%s best_mae=%s hidden=%s refs=%s crop_size=%s "
-        "architecture=%s routing_mode=%s expert_index=%s",
+        "checkpoint: epoch=%s best_raw_mae=%s selection=%s hidden=%s "
+        "refs=%s crop_size=%s architecture=%s routing_mode=%s expert_index=%s",
         metadata["epoch"],
-        metadata["best_mae"],
+        metadata["best_raw_mae"],
+        metadata["selection_metric"],
         metadata["hidden_channels"],
         metadata["native_references"],
         crop_size,
@@ -289,7 +294,7 @@ def evaluate(args: argparse.Namespace) -> None:
         raise RuntimeError("没有成功评估任何图像")
 
     summary = {
-        "count_metric": "native_sum_sigmoid_tiled",
+        "count_metric": "native_sum_sigmoid_tiled_padding_safe",
         "inference": "tiled_cosine",
         "imgsz": crop_size,
         "checkpoint": args.checkpoint,

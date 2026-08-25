@@ -8,15 +8,17 @@
     sigmoid logits
         ├─ sum over references → 各层软计数网格（fused_ref_probs）
         │      soft_count = Σ_level fused_ref_probs.sum()
-        └─ max over references → 概率热力图网格（fused_levels）
+        └─ reshape [H,W,S²] → [H*S,W*S]
+               dense reference probability lattice
 
 tile 输出按 expert_indices 建 mask，再用该 expert 自己的 stride/refs
-reshape 回 [H, W, K]，因此 native 与 expert_only(E0/E1/E2) 走同一套
-解码逻辑，不会把 E2 的 20x20x16 错当 80x80x1。
+reshape 回 [H, W, K]。padding reference 在原图域 mask 中清零；point/raw
+point 使用 tile ownership 和原图边界过滤，不会把越界点 clip 到边缘。
 """
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 
 import cv2
@@ -37,11 +39,11 @@ def cosine_window_1d(size: int) -> np.ndarray:
 class TiledResult:
     count: float            # 融合后软计数 = Σ_level fused_ref_probs.sum()
     level_counts: dict[int, float]  # {stride: 该层软计数}
-    points: np.ndarray      # [N,2] 原图像素坐标（conf 过滤 + NMS 去重）
+    points: np.ndarray      # [N,2] owned, conf-filtered, NMS-deduplicated
     sources: np.ndarray     # [N] expert_indices
     scores: np.ndarray      # [N] sigmoid 置信度
-    prob_map: np.ndarray    # [H,W] float32 全分辨率概率热力图
-    raw_points: np.ndarray  # [M,2] 阈值/NMS 之前的全部候选（原图坐标）
+    prob_map: np.ndarray    # [H,W] dense-reference probability heatmap
+    raw_points: np.ndarray  # [M,2] owned candidates before threshold/NMS
     raw_scores: np.ndarray  # [M] 原始 sigmoid 置信度
     raw_sources: np.ndarray # [M] expert_indices
 
@@ -95,6 +97,98 @@ def _pool_window(window_2d: np.ndarray, level_stride: int) -> np.ndarray:
         .mean(axis=(1, 3))
         .astype(np.float32)
     )
+def _reference_domain_mask(
+    height: int,
+    width: int,
+    padded_height: int,
+    padded_width: int,
+    level_stride: int,
+    references: int,
+) -> np.ndarray:
+    """Return the valid original-image mask for ``[cell_y, cell_x, ref]``."""
+    side = math.isqrt(references)
+    if side * side != references:
+        raise ValueError(
+            "native references must be perfect squares for dense decoding"
+        )
+    cells_h = padded_height // level_stride
+    cells_w = padded_width // level_stride
+    cell_y = np.arange(cells_h, dtype=np.float32)[:, None, None]
+    cell_x = np.arange(cells_w, dtype=np.float32)[None, :, None]
+    reference_y, reference_x = np.meshgrid(
+        np.arange(side, dtype=np.float32),
+        np.arange(side, dtype=np.float32),
+        indexing="ij",
+    )
+    ref_y = ((reference_y.reshape(-1) + 0.5) / side)[
+        None,
+        None,
+        :,
+    ]
+    ref_x = ((reference_x.reshape(-1) + 0.5) / side)[
+        None,
+        None,
+        :,
+    ]
+    points_y = (cell_y + ref_y) * level_stride
+    points_x = (cell_x + ref_x) * level_stride
+    return (points_y < height) & (points_x < width)
+
+
+def _dense_reference_layout(grid: np.ndarray) -> np.ndarray:
+    """Expand ``[cells_h, cells_w, S²]`` into ``[cells_h*S, cells_w*S]``."""
+    if grid.ndim != 3:
+        raise ValueError("reference grid must have shape [H, W, K]")
+    cells_h, cells_w, references = grid.shape
+    side = math.isqrt(int(references))
+    if side * side != references:
+        raise ValueError(
+            "native references must be perfect squares for dense decoding"
+        )
+    return (
+        grid.reshape(cells_h, cells_w, side, side)
+        .transpose(0, 2, 1, 3)
+        .reshape(cells_h * side, cells_w * side)
+    )
+
+
+def _ownership_bounds(
+    starts: list[int],
+    length: int,
+) -> list[tuple[float, float]]:
+    """Partition an axis so exactly one overlapping tile owns each point."""
+    if not starts:
+        raise ValueError("tile starts must not be empty")
+    boundaries = [0.0]
+    boundaries.extend(
+        (left + right) / 2.0
+        for left, right in zip(starts, starts[1:])
+    )
+    boundaries.append(float(length))
+    return list(zip(boundaries, boundaries[1:]))
+
+
+def _tile_ownership_bounds(
+    origins: list[tuple[int, int]],
+    height: int,
+    width: int,
+) -> dict[tuple[int, int], tuple[float, float, float, float]]:
+    """Return ``origin -> (y_min, y_max, x_min, x_max)`` ownership regions."""
+    y_starts = sorted({int(y0) for y0, _ in origins})
+    x_starts = sorted({int(x0) for _, x0 in origins})
+    y_bounds = _ownership_bounds(y_starts, height)
+    x_bounds = _ownership_bounds(x_starts, width)
+    y_index = {start: index for index, start in enumerate(y_starts)}
+    x_index = {start: index for index, start in enumerate(x_starts)}
+    return {
+        origin: (
+            y_bounds[y_index[origin[0]]][0],
+            y_bounds[y_index[origin[0]]][1],
+            x_bounds[x_index[origin[1]]][0],
+            x_bounds[x_index[origin[1]]][1],
+        )
+        for origin in origins
+    }
 
 
 def _greedy_nms(
@@ -155,16 +249,17 @@ def tiled_forward(
 ) -> dict:
     """滑窗前向并融合各层 reference 置信度网格。
 
-    返回 {"fused_levels": {stride: [H,W] 热力图(逐 cell max over refs)},
-           "fused_ref_probs": {stride: [H,W,K] 软计数网格},
-           "soft_count": float, "level_counts": {stride: float},
-           "tile_predictions": [...], "origins": [(y0,x0),...],
-           "padded_hw": (Hp,Wp)}。
-    供训练验证复用（criterion 需要逐 tile 原始输出），不做阈值/NMS。
+    返回 ``fused_ref_probs``（逐 reference 软计数网格）、
+    ``fused_levels``（仅供 cell-level 诊断的 max-reference 网格）、
+    ``fused_reference_maps``（dense reference lattice）、``soft_count``、
+    ``level_counts``、``tile_predictions``、``origins`` 和 ``padded_hw``。
+    padding reference 已按原图域清零；不在这里做阈值/NMS。
     """
     height, width = image_bgr.shape[:2]
     if crop_size <= 0:
         raise ValueError("crop_size must be positive")
+    if tile_batch_size <= 0:
+        raise ValueError("tile_batch_size must be positive")
     if not 0.0 <= overlap < 1.0:
         raise ValueError("overlap must be in [0, 1)")
 
@@ -316,13 +411,35 @@ def tiled_forward(
                     )
                     weight_acc[s_l][slice_y, slice_x] += window
 
-    fused_ref_probs = {
-        s_l: grid / np.maximum(weight_acc[s_l][:, :, None], 1e-8)
-        for s_l, grid in fused_ref_acc.items()
+    reference_masks = {
+        s_l: _reference_domain_mask(
+            height,
+            width,
+            padded_h,
+            padded_w,
+            s_l,
+            references_per_expert[expert],
+        )
+        for expert, s_l in enumerate(output_strides)
     }
-    # 热力图：每个位置取所有 reference 的最高人头概率。
+    fused_ref_probs = {}
+    for s_l, grid in fused_ref_acc.items():
+        fused = grid / np.maximum(
+            weight_acc[s_l][:, :, None],
+            1e-8,
+        )
+        # Padding references are not part of the original image domain.
+        fused *= reference_masks[s_l]
+        fused_ref_probs[s_l] = fused
+
+    # Cell-level max remains available for diagnostics.  The user-facing
+    # heatmap uses the dense reference lattice below instead.
     fused_levels = {
         s_l: grid.max(axis=-1) for s_l, grid in fused_ref_probs.items()
+    }
+    fused_reference_maps = {
+        s_l: _dense_reference_layout(grid)
+        for s_l, grid in fused_ref_probs.items()
     }
     level_counts = {
         s_l: float(grid.sum()) for s_l, grid in fused_ref_probs.items()
@@ -331,6 +448,8 @@ def tiled_forward(
     return {
         "fused_levels": fused_levels,
         "fused_ref_probs": fused_ref_probs,
+        "fused_reference_maps": fused_reference_maps,
+        "reference_masks": reference_masks,
         "soft_count": soft_count,
         "level_counts": level_counts,
         "tile_predictions": tile_predictions,
@@ -352,12 +471,12 @@ def run_tiled_inference(
     expert_index: int | None = None,
     return_raw_candidates: bool = False,
 ) -> TiledResult:
-    """滑窗推理完整出口：软计数 + 全分辨率概率热力图 + NMS 后点位。
+    """滑窗推理完整出口：软计数 + dense-reference 热力图 + 点位。
 
-    return_raw_candidates=True 时同时返回阈值/NMS 之前的全部候选
-    （raw_points/raw_scores/raw_sources，原图坐标），用于不受阈值
-    影响的置信度诊断（如 GT 邻域最大原始置信度）。
-    ``nms_radius`` 默认为 4px，仅去除重叠 tile 的重复候选。
+    return_raw_candidates=True 时返回经过原图边界和 tile ownership
+    过滤、但尚未阈值/NMS 的候选，用于 GT 邻域最大原始置信度诊断。
+    ``nms_radius`` 默认为 4px；ownership 先保证重叠 tile 中每个点只
+    由一个 tile 提供，再用 NMS 处理同一 ownership 区域内的重复点。
     """
     height, width = image_bgr.shape[:2]
     if nms_radius < 0:
@@ -372,23 +491,27 @@ def run_tiled_inference(
         routing_mode=routing_mode,
         expert_index=expert_index,
     )
-    fused_levels: dict[int, np.ndarray] = forward["fused_levels"]
+    fused_reference_maps: dict[int, np.ndarray] = forward[
+        "fused_reference_maps"
+    ]
     origins: list[tuple[int, int]] = forward["origins"]
     padded_h, padded_w = forward["padded_hw"]
 
     count = float(forward["soft_count"])
     level_counts = dict(forward["level_counts"])
 
+    # Each reference is expanded to its real sub-cell before upsampling.
+    # This preserves E1's 2x2 and E2's 4x4 reference positions.
     prob_map = np.zeros((padded_h, padded_w), dtype=np.float32)
-    for grid in fused_levels.values():
+    for grid in fused_reference_maps.values():
         upsampled = cv2.resize(
             grid,
             (padded_w, padded_h),
-            interpolation=cv2.INTER_LINEAR,
+            interpolation=cv2.INTER_CUBIC,
         )
         prob_map = np.maximum(prob_map, upsampled)
     prob_map = prob_map[:height, :width]
-
+    np.clip(prob_map, 0.0, 1.0, out=prob_map)
 
     candidate_points: list[np.ndarray] = []
     candidate_scores: list[np.ndarray] = []
@@ -396,6 +519,7 @@ def run_tiled_inference(
     raw_points_list: list[np.ndarray] = []
     raw_scores_list: list[np.ndarray] = []
     raw_sources_list: list[np.ndarray] = []
+    ownership = _tile_ownership_bounds(origins, height, width)
     origin_index = 0
     for predictions in forward["tile_predictions"]:
         probs = predictions["logits"].sigmoid()
@@ -404,47 +528,47 @@ def run_tiled_inference(
         for tile_index in range(probs.shape[0]):
             y0, x0 = origins[origin_index]
             origin_index += 1
-            tile_probs = probs[tile_index]
-            tile_points = points[tile_index]
-            tile_sources = sources[tile_index]
+            tile_probs = probs[tile_index].cpu().numpy().astype(
+                np.float32
+            )
+            tile_points = points[tile_index].cpu().numpy().astype(
+                np.float32
+            )
+            tile_sources = sources[tile_index].cpu().numpy().astype(
+                np.int64
+            )
+            global_points = tile_points + np.asarray(
+                [x0, y0],
+                dtype=np.float32,
+            )
+            y_min, y_max, x_min, x_max = ownership[(y0, x0)]
+            valid = (
+                np.isfinite(global_points).all(axis=1)
+                & np.isfinite(tile_probs)
+                & (global_points[:, 0] >= 0.0)
+                & (global_points[:, 0] < width)
+                & (global_points[:, 1] >= 0.0)
+                & (global_points[:, 1] < height)
+                & (global_points[:, 1] >= y_min)
+                & (global_points[:, 1] < y_max)
+                & (global_points[:, 0] >= x_min)
+                & (global_points[:, 0] < x_max)
+            )
+            if not bool(valid.any()):
+                continue
+            owned_points = global_points[valid]
+            owned_probs = tile_probs[valid]
+            owned_sources = tile_sources[valid]
             if return_raw_candidates:
-                raw_points = (
-                    tile_points.cpu().numpy()
-                    + np.asarray([x0, y0], dtype=np.float32)
-                )
-                raw_points[:, 0] = np.clip(
-                    raw_points[:, 0], 0, max(width - 1, 0)
-                )
-                raw_points[:, 1] = np.clip(
-                    raw_points[:, 1], 0, max(height - 1, 0)
-                )
-                raw_points_list.append(raw_points.astype(np.float32))
-                raw_scores_list.append(
-                    tile_probs.cpu().numpy().astype(np.float32)
-                )
-                raw_sources_list.append(
-                    tile_sources.cpu().numpy().astype(np.int64)
-                )
-            keep = tile_probs > conf_threshold
+                raw_points_list.append(owned_points)
+                raw_scores_list.append(owned_probs)
+                raw_sources_list.append(owned_sources)
+            keep = owned_probs > conf_threshold
             if not bool(keep.any()):
                 continue
-            selected_points = (
-                tile_points[keep].cpu().numpy()
-                + np.asarray([x0, y0], dtype=np.float32)
-            )
-            selected_points[:, 0] = np.clip(
-                selected_points[:, 0], 0, max(width - 1, 0)
-            )
-            selected_points[:, 1] = np.clip(
-                selected_points[:, 1], 0, max(height - 1, 0)
-            )
-            candidate_points.append(selected_points.astype(np.float32))
-            candidate_scores.append(
-                tile_probs[keep].cpu().numpy().astype(np.float32)
-            )
-            candidate_sources.append(
-                tile_sources[keep].cpu().numpy().astype(np.int64)
-            )
+            candidate_points.append(owned_points[keep])
+            candidate_scores.append(owned_probs[keep])
+            candidate_sources.append(owned_sources[keep])
 
     if not candidate_points:
         return TiledResult(

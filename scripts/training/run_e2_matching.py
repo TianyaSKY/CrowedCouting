@@ -1,33 +1,21 @@
-"""E2 matching starvation 诊断实验：confidence 预筛 vs 全池 Hungarian。
+"""Run the E2 matching starvation experiment with a mandatory smoke gate.
 
-对照组与实验组保持 seed/数据/epoch/LR 完全一致，仅改两个 matching 参数：
-
-- baseline:   --match-top-k 2000 --match-confidence-weight 0.25
-              （当前默认：先从 6400 个 E2 candidate 按 confidence 预筛
-              2000 个，再 Hungarian；代价含 confidence 项）
-- full_pool:  --match-top-k 6400 --match-confidence-weight 0.0
-              （取消 confidence 预筛与置信度项：全部 6400 个 E2
-              candidate 参与纯位置 Hungarian）
-
-评估对比先看 scale-bin 的 large-proxy Recall@16/32、matched distance、
-matched confidence、count bias，而不是只看 MAE：
-
-    python -m scripts.evaluation.ablation_expert \
-        --checkpoint runs/e2_matching_baseline/best_native.pt \
-        --checkpoint runs/e2_matching_full_pool/best_native.pt \
-        --data-root datasets/shanghaitech_AB
-
-训练前应先跑 smoke test（1 样本、1 epoch、batch=1），确认
-forward -> loss -> backward -> optimizer step -> checkpoint 保存
--> reload 全链路正常。
+The baseline and full-pool runs share seed, data, architecture, and optimizer;
+only matching preselection and confidence cost differ.  Every invocation gets a
+fresh timestamped root so checkpoints and TensorBoard files cannot mix with an
+older experiment.
 """
 from __future__ import annotations
 
+import argparse
+import os
+from pathlib import Path
 import subprocess
 import sys
+import time
 
-COMMON = [
-    "python", "-m", "scripts.training.train_moe",
+COMMON_ARGS = [
+    "-m", "scripts.training.train_moe",
     "--weights", "yolo11n.pt",
     "--data-root", "datasets/shanghaitech_AB",
     "--crop-size", "640",
@@ -51,29 +39,84 @@ COMMON = [
 
 RUNS = [
     (
-        "e2_matching_baseline",
+        "baseline",
         ["--match-top-k", "2000", "--match-confidence-weight", "0.25"],
     ),
     (
-        "e2_matching_full_pool",
+        "full_pool",
         ["--match-top-k", "6400", "--match-confidence-weight", "0.0"],
     ),
 ]
 
 
-def main() -> int:
-    print("E2_MATCHING_DRIVER_STARTED", flush=True)
+def _run(command: list[str]) -> subprocess.CompletedProcess:
+    print("$ " + " ".join(command), flush=True)
+    return subprocess.run(command, cwd=os.getcwd())
+
+
+def _run_id() -> str:
+    return f"{time.strftime('%Y%m%d_%H%M%S')}_{os.getpid()}"
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="E2 matching A/B experiment with a mandatory training smoke test"
+    )
+    parser.add_argument(
+        "--output-root",
+        default="runs/e2_matching",
+        help="timestamped experiment roots are created below this directory",
+    )
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
+    root = Path(args.output_root) / _run_id()
+    smoke_dir = root / "smoke"
+    root.mkdir(parents=True, exist_ok=False)
+    print(f"E2_MATCHING_DRIVER_STARTED root={root}", flush=True)
+
+    smoke_command = [
+        sys.executable,
+        *COMMON_ARGS,
+        "--smoke-test",
+        "--save-dir",
+        str(smoke_dir),
+    ]
+    print("===== SMOKE GATE =====", flush=True)
+    smoke_result = _run(smoke_command)
+    smoke_checkpoint = smoke_dir / "last.pt"
+    if smoke_result.returncode != 0 or not smoke_checkpoint.exists():
+        print(
+            "SMOKE GATE FAILED "
+            f"rc={smoke_result.returncode} checkpoint={smoke_checkpoint}",
+            flush=True,
+        )
+        return smoke_result.returncode or 1
+    print("SMOKE GATE OK", flush=True)
+
     failures = 0
     for name, extra in RUNS:
-        command = COMMON + extra + ["--save-dir", f"runs/{name}"]
-        print(f"\n===== RUN {name} =====", flush=True)
-        result = subprocess.run(command, cwd=".")
+        save_dir = root / name
+        command = [
+            sys.executable,
+            *COMMON_ARGS,
+            *extra,
+            "--save-dir",
+            str(save_dir),
+        ]
+        print(f"\n===== RUN {name} ({save_dir}) =====", flush=True)
+        result = _run(command)
         if result.returncode != 0:
             failures += 1
             print(f"RUN {name} FAILED rc={result.returncode}", flush=True)
         else:
             print(f"RUN {name} OK", flush=True)
-    print(f"E2_MATCHING_DRIVER_DONE failures={failures}", flush=True)
+    print(
+        f"E2_MATCHING_DRIVER_DONE root={root} failures={failures}",
+        flush=True,
+    )
     return 0 if failures == 0 else 1
 
 

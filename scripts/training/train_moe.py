@@ -118,14 +118,41 @@ def build_optimizer(model, args):
     )
 
 
+def native_candidate_pool_size(args) -> int:
+    """Return the candidate count seen by the matching call."""
+    output_strides = (8, 16, 32)
+    references = parse_native_references(args.native_references)
+    if getattr(args, "expert_index", None) is not None:
+        indices = (int(args.expert_index),)
+    else:
+        indices = range(3)
+    return sum(
+        (int(args.crop_size) // output_strides[index]) ** 2
+        * references[index]
+        for index in indices
+    )
+
+
 def build_checkpoint_config(
     args,
     criterion: PointMoELoss,
     *,
     matching_stage: str,
 ) -> dict[str, object]:
+    routing_mode = (
+        "expert_only"
+        if getattr(args, "expert_index", None) is not None
+        else "native"
+    )
+    pool_size = native_candidate_pool_size(args)
+    if criterion.match_top_k >= pool_size:
+        candidate_preselection = "full_pool"
+    elif routing_mode == "expert_only":
+        candidate_preselection = "confidence_top_k"
+    else:
+        candidate_preselection = "expert_balanced_top_k"
     return {
-        "checkpoint_version": 2,
+        "checkpoint_version": 3,
         "architecture": NATIVE_ARCHITECTURE,
         "crop_size": int(args.crop_size),
         "hidden_channels": int(args.hidden_channels),
@@ -137,7 +164,11 @@ def build_checkpoint_config(
         "matching_schedule": (
             "independent_per_expert_then_global_hungarian"
         ),
-        "selection_metric": "native weighted normalized MAE",
+        "selection_metric": (
+            "native normalized MAE"
+            if routing_mode == "expert_only"
+            else "native weighted normalized MAE"
+        ),
         "match_top_k": int(criterion.match_top_k),
         "match_position_weight": float(
             criterion.match_position_weight
@@ -145,7 +176,36 @@ def build_checkpoint_config(
         "match_confidence_weight": float(
             criterion.match_confidence_weight
         ),
-        "candidate_preselection": "expert_balanced_top_k",
+        "candidate_pool_size": pool_size,
+        "candidate_preselection": candidate_preselection,
+        "routing_mode": routing_mode,
+        "expert_index": getattr(args, "expert_index", None),
+        "seed": getattr(args, "seed", None),
+        "native_matched_distance_metric": "l1_px",
+    }
+
+
+def resume_config_mismatches(
+    config: dict[str, object],
+    args,
+    criterion: PointMoELoss,
+) -> list[str]:
+    """Return every training condition that differs from a checkpoint."""
+    expected: dict[str, object] = {
+        "architecture": NATIVE_ARCHITECTURE,
+        "crop_size": int(args.crop_size),
+        "hidden_channels": int(args.hidden_channels),
+        "native_references": tuple(
+            parse_native_references(args.native_references)
+        ),
+        "native_warmup_epochs": int(args.native_warmup_epochs),
+        "match_top_k": int(criterion.match_top_k),
+        "match_position_weight": float(
+            criterion.match_position_weight
+        ),
+        "match_confidence_weight": float(
+            criterion.match_confidence_weight
+        ),
         "routing_mode": (
             "expert_only"
             if getattr(args, "expert_index", None) is not None
@@ -154,10 +214,87 @@ def build_checkpoint_config(
         "expert_index": getattr(args, "expert_index", None),
         "seed": getattr(args, "seed", None),
     }
+    mismatches: list[str] = []
+    for key, expected_value in expected.items():
+        if key not in config:
+            mismatches.append(f"{key}=<missing> (expected {expected_value!r})")
+            continue
+        if key == "native_references":
+            saved_value = (
+                tuple(int(item.strip()) for item in saved_value.split(","))
+                if isinstance(saved_value, str)
+                else tuple(int(value) for value in saved_value)
+            )
+        if isinstance(expected_value, float):
+            try:
+                equal = math.isclose(
+                    float(saved_value),
+                    expected_value,
+                )
+            except (TypeError, ValueError):
+                equal = False
+        else:
+            equal = saved_value == expected_value
+        if not equal:
+            mismatches.append(
+                f"{key}={saved_value!r} (current {expected_value!r})"
+            )
+    return mismatches
+
+
+def validate_resume_config(
+    config: dict[str, object],
+    args,
+    criterion: PointMoELoss,
+) -> None:
+    mismatches = resume_config_mismatches(config, args, criterion)
+    if not mismatches:
+        return
+    detail = "; ".join(mismatches)
+    if not getattr(args, "allow_config_change", False):
+        raise ValueError(
+            "resume checkpoint 的实验条件不一致；"
+            "如确需改变请显式传 --allow-config-change: "
+            + detail
+        )
+    logging.warning(
+        "显式允许 resume 实验条件变化: %s",
+        detail,
+    )
 
 
 def timestamped_save_dir(base: str) -> str:
     return f"{base}_{time.strftime('%Y%m%d_%H%M%S')}"
+
+def _apply_smoke_test_overrides(args) -> None:
+    if not getattr(args, "smoke_test", False):
+        return
+    args.batch_size = 1
+    args.workers = 0
+    args.epochs = 1
+    args.native_warmup_epochs = 0
+    args.freeze_epochs = 0
+    args.val_image_interval = 0
+    args.val_image_count = 1
+    logging.info(
+        "smoke-test overrides: train_samples=1 val_samples=1 "
+        "epochs=1 batch=1 workers=0"
+    )
+
+
+def _reload_smoke_checkpoint(args, checkpoint_path: str, device: str) -> None:
+    checkpoint = torch.load(
+        checkpoint_path,
+        map_location="cpu",
+        weights_only=False,
+    )
+    model = YOLO11MoEPoint(
+        weights=args.weights,
+        hidden_channels=args.hidden_channels,
+        native_references=parse_native_references(args.native_references),
+    ).to(device)
+    model.load_state_dict(checkpoint["model"])
+    model.eval()
 
 
 def dataset_mean_gt_count(dataset) -> float:
@@ -396,6 +533,7 @@ def evaluate_native_count_mae(
 
 
 def train_moe(args):
+    _apply_smoke_test_overrides(args)
     if args.native_warmup_epochs < 0:
         raise ValueError("--native-warmup-epochs 不能为负数")
     if args.expert_index is not None and not 0 <= args.expert_index <= 2:
@@ -463,11 +601,13 @@ def train_moe(args):
         args.data_root,
         split="train",
         crop_size=args.crop_size,
+        max_samples=1 if getattr(args, "smoke_test", False) else None,
     )
     val_dataset = PointDataset(
         args.data_root,
         split="val",
         crop_size=args.crop_size,
+        max_samples=1 if getattr(args, "smoke_test", False) else None,
     )
     val_mean_gt_count = dataset_mean_gt_count(val_dataset)
     val_image_interval, val_image_count, val_image_conf = (
@@ -505,7 +645,7 @@ def train_moe(args):
     optimizer = build_optimizer(model, args)
     start_epoch = 0
     best_selection_score = float("inf")
-
+    best_native_mae = float("inf")
     if args.resume:
         checkpoint = torch.load(
             args.resume,
@@ -513,31 +653,9 @@ def train_moe(args):
             weights_only=False,
         )
         config = checkpoint.get("config", {})
-        if not isinstance(config, dict) or config.get("architecture") != NATIVE_ARCHITECTURE:
-            raise ValueError(
-                "只支持 native_multiscale checkpoint；旧 D2 checkpoint 已删除"
-            )
-        saved_refs = tuple(config.get("native_references", ()))
-        if saved_refs != native_references:
-            raise ValueError(
-                "resume checkpoint 的 native_references 与当前配置不一致"
-            )
-        saved_position_weight = float(
-            config.get("match_position_weight", 5.0)
-        )
-        saved_confidence_weight = float(
-            config.get("match_confidence_weight", 0.25)
-        )
-        if not math.isclose(
-            saved_position_weight,
-            args.match_position_weight,
-        ) or not math.isclose(
-            saved_confidence_weight,
-            args.match_confidence_weight,
-        ):
-            raise ValueError(
-                "resume checkpoint 的 matching cost 权重与当前配置不一致"
-            )
+        if not isinstance(config, dict):
+            raise ValueError("resume checkpoint 缺少 config 字典")
+        validate_resume_config(config, args, criterion)
         model.load_state_dict(checkpoint["model"])
         try:
             optimizer.load_state_dict(checkpoint["optimizer"])
@@ -545,8 +663,11 @@ def train_moe(args):
             logging.warning("优化器状态不兼容，使用全新优化器: %s", error)
             optimizer = build_optimizer(model, args)
         start_epoch = int(checkpoint.get("epoch", -1)) + 1
-        best_selection_score = float(
-            checkpoint.get("best_selection_score", float("inf"))
+        saved_best_native_mae = checkpoint.get("best_native_mae")
+        best_native_mae = (
+            float(saved_best_native_mae)
+            if saved_best_native_mae is not None
+            else float("inf")
         )
         if start_epoch >= args.freeze_epochs:
             for param in model.yolo.parameters():
@@ -562,6 +683,13 @@ def train_moe(args):
             if not os.path.exists(backup):
                 shutil.copy2(old_best, backup)
 
+    smoke_parameters = [
+        parameter
+        for parameter in model.parameters()
+        if parameter.requires_grad
+    ]
+    smoke_parameters_before = None
+    smoke_updated = False
     for epoch in range(start_epoch, args.epochs):
         epoch_started_at = time.perf_counter()
         matching_mode = native_matching_mode(epoch, args)
@@ -608,6 +736,22 @@ def train_moe(args):
                 image_size=images.shape[-2:],
                 matching_mode=matching_mode,
             )
+            if getattr(args, "smoke_test", False):
+                for key in ("logits", "points"):
+                    value = predictions[key]
+                    if not bool(torch.isfinite(value).all()):
+                        raise RuntimeError(
+                            f"smoke-test forward produced non-finite {key}"
+                        )
+                if not bool(torch.isfinite(loss)):
+                    raise RuntimeError(
+                        "smoke-test loss is non-finite before backward"
+                    )
+                if smoke_parameters_before is None:
+                    smoke_parameters_before = [
+                        parameter.detach().clone()
+                        for parameter in smoke_parameters
+                    ]
 
             train_winner_sum += loss_items["winner_hist"].to(
                 device=device,
@@ -617,17 +761,45 @@ def train_moe(args):
 
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
+            if getattr(args, "smoke_test", False):
+                if any(
+                    parameter.grad is not None
+                    and not bool(torch.isfinite(parameter.grad).all())
+                    for parameter in model.parameters()
+                ):
+                    raise RuntimeError(
+                        "smoke-test backward produced non-finite gradients"
+                    )
             torch.nn.utils.clip_grad_norm_(
                 model.parameters(),
                 max_norm=args.grad_clip,
             )
             optimizer.step()
+            if (
+                getattr(args, "smoke_test", False)
+                and smoke_parameters_before is not None
+                and any(
+                    not torch.equal(before, parameter.detach())
+                    for before, parameter in zip(
+                        smoke_parameters_before,
+                        smoke_parameters,
+                    )
+                )
+            ):
+                smoke_updated = True
 
             total_loss += loss.item()
             for name in loss_sums:
                 loss_sums[name] += loss_items[name].detach()
             num_batches += 1
 
+        if (
+            getattr(args, "smoke_test", False)
+            and not smoke_updated
+        ):
+            raise RuntimeError(
+                "smoke-test optimizer step did not update any parameter"
+            )
         avg_loss = total_loss / max(num_batches, 1)
         avg_loss_items = {
             name: (value / max(num_batches, 1)).item()
@@ -660,7 +832,8 @@ def train_moe(args):
         train_winner_pct = train_winner_sum.float() / max(int(train_winner_sum.sum()), 1) * 100
 
         logging.info(
-            "[Epoch %d/%d] loss=%.4f cls=%.4f point=%.4f count=%.4f stage=%s MAE=%.3f/%.6f RMSE=%.3f bias=%.3f",
+            "[Epoch %d/%d] loss=%.4f cls=%.4f point=%.4f count=%.4f "
+            "stage=%s rawMAE=%.3f normMAE=%.6f RMSE=%.3f bias=%.3f",
             epoch + 1,
             args.epochs,
             avg_loss,
@@ -686,7 +859,7 @@ def train_moe(args):
             train_winner_pct[2],
         )
         logging.info(
-            "  matched distance(px): E0=%.2f E1=%.2f E2=%.2f",
+            "  matched distance L1(px): E0=%.2f E1=%.2f E2=%.2f",
             val_distance_mean[0],
             val_distance_mean[1],
             val_distance_mean[2],
@@ -720,8 +893,13 @@ def train_moe(args):
         if validation["loss"] is not None:
             for name, value in validation["loss"].items():
                 writer.add_scalar(f"val/loss_native_{name}", value, epoch)
-        writer.add_scalar("mae/native_raw", native_mae, epoch)
-        writer.add_scalar("mae/native_weighted_norm", native_norm_mae, epoch)
+        writer.add_scalar(
+            "mae/native_norm"
+            if args.expert_index is not None
+            else "mae/native_weighted_norm",
+            native_norm_mae,
+            epoch,
+        )
         writer.add_scalar("val/rmse_native", native_rmse, epoch)
         writer.add_scalar("val/count_bias_native", native_bias, epoch)
         writer.add_scalar("schedule/native_warmup", float(matching_mode == "independent"), epoch)
@@ -746,6 +924,7 @@ def train_moe(args):
         )
         if improved:
             best_selection_score = native_norm_mae
+            best_native_mae = native_mae
         if math.isfinite(best_selection_score):
             writer.add_scalar("val/best_score", best_selection_score, epoch)
 
@@ -754,14 +933,33 @@ def train_moe(args):
             "optimizer": optimizer.state_dict(),
             "epoch": epoch,
             "best_selection_score": best_selection_score,
-            "best_mae": best_selection_score,
-            "selection_metric": "native weighted normalized MAE",
+            "best_native_mae": (
+                best_native_mae
+                if math.isfinite(best_native_mae)
+                else None
+            ),
+            "best_raw_mae": (
+                best_native_mae
+                if math.isfinite(best_native_mae)
+                else None
+            ),
+            "best_mae": (
+                best_native_mae
+                if math.isfinite(best_native_mae)
+                else None
+            ),
+            "selection_metric": (
+                "native normalized MAE"
+                if args.expert_index is not None
+                else "native weighted normalized MAE"
+            ),
             "architecture": NATIVE_ARCHITECTURE,
             "native_mae": native_mae,
             "native_rmse": native_rmse,
             "native_bias": native_bias,
             "native_norm_mae": native_norm_mae,
             "matching_stage": matching_stage,
+            "native_matched_distance_metric": "l1_px",
             "native_winner_hist": val_winner_hist.detach().cpu(),
             "native_train_winner_hist": train_winner_sum.detach().cpu(),
             "native_positive_count": val_positive_count.detach().cpu(),
@@ -779,7 +977,7 @@ def train_moe(args):
             best_path = os.path.join(args.save_dir, "best_native.pt")
             torch.save(checkpoint_data, best_path)
             logging.info(
-                "  -> 新的最佳 native weighted normalized MAE: %.6f (%s)",
+                "  -> 新的最佳选模分数: %.6f (%s)",
                 best_selection_score,
                 best_path,
             )
@@ -794,6 +992,12 @@ def train_moe(args):
         writer.flush()
 
     writer.close()
+    if getattr(args, "smoke_test", False):
+        last_path = os.path.join(args.save_dir, "last.pt")
+        if not os.path.exists(last_path):
+            raise RuntimeError("smoke-test 未生成 last.pt checkpoint")
+        _reload_smoke_checkpoint(args, last_path, device)
+        logging.info("smoke-test fresh checkpoint reload succeeded")
     logging.info("训练结束。")
 
 
@@ -866,6 +1070,16 @@ def build_parser():
         help="固定 torch/numpy/random 种子，保证不同 run 数据增广序列一致",
     )
     parser.add_argument("--workers", type=int, default=4)
+    parser.add_argument(
+        "--allow-config-change",
+        action="store_true",
+        help="允许 resume 时显式改变已锁定实验条件",
+    )
+    parser.add_argument(
+        "--smoke-test",
+        action="store_true",
+        help="运行 1 样本/1 epoch 的 forward-backward-update-reload 烟雾测试",
+    )
     parser.add_argument("--save-dir", type=str, default=None)
     parser.add_argument(
         "--resume",

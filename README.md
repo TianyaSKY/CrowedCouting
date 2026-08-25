@@ -143,7 +143,7 @@ python -m scripts.evaluation.evaluate_datasets \
     --out-dir runs/native_multiscale_all/eval
 ```
 
-计数口径始终是所有 native candidates 的 `sum(sigmoid(logits))`（tiled 推理中按 reference 维度求和；热力图是逐位置取 reference 最大值，两条链路不混用）。评估不使用置信度阈值作为 MAE 计数口径，也不使用 NMS。
+计数口径始终是所有 native candidates 的 `sum(sigmoid(logits))`（tiled 推理中按 reference 维度求和，并清零 padding reference；热力图把 `[H,W,S²]` 展开为 `[H*S,W*S]` 的 dense-reference lattice，约 8px 间距，两条链路不混用）。点位先按原图边界与 tile ownership 过滤，再做阈值/NMS；评估不使用置信度阈值作为 MAE 计数口径。
 
 单专家消融 checkpoint（`--expert-index` 训练）在推理/评估时自动从 checkpoint 恢复 `routing_mode=expert_only` 与 `expert_index`，无需在命令行重复指定。
 

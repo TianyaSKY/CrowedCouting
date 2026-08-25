@@ -5,18 +5,19 @@
 - 单专家消融 (expert_only, 由 checkpoint config["expert_index"] 标记):
   只输出被保留专家的候选。
 
-推理协议与正式验证完全一致（tiled 滑窗 + 余弦窗融合，原图坐标）：
+推理协议与正式验证完全一致（tiled 滑窗 + 余弦窗融合 + tile ownership，原图坐标）：
 
     原始图像 → tiled inference → 原图坐标 predictions → 原图坐标 GT
-        → 逐 GT 最近距离 d(g) = min_j |p_j - g|
+        → 逐 GT 最近距离 d(g) = min_j ||p_j - g||₂
 
-统计：Recall@8/16/32、mean/median 最近距离（仅有限距离）、各专家计数 MAE
-（专家计数 = 该专家层 fused soft count）。
+统计：Recall@8/16/32、mean/median 最近距离（Euclidean L2，仅有限距离）、
+各专家计数 MAE（专家计数 = 该专家层 fused soft count）。
 
-另按 GT scale proxy（与最近 3 个 GT 距离的 median）切成
-dense_small / medium / sparse_large 三桶，分别统计
-Recall@8/16/32、最近距离 mean/median 与 GT 邻域最大置信度，
-用于诊断 E2 是总体定位差还是专门漏掉近景/大目标。
+另按 GT 邻域间距 heuristic（与最近 3 个 GT 距离的 median）切成
+dense_small_proxy / medium_proxy / sparse_large_proxy 三桶，分别统计
+Recall@8/16/32、最近距离 mean/median 与 GT 邻域最大置信度。
+该 proxy 反映局部标注密度，不是 ground-truth object size，不能单独
+支持“真正的大目标 Recall 提升”的结论。
 """
 from __future__ import annotations
 
@@ -51,9 +52,13 @@ RADII = (8, 16, 32)
 RAW_CONF_RADII = (16, 32)
 RAW_CONF_CANDIDATE_CHUNK_SIZE = 4096
 RAW_CONF_GT_CHUNK_SIZE = 4096
-# scale proxy 的最近邻数量（对每个 GT 取最近的 3 个 GT 距离的 median）。
+# scale proxy 的最近邻数量；它是局部密度 heuristic，不是目标尺寸。
 SCALE_K = 3
-SCALE_BIN_NAMES = ("dense_small", "medium", "sparse_large")
+SCALE_BIN_NAMES = (
+    "dense_small_proxy",
+    "medium_proxy",
+    "sparse_large_proxy",
+)
 
 
 def setup_logging(log_path: str) -> None:
@@ -70,10 +75,11 @@ def setup_logging(log_path: str) -> None:
 
 
 def scale_proxies(gt: np.ndarray) -> np.ndarray:
-    """每个 GT 的 scale proxy：与最近 SCALE_K 个 GT 距离的 median。
+    """每个 GT 的局部间距 proxy：最近 SCALE_K 个 GT 距离的 median。
 
-    密集人群中的 GT proxy 小（近景/小头），孤立 GT proxy 大
-    （远景/大头）。不足 SCALE_K 个邻居时用现有邻居；无邻居记 inf。
+    dense_small_proxy 通常表示更密的远景/小头布局，sparse_large_proxy
+    通常表示更稀的近景/大头布局；但透视、构图和标注密度都会影响它，
+    因此它不是 ground-truth object size。
     """
     count = gt.shape[0]
     proxies = np.full(count, np.inf, dtype=np.float64)
@@ -96,7 +102,7 @@ def scale_proxies(gt: np.ndarray) -> np.ndarray:
 def scale_bin_thresholds(
     proxies: np.ndarray,
 ) -> tuple[float, float]:
-    """按 33.3%/66.7% 分位切分 scale proxy；inf 归入 sparse_large。"""
+    """按 33.3%/66.7% 分位切分 proxy；inf 归入 sparse_large_proxy。"""
     finite = proxies[np.isfinite(proxies)]
     if finite.size < 2:
         return 0.0, 0.0
@@ -112,10 +118,10 @@ def assign_scale_bin(
 ) -> str:
     low, high = thresholds
     if proxy <= low:
-        return "dense_small"
+        return "dense_small_proxy"
     if proxy <= high:
-        return "medium"
-    return "sparse_large"
+        return "medium_proxy"
+    return "sparse_large_proxy"
 
 
 def _raw_max_confidences(
@@ -499,6 +505,8 @@ def evaluate_checkpoint(
                 if expert_dists[expert] is None:
                     for radius in RADII:
                         row[f"recall_E{expert}@{radius}px"] = None
+                    row[f"meanD_L2_E{expert}"] = None
+                    row[f"medianD_L2_E{expert}"] = None
                 else:
                     finite = expert_dists[expert][
                         np.isfinite(expert_dists[expert])
@@ -507,10 +515,10 @@ def evaluate_checkpoint(
                         row[f"recall_E{expert}@{radius}px"] = float(
                             (expert_dists[expert] <= radius).mean()
                         )
-                    row[f"meanD_E{expert}"] = (
+                    row[f"meanD_L2_E{expert}"] = (
                         float(finite.mean()) if finite.size > 0 else None
                     )
-                    row[f"medianD_E{expert}"] = (
+                    row[f"medianD_L2_E{expert}"] = (
                         float(np.median(finite))
                         if finite.size > 0
                         else None
@@ -543,7 +551,7 @@ def evaluate_checkpoint(
                     ),
                 )
 
-    # 按 scale proxy 分桶统计（诊断大/小目标定位差异）。
+    # 按局部 GT 间距 heuristic 分桶；不把 proxy 当作真实目标尺寸。
     proxies = np.asarray(
         [record[0] for record in gt_scale_records],
         dtype=np.float64,
@@ -565,6 +573,9 @@ def evaluate_checkpoint(
         "p33": thresholds[0],
         "p66": thresholds[1],
         "scale_proxy": "median distance to 3 nearest GT",
+        "scale_proxy_semantics": (
+            "local GT spacing heuristic; not ground-truth object size"
+        ),
     }
 
     return {
@@ -573,6 +584,9 @@ def evaluate_checkpoint(
         "routing_mode": routing_mode,
         "expert_index": expert_index,
         "epoch": metadata.get("epoch"),
+        "nearest_distance_metric": "euclidean_l2_px",
+        "scale_proxy": "median distance to 3 nearest GT",
+        "scale_proxy_is_ground_truth_size": False,
         "per_expert": {
             f"E{expert}": stats[expert].summary()
             for expert in range(3)
@@ -595,8 +609,8 @@ def format_recall_line(
     )
     if summary.get("gt_total"):
         line += (
-            f" meanD={summary['mean_dist_px']:.1f}px "
-            f"medD={summary['median_dist_px']:.1f}px"
+            f" meanD_L2={summary['mean_dist_px']:.1f}px "
+            f"medD_L2={summary['median_dist_px']:.1f}px"
         )
         for radius in RADII:
             recall = summary[f"recall@{radius}px"]
@@ -622,8 +636,8 @@ def main(args: argparse.Namespace) -> None:
         if scale_bins:
             thresholds = scale_bins.get("thresholds", {})
             logging.info(
-                "  scale bins (proxy=median dist to 3 nearest GT, "
-                "p33=%.1fpx p66=%.1fpx):",
+                "  scale bins (proxy=median dist to 3 nearest GT; "
+                "density heuristic, not object size; p33=%.1fpx p66=%.1fpx):",
                 thresholds.get("p33", 0.0),
                 thresholds.get("p66", 0.0),
             )
@@ -642,10 +656,14 @@ def main(args: argparse.Namespace) -> None:
                 mean_dist = summary.get("mean_dist_px")
                 median_dist = summary.get("median_dist_px")
                 line += (
-                    f" meanD={mean_dist:.1f}px" if mean_dist is not None else " meanD=N/A"
+                    f" meanD_L2={mean_dist:.1f}px"
+                    if mean_dist is not None
+                    else " meanD_L2=N/A"
                 )
                 line += (
-                    f" medD={median_dist:.1f}px" if median_dist is not None else " medD=N/A"
+                    f" medD_L2={median_dist:.1f}px"
+                    if median_dist is not None
+                    else " medD_L2=N/A"
                 )
                 for radius in RAW_CONF_RADII:
                     raw_conf = summary.get(f"raw_max_conf@{radius}px")
@@ -661,8 +679,13 @@ def main(args: argparse.Namespace) -> None:
         json.dump(
             {
                 "radii_px": list(RADII),
-                "count_metric": "level_fused_soft_count (tiled)",
+                "count_metric": "native_sum_sigmoid_tiled_padding_safe",
                 "inference": "tiled_cosine",
+                "nearest_distance_metric": "euclidean_l2_px",
+                "scale_proxy_semantics": (
+                    "median distance to 3 nearest GT; "
+                    "local density heuristic, not object size"
+                ),
                 "conf_threshold": args.conf,
                 "nms_radius": args.nms_radius,
                 "results": [
@@ -688,9 +711,8 @@ def main(args: argparse.Namespace) -> None:
             for expert in range(3)
             for radius in RADII
         ]
-        + [f"meanD_E{expert}" for expert in range(3)]
-        + [f"medianD_E{expert}" for expert in range(3)]
-        + ["gt_proxy_median"]
+        + [f"meanD_L2_E{expert}" for expert in range(3)]
+        + [f"medianD_L2_E{expert}" for expert in range(3)]
     )
     with open(csv_path, "w", newline="", encoding="utf-8") as csv_file:
         writer = csv.writer(csv_file)
@@ -709,8 +731,12 @@ def main(args: argparse.Namespace) -> None:
                         for expert in range(3)
                         for radius in RADII
                     ]
-                    + [row[f"meanD_E{expert}"] for expert in range(3)]
-                    + [row[f"medianD_E{expert}"] for expert in range(3)]
+                    + [
+                        row[f"meanD_L2_E{expert}"] for expert in range(3)
+                    ]
+                    + [
+                        row[f"medianD_L2_E{expert}"] for expert in range(3)
+                    ]
                     + [row["gt_proxy_median"]]
                 )
     logging.info("汇总: %s", summary_path)
@@ -736,7 +762,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--weights", type=str, default="yolo11n.pt")
     parser.add_argument("--imgsz", type=int, default=None)
     parser.add_argument("--batch-size", type=int, default=8)
-    parser.add_argument("--workers", type=int, default=4)
+
     parser.add_argument("--out-dir", type=str, default="runs/ablation_eval")
     parser.add_argument("--vis-images", type=int, default=0)
     parser.add_argument("--vis-conf", type=float, default=0.3)

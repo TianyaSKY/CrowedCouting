@@ -149,9 +149,10 @@ def _load_native_resume(
     optimizer,
     args,
     native_references: tuple[int, int, int],
+    criterion: PointMoELoss,
 ):
     if not args.resume:
-        return optimizer, 0, float("inf")
+        return optimizer, 0, float("inf"), float("inf")
 
     checkpoint = torch.load(
         args.resume,
@@ -159,30 +160,9 @@ def _load_native_resume(
         weights_only=False,
     )
     config = checkpoint.get("config", {})
-    if not isinstance(config, dict) or config.get("architecture") != NATIVE_ARCHITECTURE:
-        raise ValueError(
-            "只支持 native_multiscale checkpoint；旧 D2 checkpoint 已删除"
-        )
-    if tuple(config.get("native_references", ())) != native_references:
-        raise ValueError(
-            "resume checkpoint 的 native_references 与当前配置不一致"
-        )
-    saved_position_weight = float(
-        config.get("match_position_weight", 5.0)
-    )
-    saved_confidence_weight = float(
-        config.get("match_confidence_weight", 0.25)
-    )
-    if not math.isclose(
-        saved_position_weight,
-        args.match_position_weight,
-    ) or not math.isclose(
-        saved_confidence_weight,
-        args.match_confidence_weight,
-    ):
-        raise ValueError(
-            "resume checkpoint 的 matching cost 权重与当前配置不一致"
-        )
+    if not isinstance(config, dict):
+        raise ValueError("resume checkpoint 缺少 config 字典")
+    tm.validate_resume_config(config, args, criterion)
     model.load_state_dict(checkpoint["model"])
     try:
         optimizer.load_state_dict(checkpoint["optimizer"])
@@ -193,7 +173,13 @@ def _load_native_resume(
     best_score = float(
         checkpoint.get("best_selection_score", float("inf"))
     )
-    return optimizer, start_epoch, best_score
+    saved_best_native_mae = checkpoint.get("best_native_mae")
+    best_native_mae = (
+        float(saved_best_native_mae)
+        if saved_best_native_mae is not None
+        else float("inf")
+    )
+    return optimizer, start_epoch, best_score, best_native_mae
 
 
 def train_all(args: argparse.Namespace) -> None:
@@ -324,11 +310,14 @@ def train_all(args: argparse.Namespace) -> None:
         )
 
     optimizer = tm.build_optimizer(model, args)
-    optimizer, start_epoch, best_selection_score = _load_native_resume(
-        model,
-        optimizer,
-        args,
-        native_references,
+    optimizer, start_epoch, best_selection_score, best_native_mae = (
+        _load_native_resume(
+            model,
+            optimizer,
+            args,
+            native_references,
+            criterion,
+        )
     )
     if start_epoch >= args.freeze_epochs:
         for param in model.yolo.parameters():
@@ -422,6 +411,19 @@ def train_all(args: argparse.Namespace) -> None:
                 crop_size=args.crop_size,
                 max_visual_samples=val_image_count if collect_visuals else 0,
             )
+            validation_by_dataset[name] = validation
+            per_dataset[name] = {
+                "native": float(validation["mae"]),
+            }
+            val_winner_hist += validation["winner_hist"].to(
+                device=device,
+                dtype=torch.int64,
+            )
+            val_positive_count += validation["positive_count"].to(device)
+            val_distance_sum += validation["matched_distance_sum"].to(device)
+            val_confidence_sum += validation[
+                "matched_confidence_sum"
+            ].to(device)
             val_matched_count += validation["matched_count"]
 
             if collect_visuals and validation["validation_samples"]:
@@ -443,6 +445,11 @@ def train_all(args: argparse.Namespace) -> None:
             val_image_counts,
         )
         total_val_images = max(sum(val_image_counts.values()), 1)
+        native_mae = sum(
+            val_image_counts[name]
+            * validation_by_dataset[name]["mae"]
+            for name in validation_by_dataset
+        ) / total_val_images
         native_rmse = (
             sum(
                 val_image_counts[name]
@@ -471,7 +478,8 @@ def train_all(args: argparse.Namespace) -> None:
         train_winner_pct = train_winner_sum.float() / max(int(train_winner_sum.sum()), 1) * 100
 
         logging.info(
-            "[Epoch %d/%d] loss=%.4f cls=%.4f point=%.4f count=%.4f stage=%s MAE_native=%.6f RMSE=%.3f bias=%.3f",
+            "[Epoch %d/%d] loss=%.4f cls=%.4f point=%.4f count=%.4f "
+            "stage=%s weightedNormMAE=%.6f rawMAE=%.3f RMSE=%.3f bias=%.3f",
             epoch + 1,
             args.epochs,
             avg_loss,
@@ -480,6 +488,7 @@ def train_all(args: argparse.Namespace) -> None:
             avg_loss_items["count"],
             matching_stage,
             native_weighted_norm,
+            native_mae,
             native_rmse,
             native_bias,
         )
@@ -503,7 +512,7 @@ def train_all(args: argparse.Namespace) -> None:
             train_winner_pct[2],
         )
         logging.info(
-            "  matched distance(px): E0=%.2f E1=%.2f E2=%.2f",
+            "  matched distance L1(px): E0=%.2f E1=%.2f E2=%.2f",
             val_distance_mean[0],
             val_distance_mean[1],
             val_distance_mean[2],
@@ -519,9 +528,14 @@ def train_all(args: argparse.Namespace) -> None:
             dataset_winner = validation["winner_hist"]
             dataset_distance = validation["matched_distance_sum"].to(device) / dataset_positive.to(device).clamp_min(1)
             dataset_confidence = validation["matched_confidence_sum"].to(device) / dataset_positive.to(device).clamp_min(1)
-            dataset_winner_pct = dataset_winner.float() / max(int(dataset_winner.sum()), 1) * 100
+            dataset_winner_pct = (
+                dataset_winner.float()
+                / max(int(dataset_winner.sum()), 1)
+                * 100
+            )
             logging.info(
-                "  %s winner: E0=%.1f%% E1=%.1f%% E2=%.1f%% | distance: %.2f/%.2f/%.2f | confidence: %.3f/%.3f/%.3f",
+                "  %s winner: E0=%.1f%% E1=%.1f%% E2=%.1f%% | "
+                "distance L1: %.2f/%.2f/%.2f | confidence: %.3f/%.3f/%.3f",
                 name,
                 dataset_winner_pct[0],
                 dataset_winner_pct[1],
@@ -559,6 +573,7 @@ def train_all(args: argparse.Namespace) -> None:
         )
         if improved:
             best_selection_score = native_weighted_norm
+            best_native_mae = native_mae
         if math.isfinite(best_selection_score):
             writer.add_scalar("val/best_score", best_selection_score, epoch)
 
@@ -567,15 +582,31 @@ def train_all(args: argparse.Namespace) -> None:
             "optimizer": optimizer.state_dict(),
             "epoch": epoch,
             "best_selection_score": best_selection_score,
-            "best_mae": best_selection_score,
+            "best_native_mae": (
+                best_native_mae
+                if math.isfinite(best_native_mae)
+                else None
+            ),
+            "best_raw_mae": (
+                best_native_mae
+                if math.isfinite(best_native_mae)
+                else None
+            ),
+            "best_mae": (
+                best_native_mae
+                if math.isfinite(best_native_mae)
+                else None
+            ),
             "selection_metric": "native weighted normalized MAE",
             "architecture": NATIVE_ARCHITECTURE,
+            "native_mae": native_mae,
             "native_weighted_norm_mae": native_weighted_norm,
             "native_macro_norm_mae": native_macro_norm,
             "native_rmse": native_rmse,
             "native_bias": native_bias,
             "native_loss": native_loss,
             "matching_stage": matching_stage,
+            "native_matched_distance_metric": "l1_px",
             "native_winner_hist": val_winner_hist.detach().cpu(),
             "native_train_winner_hist": train_winner_sum.detach().cpu(),
             "native_positive_count": val_positive_count.detach().cpu(),
