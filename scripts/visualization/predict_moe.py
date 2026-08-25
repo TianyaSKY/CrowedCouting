@@ -106,13 +106,18 @@ def load_model(weights_path, checkpoint_path, device):
     if not isinstance(state_dict, dict):
         raise ValueError("checkpoint 中缺少 model state_dict")
     model.load_state_dict(state_dict)
+    config = checkpoint.get("config", {}) if isinstance(checkpoint, dict) else {}
+    model.routing_mode = str(config.get("routing_mode", "native"))
+    model.expert_index = config.get("expert_index", None)
     model.eval()
     logging.info(
-        "从 %s 加载 native_multiscale 权重 (weights=%s, hidden=%d, refs=%s)",
+        "从 %s 加载 native_multiscale 权重 (weights=%s, hidden=%d, refs=%s, routing_mode=%s, expert_index=%s)",
         checkpoint_path,
         weights,
         hidden_channels,
         native_references,
+        model.routing_mode,
+        model.expert_index,
     )
     return model
 

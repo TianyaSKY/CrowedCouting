@@ -152,12 +152,18 @@ def tiled_forward(
             origins.append((y0, x0))
 
     tile_predictions: list[dict[str, object]] = []
+    routing_mode = getattr(model, "routing_mode", "native")
+    expert_index = getattr(model, "expert_index", None)
     with torch.no_grad():
         for start in range(0, len(tile_tensors), tile_batch_size):
             batch = torch.stack(
                 tile_tensors[start:start + tile_batch_size]
             ).to(device)
-            predictions = model(batch)
+            predictions = model(
+                batch,
+                routing_mode=routing_mode,
+                expert_index=expert_index,
+            )
             tile_predictions.append(predictions)
             probs = predictions["logits"].sigmoid()
             tile_experts_all = predictions["expert_indices"]
