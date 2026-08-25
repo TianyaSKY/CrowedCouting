@@ -30,6 +30,9 @@ class TiledResult:
     sources: np.ndarray     # [N] expert_indices
     scores: np.ndarray      # [N] sigmoid 置信度
     prob_map: np.ndarray    # [H,W] float32 全分辨率概率图
+    # {stride: 网格} 各专家层独立融合的置信度（stride 8/16/32 ↔ E0/E1/E2）；
+    # 仅 run_tiled_inference 填充，便于按专家分别可视化。
+    fused_levels: dict | None = None
 
 
 def _tile_starts(length: int, size: int, stride: int) -> tuple[list[int], int]:
@@ -157,20 +160,20 @@ def tiled_forward(
             predictions = model(batch)
             tile_predictions.append(predictions)
             probs = predictions["logits"].sigmoid()
+            tile_experts_all = predictions["expert_indices"]
 
             for tile_index in range(probs.shape[0]):
                 y0, x0 = origins[start + tile_index]
-                offset = 0
-                for s_l, refs in zip(
-                    output_strides, references_per_expert
-                ):
+                # expert_only 模式只返回选中专家的候选；按 expert_indices
+                # 保序分组，native 与 expert_only 两种布局都能还原网格。
+                for expert_id in tile_experts_all[tile_index].unique().tolist():
+                    refs = references_per_expert[expert_id]
+                    s_l = output_strides[expert_id]
+                    level_scores = probs[tile_index][
+                        tile_experts_all[tile_index] == expert_id
+                    ]
                     height_cells = crop_size // s_l
                     width_cells = crop_size // s_l
-                    count = height_cells * width_cells * refs
-                    level_scores = probs[
-                        tile_index, offset:offset + count
-                    ]
-                    offset += count
                     conf_grid = (
                         level_scores.reshape(
                             height_cells, width_cells, refs
@@ -191,6 +194,7 @@ def tiled_forward(
     fused_levels = {
         s_l: grid / np.maximum(weight_acc[s_l], 1e-8)
         for s_l, grid in fused_acc.items()
+        if weight_acc[s_l].max() > 0.0
     }
     return {
         "fused_levels": fused_levels,
@@ -278,6 +282,7 @@ def run_tiled_inference(
             sources=np.zeros((0,), dtype=np.int64),
             scores=np.zeros((0,), dtype=np.float32),
             prob_map=prob_map,
+            fused_levels=forward["fused_levels"],
         )
 
     all_points = np.concatenate(candidate_points, axis=0)
@@ -292,4 +297,5 @@ def run_tiled_inference(
         sources=all_sources[kept_order],
         scores=kept_scores,
         prob_map=prob_map,
+        fused_levels=forward["fused_levels"],
     )

@@ -101,6 +101,61 @@ class PointExpert(nn.Module):
         return confidence_logits, offsets
 
 
+class PixelShufflePointExpert(nn.Module):
+    """单个点检测专家（通过 PixelShuffle 亚像素空间展开实现）。"""
+
+    def __init__(
+        self,
+        channels: int,
+        hidden_channels: int = 128,
+        upscale_factor: int = 4,
+        prior_probability: float = 0.01,
+    ) -> None:
+        super().__init__()
+        self.use_pixel_shuffle = True
+        self.num_references = 1
+        self.upscale_factor = upscale_factor
+
+        self.expand = nn.Sequential(
+            nn.Conv2d(
+                channels,
+                hidden_channels * (upscale_factor**2),
+                kernel_size=3,
+                padding=1,
+                bias=False,
+            ),
+            make_group_norm(hidden_channels * (upscale_factor**2)),
+            nn.SiLU(inplace=True),
+        )
+        self.pixel_shuffle = nn.PixelShuffle(upscale_factor)
+        self.body = ConvBlock(hidden_channels, hidden_channels)
+        self.prediction = nn.Conv2d(
+            hidden_channels,
+            3,
+            kernel_size=1,
+        )
+
+        prior_bias = math.log(
+            prior_probability / (1.0 - prior_probability)
+        )
+        nn.init.normal_(self.prediction.weight, std=0.01)
+        with torch.no_grad():
+            self.prediction.bias.zero_()
+            self.prediction.bias[0] = prior_bias
+
+    def forward(
+        self,
+        feature: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        x = self.pixel_shuffle(self.expand(feature))
+        x = self.body(x)
+        output = self.prediction(x)
+
+        confidence_logits = output[:, 0:1]
+        offsets = output[:, 1:3].unsqueeze(1)
+        return confidence_logits, offsets
+
+
  
  
 class MoEPointHead(nn.Module):
@@ -176,9 +231,10 @@ class MoEPointHead(nn.Module):
             hidden_channels,
             self.references_per_expert[1],
         )
-        self.expert5 = PointExpert(
+        self.expert5 = PixelShufflePointExpert(
             hidden_channels,
-            self.references_per_expert[2],
+            hidden_channels=128,
+            upscale_factor=4,
         )
 
         for expert_index, references in enumerate(
@@ -211,13 +267,59 @@ class MoEPointHead(nn.Module):
         self,
         feature: torch.Tensor,
         projection: nn.Module,
-        expert: PointExpert,
+        expert: nn.Module,
         expert_index: int,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         projected = projection(feature)
         confidence_logits, offsets = expert(projected)
         batch_size, _, height, width = confidence_logits.shape
-        references = self.references_per_expert[expert_index]
+
+        if getattr(expert, "use_pixel_shuffle", False):
+            grid_y, grid_x = torch.meshgrid(
+                torch.arange(
+                    height,
+                    device=projected.device,
+                    dtype=projected.dtype,
+                ),
+                torch.arange(
+                    width,
+                    device=projected.device,
+                    dtype=projected.dtype,
+                ),
+                indexing="ij",
+            )
+            grid = torch.stack([grid_x, grid_y], dim=-1).unsqueeze(2)
+            base_points = (
+                grid + 0.5
+            ) * self.effective_strides[expert_index]
+            base_points = base_points.reshape(1, -1, 2)
+
+            points = (
+                base_points
+                + torch.tanh(
+                    offsets.permute(0, 3, 4, 1, 2).reshape(
+                        batch_size,
+                        -1,
+                        2,
+                    )
+                )
+                * self.offset_range
+                * self.effective_strides[expert_index]
+            )
+            logits = confidence_logits.permute(
+                0, 2, 3, 1
+            ).reshape(batch_size, -1)
+            return (
+                logits,
+                points,
+                base_points.expand(batch_size, -1, -1),
+                torch.full(
+                    (batch_size, logits.shape[1]),
+                    expert_index,
+                    dtype=torch.long,
+                    device=logits.device,
+                ),
+            )
 
         grid_y, grid_x = torch.meshgrid(
             torch.arange(

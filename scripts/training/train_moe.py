@@ -140,6 +140,7 @@ def build_checkpoint_config(
         "match_confidence_weight": float(
             criterion.match_confidence_weight
         ),
+        "gaussian_sigma": float(criterion.gaussian_sigma),
         "candidate_preselection": "expert_balanced_top_k",
     }
 
@@ -415,6 +416,7 @@ def train_moe(args):
         match_top_k=args.match_top_k,
         match_position_weight=args.match_position_weight,
         match_confidence_weight=args.match_confidence_weight,
+        gaussian_sigma=getattr(args, "gaussian_sigma", 8.0),
     )
 
     model = YOLO11MoEPoint(
@@ -802,6 +804,12 @@ def build_parser():
         type=float,
         default=0.25,
         help="Hungarian cost 的 confidence 权重",
+    )
+    parser.add_argument(
+        "--gaussian-sigma",
+        type=float,
+        default=8.0,
+        help="高斯软标签标准差 (像素，0 表示禁用硬 0/1 标签)",
     )
     parser.add_argument("--freeze-epochs", type=int, default=3)
     parser.add_argument("--grad-clip", type=float, default=10.0)

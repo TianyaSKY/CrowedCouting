@@ -52,6 +52,7 @@ class PointMoELoss(nn.Module):
         match_top_k: int = 2000,
         match_position_weight: float = 5.0,
         match_confidence_weight: float = 0.25,
+        gaussian_sigma: float = 8.0,
     ) -> None:
         super().__init__()
         if match_top_k <= 0:
@@ -60,11 +61,39 @@ class PointMoELoss(nn.Module):
             raise ValueError("match_position_weight 必须为正数")
         if match_confidence_weight < 0:
             raise ValueError("match_confidence_weight 不能为负数")
+        if gaussian_sigma < 0:
+            raise ValueError("gaussian_sigma 不能为负数")
         self.coordinate_weight = coordinate_weight
         self.count_weight = count_weight
         self.match_top_k = match_top_k
         self.match_position_weight = match_position_weight
         self.match_confidence_weight = match_confidence_weight
+        self.gaussian_sigma = float(gaussian_sigma)
+
+    @staticmethod
+    def _compute_targets(
+        num_candidates: int,
+        matched_indices: torch.Tensor,
+        candidate_points: torch.Tensor,
+        ground_truth: torch.Tensor,
+        gaussian_sigma: float,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        """为正样本候选点生成标签，支持基于欧氏距离的高斯软标签平滑。"""
+        targets = torch.zeros(num_candidates, dtype=dtype, device=device)
+        if matched_indices.numel() > 0:
+            targets[matched_indices] = 1.0
+
+        if gaussian_sigma > 0.0 and ground_truth.shape[0] > 0 and candidate_points.shape[0] > 0:
+            with torch.no_grad():
+                dist = torch.cdist(ground_truth, candidate_points)  # (M, N)
+                min_dist = dist.min(dim=0).values  # (N,)
+                cutoff = 3.0 * gaussian_sigma
+                soft_weights = torch.exp(-(min_dist ** 2) / (2.0 * (gaussian_sigma ** 2)))
+                soft_weights = torch.where(min_dist <= cutoff, soft_weights, torch.zeros_like(soft_weights))
+                targets = torch.maximum(targets, soft_weights)
+        return targets
 
 
     @staticmethod
@@ -254,7 +283,15 @@ class PointMoELoss(nn.Module):
                             self.match_position_weight,
                             self.match_confidence_weight,
                         )
-                        targets[matched_indices] = 1.0
+                        targets = self._compute_targets(
+                            expert_logits.shape[0],
+                            matched_indices,
+                            expert_points,
+                            gt,
+                            self.gaussian_sigma,
+                            expert_logits.device,
+                            expert_logits.dtype,
+                        )
                         image_point_loss = (
                             image_point_loss
                             + F.smooth_l1_loss(
@@ -324,7 +361,15 @@ class PointMoELoss(nn.Module):
                         self.match_confidence_weight,
                         expert_indices[batch_index],
                     )
-                    targets[matched_indices] = 1.0
+                    targets = self._compute_targets(
+                        logits[batch_index].shape[0],
+                        matched_indices,
+                        points[batch_index],
+                        gt,
+                        self.gaussian_sigma,
+                        logits.device,
+                        logits.dtype,
+                    )
                     matched_sources = expert_indices[
                         batch_index
                     ][matched_indices]
